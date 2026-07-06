@@ -1,0 +1,263 @@
+/* Brutalist frame around a hyperreal window.
+   The DOM is concrete; the canvas is weather. */
+
+:root {
+  --ink: #dcd7ba;
+  --paper: #16161d;
+  --paper-raised: #1f1f28;
+  --rule: #45443c;
+  --accent: #e4bf56;
+  --accent-blood: #c4746e;
+  --mute: #727169;
+  --mono: "DejaVu Sans Mono", "JetBrains Mono", "Fira Mono", ui-monospace, monospace;
+}
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html,
+body {
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--mono);
+  font-size: 14px;
+  line-height: 1.45;
+}
+
+body {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+/* ------------------------------------------------------------- masthead */
+
+header.masthead {
+  border-bottom: 3px double var(--rule);
+  padding: 2.2rem 2rem 1.4rem;
+}
+
+.masthead .name {
+  font-size: clamp(2rem, 6vw, 4.5rem);
+  font-weight: 700;
+  letter-spacing: -0.04em;
+  text-transform: uppercase;
+}
+
+.masthead .name .bracket {
+  color: var(--accent);
+}
+
+.masthead .name .unnamed {
+  color: var(--mute);
+  text-decoration: line-through;
+  text-decoration-color: var(--accent-blood);
+  text-decoration-thickness: 3px;
+}
+
+.masthead .vow {
+  margin-top: 0.4rem;
+  color: var(--mute);
+  max-width: 62ch;
+}
+
+.masthead .vow em {
+  color: var(--accent);
+  font-style: normal;
+}
+
+/* --------------------------------------------------------------- layout */
+
+main {
+  flex: 1;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(220px, 26%);
+  gap: 0;
+}
+
+@media (max-width: 900px) {
+  main {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* ------------------------------------------------------------- the window */
+
+.vessel {
+  position: relative;
+  border-right: 1px solid var(--rule);
+  min-height: 60vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.vessel .plate {
+  display: flex;
+  justify-content: space-between;
+  border-bottom: 1px solid var(--rule);
+  padding: 0.4rem 1rem;
+  font-size: 0.78rem;
+  color: var(--mute);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.vessel .stage {
+  position: relative;
+  flex: 1;
+  background: #101018;
+  overflow: hidden;
+}
+
+/* Text-mode grid plays instantly; the canvas fades in over it. */
+#text-grid {
+  position: absolute;
+  inset: 0;
+  padding: 1rem;
+  font-size: clamp(6px, 1.05vw, 13px);
+  line-height: 1.25;
+  white-space: pre;
+  overflow: hidden;
+  color: var(--ink);
+}
+
+#ratty-canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  opacity: 0;
+  transition: opacity 2.4s ease;
+}
+
+#ratty-canvas.alive {
+  opacity: 1;
+}
+
+.stage .verdict {
+  position: absolute;
+  right: 0.8rem;
+  bottom: 0.6rem;
+  font-size: 0.72rem;
+  padding: 0.15rem 0.5rem;
+  border: 1px solid var(--rule);
+  color: var(--mute);
+  background: rgb(16 16 24 / 82%);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.stage .verdict.alive {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+/* ------------------------------------------------------------ the stream */
+
+aside.stream {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+aside.stream .plate {
+  border-bottom: 1px solid var(--rule);
+  padding: 0.4rem 1rem;
+  font-size: 0.78rem;
+  color: var(--mute);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+#raw-tap {
+  flex: 1;
+  padding: 0.8rem 1rem;
+  overflow-y: auto;
+  font-size: 0.68rem;
+  line-height: 1.5;
+  color: var(--mute);
+  word-break: break-all;
+  white-space: pre-wrap;
+  max-height: 70vh;
+}
+
+#raw-tap::selection {
+  background: var(--accent);
+  color: var(--paper);
+}
+
+/* ------------------------------------------------------------- manifest */
+
+section.manifest {
+  border-top: 3px double var(--rule);
+  padding: 1.2rem 2rem 2rem;
+}
+
+.manifest h2 {
+  font-size: 0.85rem;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  color: var(--mute);
+  margin-bottom: 0.8rem;
+}
+
+.manifest table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.manifest th,
+.manifest td {
+  text-align: left;
+  border: 1px solid var(--rule);
+  padding: 0.45rem 0.8rem;
+  font-size: 0.85rem;
+}
+
+.manifest th {
+  color: var(--mute);
+  font-weight: 400;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  font-size: 0.72rem;
+}
+
+.manifest tr.playing td {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.manifest td .mood {
+  color: var(--accent-blood);
+}
+
+footer {
+  border-top: 1px solid var(--rule);
+  padding: 0.8rem 2rem;
+  color: var(--mute);
+  font-size: 0.75rem;
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  flex-wrap: wrap;
+}
+
+footer a {
+  color: var(--accent);
+  text-decoration: none;
+  border-bottom: 1px solid var(--accent);
+}
+
+/* progress hairline */
+#progress {
+  position: fixed;
+  top: 0;
+  left: 0;
+  height: 3px;
+  width: 0%;
+  background: var(--accent);
+  z-index: 10;
+}

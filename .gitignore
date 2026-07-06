@@ -5,3 +5,5 @@ result-*
 
 # silk build artifacts
 tools/silk/target/
+site/pkg/
+site/transmissions
