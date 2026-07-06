@@ -2,3 +2,6 @@ assets/img
 **/target
 result
 result-*
+
+# silk build artifacts
+tools/silk/target/
