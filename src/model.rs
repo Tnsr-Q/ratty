@@ -12,6 +12,7 @@ use rust_embed::RustEmbed;
 
 use crate::config::{AppConfig, CURSOR_DEPTH};
 use crate::inline::{InlineObject, RgpInlineObject};
+#[cfg(not(target_arch = "wasm32"))]
 use crate::paths::{expand_path, runtime_asset_root};
 
 #[derive(RustEmbed)]
@@ -82,6 +83,7 @@ pub fn spawn_cursor_model(
         ))
         .id();
 
+    #[cfg(not(target_arch = "wasm32"))]
     let base_color_texture = app_config.cursor.model.texture.as_deref().and_then(|path| {
         match load_texture_image(path) {
             Ok(image) => {
@@ -94,6 +96,14 @@ pub fn spawn_cursor_model(
             }
         }
     });
+    #[cfg(target_arch = "wasm32")]
+    let base_color_texture: Option<Handle<Image>> = {
+        let _ = &images;
+        if app_config.cursor.model.texture.is_some() {
+            warn!("cursor textures are not supported in the web build yet");
+        }
+        None
+    };
 
     let [r, g, b] = app_config.cursor.model.color;
     let material = materials.add(StandardMaterial {
@@ -164,6 +174,7 @@ pub fn spawn_cursor_model(
 /// # Errors
 ///
 /// Returns an error if the file cannot be read or decoded.
+#[cfg(not(target_arch = "wasm32"))]
 fn load_texture_image(path: &Path) -> anyhow::Result<Image> {
     let path = expand_path(path);
     let bytes =
@@ -191,9 +202,49 @@ pub fn load_object_source(path: &Path) -> anyhow::Result<(String, ObjectSource)>
 
 /// Loads an object source from a path with explicit load options.
 ///
+/// The web build has no filesystem: only ratty-embedded assets resolve, and
+/// only in-memory formats (OBJ, STL).
+///
 /// # Errors
 ///
 /// Returns an error if the asset cannot be resolved or parsed.
+#[cfg(target_arch = "wasm32")]
+pub fn load_object_source_with_options(
+    path: &Path,
+    options: ObjectLoadOptions,
+) -> anyhow::Result<(String, ObjectSource)> {
+    let candidate = object_asset_path(path)?;
+    let extension = Path::new(&candidate)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase())
+        .unwrap_or_default();
+
+    let file_name = Path::new(&candidate)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .with_context(|| format!("invalid asset path {}", path.display()))?;
+    let Some(file) = EmbeddedObjects::get(file_name) else {
+        bail!(
+            "asset {} is not embedded; the web build has no filesystem (use payload registration)",
+            path.display()
+        );
+    };
+    match extension.as_str() {
+        "stl" => load_stl_meshes_from_bytes(&file.data)
+            .map(|mesh| (format!("embedded:{file_name}"), ObjectSource::Stl(mesh))),
+        "obj" => load_obj_meshes_from_bytes(file_name, &file.data, options.normalize)
+            .map(|meshes| (format!("embedded:{file_name}"), ObjectSource::Obj(meshes))),
+        _ => bail!("format {extension} is not supported in the web build yet (obj, stl)"),
+    }
+}
+
+/// Loads an object source from a path with explicit load options.
+///
+/// # Errors
+///
+/// Returns an error if the asset cannot be resolved or parsed.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn load_object_source_with_options(
     path: &Path,
     options: ObjectLoadOptions,
@@ -331,27 +382,36 @@ pub fn load_object_source_from_bytes_with_options(
         "glb" | "gltf" => {
             // Bevy scene loading still goes through the asset server, so payload-backed GLB/GLTF
             // assets need to be materialized under the asset root before they can be instantiated.
-            let extension = if format == "gltf" { "gltf" } else { "glb" };
-            let stem = Path::new(display_name)
-                .file_stem()
-                .and_then(|stem| stem.to_str())
-                .filter(|stem| !stem.is_empty())
-                .unwrap_or("payload");
-            let sanitized = stem
-                .chars()
-                .map(|c| match c {
-                    'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' => c,
-                    _ => '_',
-                })
-                .collect::<String>();
-            let candidate = format!("objects/rgp/{sanitized}.{extension}");
-            let asset_path = ensure_scene_asset_path(&candidate, Some((display_name, bytes)))?;
-            Ok((payload_name, ObjectSource::Gltf(asset_path)))
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let extension = if format == "gltf" { "gltf" } else { "glb" };
+                let stem = Path::new(display_name)
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .filter(|stem| !stem.is_empty())
+                    .unwrap_or("payload");
+                let sanitized = stem
+                    .chars()
+                    .map(|c| match c {
+                        'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' => c,
+                        _ => '_',
+                    })
+                    .collect::<String>();
+                let candidate = format!("objects/rgp/{sanitized}.{extension}");
+                let asset_path = ensure_scene_asset_path(&candidate, Some((display_name, bytes)))?;
+                Ok((payload_name, ObjectSource::Gltf(asset_path)))
+            }
+            #[cfg(target_arch = "wasm32")]
+            bail!(
+                "GLB/GLTF payloads are not supported in the web build yet (obj, stl): {}",
+                display_name
+            )
         }
         _ => bail!("unsupported object format for {}", display_name),
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn ensure_scene_asset_path(
     candidate: &str,
     embedded: Option<(&str, &[u8])>,
@@ -414,6 +474,7 @@ fn object_asset_path(path: &Path) -> anyhow::Result<String> {
         .to_string())
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn load_stl_meshes_from_path(path: &Path) -> anyhow::Result<Mesh> {
     let data = std::fs::read(path)?;
     load_stl_meshes_from_bytes(&data)
@@ -461,6 +522,7 @@ fn load_stl_meshes_from_bytes(bytes: &[u8]) -> anyhow::Result<Mesh> {
     Ok(mesh)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn load_obj_meshes_from_path(path: &Path, normalize: bool) -> anyhow::Result<Vec<Mesh>> {
     let options = tobj::LoadOptions {
         triangulate: true,

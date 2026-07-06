@@ -1,14 +1,19 @@
 //! Application configuration types.
 
 use std::collections::BTreeMap;
+#[cfg(not(target_arch = "wasm32"))]
 use std::fs;
-use std::path::{Path, PathBuf};
+#[cfg(not(target_arch = "wasm32"))]
+use std::path::Path;
+use std::path::PathBuf;
 
 use anyhow::Context;
 use bevy::prelude::Resource;
+#[cfg(not(target_arch = "wasm32"))]
 use etcetera::{BaseStrategy, choose_base_strategy};
 use serde::{Deserialize, Deserializer};
 
+#[cfg(not(target_arch = "wasm32"))]
 use crate::paths::expand_path;
 
 /// Application name used for config discovery.
@@ -52,6 +57,7 @@ impl AppConfig {
     /// # Errors
     ///
     /// Returns an error if the selected config file cannot be read or parsed.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn load() -> anyhow::Result<Self> {
         Self::load_from_path(None)
     }
@@ -61,6 +67,7 @@ impl AppConfig {
     /// # Errors
     ///
     /// Returns an error if the selected config file cannot be read or parsed.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn load_from_path(path: Option<&Path>) -> anyhow::Result<Self> {
         let selected_path = if let Some(path) = path {
             Some(expand_path(path))
@@ -74,12 +81,25 @@ impl AppConfig {
 
         let contents = fs::read_to_string(&path)
             .with_context(|| format!("failed to read {}", path.display()))?;
-        let mut config: Self = toml::from_str(&contents)
+        let mut config = Self::from_toml_str(&contents)
             .with_context(|| format!("failed to parse {}", path.display()))?;
         config.resolve_relative_paths(&path);
         Ok(config)
     }
 
+    /// Parses a configuration from TOML content without touching the
+    /// filesystem. Relative asset paths are left as-is; embedders that have
+    /// no config directory (e.g. the web build) should use absolute or
+    /// ratty-embedded paths.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the TOML cannot be parsed.
+    pub fn from_toml_str(contents: &str) -> anyhow::Result<Self> {
+        toml::from_str(contents).context("failed to parse config TOML")
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     fn default_config_path() -> anyhow::Result<Option<PathBuf>> {
         let strategy =
             choose_base_strategy().context("failed to determine system config directory")?;
@@ -94,6 +114,7 @@ impl AppConfig {
         })
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn resolve_relative_paths(&mut self, path: &Path) {
         let config_dir = path.parent().unwrap_or_else(|| Path::new("."));
         self.cursor.model.path = resolve_config_path(config_dir, &self.cursor.model.path);
@@ -106,6 +127,7 @@ impl AppConfig {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn resolve_config_path(config_dir: &Path, path: &Path) -> PathBuf {
     let expanded = expand_path(path);
     if !expanded.is_relative() {

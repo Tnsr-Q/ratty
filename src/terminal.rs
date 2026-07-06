@@ -322,6 +322,15 @@ pub fn texture_logical_size(texture_size: UVec2, render_scale: f32) -> Vec2 {
     Vec2::new(width, height)
 }
 
+/// Embedded default monospace fonts for targets without a system font
+/// source (the web build). DejaVu Sans Mono is also the native default
+/// family, so web rendering matches native defaults. License:
+/// `assets/fonts/LICENSE-DejaVu.txt`.
+#[cfg(target_arch = "wasm32")]
+const EMBEDDED_MONO_REGULAR: &[u8] = include_bytes!("../assets/fonts/DejaVuSansMono.ttf");
+#[cfg(target_arch = "wasm32")]
+const EMBEDDED_MONO_BOLD: &[u8] = include_bytes!("../assets/fonts/DejaVuSansMono-Bold.ttf");
+
 fn build_terminal_renderer(
     font: &FontConfig,
     theme_config: &ThemeConfig,
@@ -357,14 +366,26 @@ fn build_terminal_renderer(
         // Fractional cells keep font-size zoom proportional on both axes even
         // when a single step moves the glyph advance by less than one pixel.
         .with_cell_quantization(CellQuantization::Fractional);
-    TerminalRenderer::new_scaled(
+    #[cfg_attr(
+        not(target_arch = "wasm32"),
+        expect(unused_mut, reason = "mutated on wasm")
+    )]
+    let mut renderer = TerminalRenderer::new_scaled(
         FontOptions {
             size: font.size as f32 * PT_TO_PX,
             ..font_options
         },
         theme,
         render_scale,
-    )
+    );
+    // Registration happens inside the builder so every construction path —
+    // including the font-size-zoom rebuild — carries the embedded glyphs.
+    #[cfg(target_arch = "wasm32")]
+    {
+        renderer.register_font_family("DejaVu Sans Mono", EMBEDDED_MONO_REGULAR);
+        renderer.register_font_data(EMBEDDED_MONO_BOLD);
+    }
+    renderer
 }
 
 /// Ratatui widget backed by a VT100 screen.

@@ -1,16 +1,22 @@
-//! PTY runtime and parser state.
+//! Terminal transport (PTY or virtual byte channel) and parser state.
 
 use std::collections::HashSet;
+#[cfg(not(target_arch = "wasm32"))]
 use std::env;
-use std::io::{ErrorKind, Read, Write};
+use std::io::Write;
+#[cfg(not(target_arch = "wasm32"))]
+use std::io::{ErrorKind, Read};
 use std::path::PathBuf;
-use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
+#[cfg(not(target_arch = "wasm32"))]
 use std::thread::{self, JoinHandle};
 
+#[cfg(not(target_arch = "wasm32"))]
 use anyhow::Context;
 use bevy::platform::cell::SyncCell;
 use bevy::prelude::Resource;
+#[cfg(not(target_arch = "wasm32"))]
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 use vt100::{Callbacks, Parser, Screen};
 
@@ -170,29 +176,68 @@ impl Callbacks for TerminalParserCallbacks {
     }
 }
 
-/// Running PTY and parser state.
+/// Running terminal transport and parser state.
+///
+/// The transport is either a real PTY (native) or a virtual byte channel
+/// (see [`TerminalRuntime::virtual_channel`]); everything downstream only
+/// consumes [`TerminalRuntime::try_recv`], [`TerminalRuntime::write_input`],
+/// and [`TerminalRuntime::parser`], so the two are interchangeable.
 ///
 /// The `!Sync` PTY handles (the output channel receiver and the master) live
 /// in [`SyncCell`]s so the runtime qualifies as a regular [`Resource`] and
 /// systems using it are not pinned to the main thread.
 #[derive(Resource)]
 pub struct TerminalRuntime {
-    /// PTY output channel.
+    /// Terminal output channel (PTY reader or virtual feed).
     rx: SyncCell<Receiver<Vec<u8>>>,
-    /// PTY input writer.
+    /// Terminal input writer (PTY writer or virtual input forwarder).
     pub writer: Arc<Mutex<Option<Box<dyn Write + Send>>>>,
     /// PTY master handle.
+    #[cfg(not(target_arch = "wasm32"))]
     master: SyncCell<Option<Box<dyn MasterPty + Send>>>,
     /// Child process handle.
+    #[cfg(not(target_arch = "wasm32"))]
     child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
     /// PTY reader thread.
+    #[cfg(not(target_arch = "wasm32"))]
     reader_thread: Option<JoinHandle<()>>,
     /// Terminal parser.
     pub parser: Parser<TerminalParserCallbacks>,
     scrollback_len: usize,
-    /// Indicates PTY shutdown.
+    /// Indicates transport shutdown.
     pub pty_disconnected: bool,
     shutdown_started: bool,
+}
+
+/// Host-side handles for a virtual terminal transport created by
+/// [`TerminalRuntime::virtual_channel`].
+///
+/// The host plays the role the PTY plays in a native session: it produces
+/// terminal output bytes and consumes whatever the terminal writes back
+/// (keystrokes, RGP support replies, cursor position reports).
+pub struct VirtualTerminalHost {
+    /// Producer for terminal output bytes (text, ANSI, RGP, Kitty).
+    pub feed_tx: Sender<Vec<u8>>,
+    /// Consumer for bytes the terminal writes back as input.
+    pub input_rx: Receiver<Vec<u8>>,
+}
+
+/// [`Write`] adapter that forwards terminal input into the virtual host's
+/// channel instead of a PTY.
+struct VirtualInputWriter {
+    tx: Sender<Vec<u8>>,
+}
+
+impl Write for VirtualInputWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        // Unbounded channel: never blocks. A closed host just discards.
+        let _ = self.tx.send(buf.to_vec());
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 /// Returns the default shell for the current platform.
@@ -202,6 +247,7 @@ pub struct TerminalRuntime {
 /// Ratatui demos behave the same as on Linux/macOS), then `%COMSPEC%` (the
 /// resolved command processor), and finally `cmd.exe`. On other platforms
 /// it falls back to `/bin/sh`.
+#[cfg(not(target_arch = "wasm32"))]
 fn default_shell() -> String {
     #[cfg(windows)]
     {
@@ -264,11 +310,48 @@ fn find_git_bash() -> Option<String> {
 }
 
 impl TerminalRuntime {
+    /// Creates a runtime backed by a virtual byte channel instead of a PTY.
+    ///
+    /// The returned [`VirtualTerminalHost`] feeds terminal output through
+    /// `feed_tx` and drains terminal input from `input_rx`. Channels are
+    /// unbounded so producing never blocks — a blocking send would hang a
+    /// single-threaded (e.g. wasm) embedder permanently.
+    pub fn virtual_channel(config: &AppConfig) -> (Self, VirtualTerminalHost) {
+        let cols = config.terminal.default_cols;
+        let rows = config.terminal.default_rows;
+        let (feed_tx, rx) = mpsc::channel::<Vec<u8>>();
+        let (input_tx, input_rx) = mpsc::channel::<Vec<u8>>();
+
+        let runtime = Self {
+            rx: SyncCell::new(rx),
+            writer: Arc::new(Mutex::new(Some(
+                Box::new(VirtualInputWriter { tx: input_tx }) as Box<dyn Write + Send>,
+            ))),
+            #[cfg(not(target_arch = "wasm32"))]
+            master: SyncCell::new(None),
+            #[cfg(not(target_arch = "wasm32"))]
+            child: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            reader_thread: None,
+            parser: Parser::new_with_callbacks(
+                rows,
+                cols,
+                config.terminal.scrollback,
+                TerminalParserCallbacks::default(),
+            ),
+            scrollback_len: config.terminal.scrollback,
+            pty_disconnected: false,
+            shutdown_started: false,
+        };
+        (runtime, VirtualTerminalHost { feed_tx, input_rx })
+    }
+
     /// Spawns the shell PTY runtime.
     ///
     /// # Errors
     ///
     /// Returns an error if the PTY cannot be created or the shell cannot be spawned.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn spawn(config: &AppConfig, options: &RuntimeOptions) -> anyhow::Result<Self> {
         let cols = config.terminal.default_cols;
         let rows = config.terminal.default_rows;
@@ -382,12 +465,13 @@ impl TerminalRuntime {
         }
     }
 
-    /// Resizes the PTY and parser screen.
+    /// Resizes the transport (PTY when present) and parser screen.
     pub fn resize(&mut self, cols: u16, rows: u16, pw: u16, ph: u16) {
         if cols == 0 || rows == 0 {
             return;
         }
 
+        #[cfg(not(target_arch = "wasm32"))]
         if let Some(master) = self.master.get().as_ref() {
             let _ = master.resize(PtySize {
                 rows,
@@ -396,6 +480,8 @@ impl TerminalRuntime {
                 pixel_height: ph,
             });
         }
+        #[cfg(target_arch = "wasm32")]
+        let _ = (pw, ph);
 
         let (_, old_cols) = self.parser.screen().size();
         if old_cols == cols || self.parser.screen().alternate_screen() {
@@ -419,7 +505,7 @@ impl TerminalRuntime {
         self.parser.callbacks().modify_other_keys()
     }
 
-    /// Shuts down the PTY runtime without blocking the Bevy main thread indefinitely.
+    /// Shuts down the transport without blocking the Bevy main thread indefinitely.
     pub fn shutdown(&mut self) {
         if self.shutdown_started {
             return;
@@ -431,19 +517,22 @@ impl TerminalRuntime {
             writer.take();
         }
 
-        if let Some(child) = self.child.as_mut() {
-            let _ = child.kill();
-        }
-        self.child.take();
-        self.master.get().take();
-
-        if self
-            .reader_thread
-            .as_ref()
-            .is_some_and(JoinHandle::is_finished)
-            && let Some(reader_thread) = self.reader_thread.take()
+        #[cfg(not(target_arch = "wasm32"))]
         {
-            let _ = reader_thread.join();
+            if let Some(child) = self.child.as_mut() {
+                let _ = child.kill();
+            }
+            self.child.take();
+            self.master.get().take();
+
+            if self
+                .reader_thread
+                .as_ref()
+                .is_some_and(JoinHandle::is_finished)
+                && let Some(reader_thread) = self.reader_thread.take()
+            {
+                let _ = reader_thread.join();
+            }
         }
     }
 }
@@ -451,5 +540,53 @@ impl TerminalRuntime {
 impl Drop for TerminalRuntime {
     fn drop(&mut self) {
         self.shutdown();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn virtual_channel_round_trips_output_and_input() {
+        let config = AppConfig::default();
+        let (mut runtime, host) = TerminalRuntime::virtual_channel(&config);
+
+        host.feed_tx
+            .send(b"hello".to_vec())
+            .expect("virtual feed should accept bytes");
+        assert_eq!(
+            runtime.try_recv().expect("fed bytes should arrive"),
+            b"hello".to_vec()
+        );
+        assert!(runtime.try_recv().is_err());
+
+        runtime.write_input(b"\x1b[A");
+        assert_eq!(
+            host.input_rx
+                .try_recv()
+                .expect("terminal input should reach the host"),
+            b"\x1b[A".to_vec()
+        );
+    }
+
+    #[test]
+    fn virtual_channel_feed_never_blocks() {
+        let config = AppConfig::default();
+        let (_runtime, host) = TerminalRuntime::virtual_channel(&config);
+        // Far beyond the old sync_channel(16) bound: must not block or fail.
+        for _ in 0..1000 {
+            host.feed_tx
+                .send(vec![0_u8; 1024])
+                .expect("unbounded feed should never fail");
+        }
+    }
+
+    #[test]
+    fn virtual_channel_resize_updates_parser() {
+        let config = AppConfig::default();
+        let (mut runtime, _host) = TerminalRuntime::virtual_channel(&config);
+        runtime.resize(80, 24, 0, 0);
+        assert_eq!(runtime.parser.screen().size(), (24, 80));
     }
 }
