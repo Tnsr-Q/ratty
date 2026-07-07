@@ -231,6 +231,15 @@ section.manifest {
   font-size: 0.72rem;
 }
 
+.manifest tbody tr {
+  cursor: pointer;
+}
+
+.manifest tbody tr:hover td {
+  border-color: var(--mute);
+  background: var(--paper-raised);
+}
+
 .manifest tr.playing td {
   border-color: var(--accent);
   color: var(--accent);
