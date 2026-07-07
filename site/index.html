@@ -116,6 +116,17 @@
         }
       }
 
+      async function playEntry(entry) {
+        player.stop();
+        const header = await player.load(`transmissions/${entry.cast}`);
+        nowPlaying.textContent =
+          `${header.title ?? entry.slug} — ` +
+          `${header.x_ratty?.agent ?? "unknown agent"}`;
+        markPlaying(entry.slug);
+        player.play();
+        return header;
+      }
+
       async function boot() {
         const manifest = await (await fetch("transmissions/index.json")).json();
         applySiteName(manifest);
@@ -125,13 +136,22 @@
           return;
         }
 
-        const first = manifest[0];
-        const header = await player.load(`transmissions/${first.cast}`);
-        nowPlaying.textContent =
-          `${header.title ?? first.slug} — ` +
-          `${header.x_ratty?.agent ?? "unknown agent"}`;
-        markPlaying(first.slug);
-        player.play();
+        // The manifest is the tuner: click a signal to play it. The wasm
+        // session keeps the grid/theme it booted with, so this relies on
+        // every cast sharing the default 104x32 stage.
+        document
+          .querySelector("#manifest-table tbody")
+          .addEventListener("click", (event) => {
+            const row = event.target.closest("tr[data-slug]");
+            if (!row || row.classList.contains("playing")) return;
+            const entry = manifest.find((e) => e.slug === row.dataset.slug);
+            if (!entry) return;
+            playEntry(entry).catch((error) =>
+              degrade(error?.message ?? String(error)),
+            );
+          });
+
+        const header = await playEntry(manifest[0]);
 
         if (WasmBackend.supported()) {
           verdict.textContent = "vessel: summoning wasm";
