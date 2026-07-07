@@ -88,6 +88,10 @@ jobs:
           mkdir -p _pages/transmissions
           cp -r transmissions/. _pages/transmissions/
       - uses: actions/configure-pages@v5
+        with:
+          # First-run bootstrap: create/enable the Pages site (source:
+          # GitHub Actions) if the repository doesn't have one yet.
+          enablement: true
       - uses: actions/upload-pages-artifact@v3
         with:
           path: _pages
