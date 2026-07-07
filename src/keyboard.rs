@@ -14,9 +14,9 @@ use crate::config::{AppConfig, BindingAction, FontConfig, KeyBindingConfig};
 use crate::mouse::{TerminalSelection, encode_mouse_wheel};
 use crate::runtime::TerminalRuntime;
 use crate::scene::{
-    MobiusTransition, TerminalPlaneBackLayoutQuery, TerminalPlaneLayoutQuery, TerminalPlaneView,
-    TerminalPlaneWarp, TerminalPresentation, TerminalPresentationMode, TerminalViewport,
-    sync_terminal_layout,
+    MobiusTransition, StageTween, TerminalPlaneBackLayoutQuery, TerminalPlaneLayoutQuery,
+    TerminalPlaneView, TerminalPlaneWarp, TerminalPresentation, TerminalPresentationMode,
+    TerminalViewport, sync_terminal_layout,
 };
 use crate::terminal::{TerminalRedrawState, TerminalSurface, render_scale_for_window};
 
@@ -333,6 +333,7 @@ pub struct KeyboardSystemParams<'w, 's> {
     plane_view: ResMut<'w, TerminalPlaneView>,
     presentation: ResMut<'w, TerminalPresentation>,
     mobius_transition: ResMut<'w, MobiusTransition>,
+    stage_tween: ResMut<'w, StageTween>,
     clipboard: NonSendMut<'w, TerminalClipboard>,
     runtime: ResMut<'w, TerminalRuntime>,
     terminal: ResMut<'w, TerminalSurface>,
@@ -379,11 +380,17 @@ pub fn handle_keyboard_input(
                 BindingAction::Toggle3DMode => {
                     params.presentation.toggle_plane_mode();
                     params.mobius_transition.stop();
+                    if params.stage_tween.active {
+                        params.stage_tween.stop();
+                    }
                     params.selection.clear();
                     params.redraw.request();
                     continue;
                 }
                 BindingAction::ToggleMobiusMode => {
+                    if params.stage_tween.active {
+                        params.stage_tween.stop();
+                    }
                     if params.presentation.mode == TerminalPresentationMode::Mobius3d {
                         let current_zoom = if params.mobius_transition.active {
                             params.mobius_transition.current_zoom()
@@ -455,6 +462,9 @@ pub fn handle_keyboard_input(
                     } else {
                         -0.08
                     };
+                    if params.stage_tween.active {
+                        params.stage_tween.stop();
+                    }
                     params.plane_warp.adjust(delta);
                     params.redraw.request();
                     continue;

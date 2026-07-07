@@ -1,8 +1,10 @@
 //! Scene setup and presentation resources.
 
 mod mobius;
+mod stage;
 
 pub use mobius::{MobiusTransition, MobiusTransitionDirection};
+pub use stage::{StageChannel, StageTween};
 
 use bevy::asset::RenderAssetUsages;
 use bevy::camera::ClearColorConfig;
@@ -71,7 +73,7 @@ pub struct TerminalViewport {
 }
 
 /// Terminal presentation mode.
-#[derive(Resource, Clone, Copy, PartialEq, Eq)]
+#[derive(Resource, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TerminalPresentationMode {
     /// Flat 2D presentation.
     Flat2d,
@@ -120,6 +122,39 @@ impl TerminalPresentation {
             }
         };
     }
+}
+
+/// Applies an absolute presentation-mode change, routing Möbius entry and
+/// exit through the camera transition exactly like the keyboard and web
+/// controls. Unlike the keyboard toggles, the change is absolute: leaving
+/// the Möbius view lands on the requested mode, not the mode it was entered
+/// from. Returns `true` when the mode actually changed.
+pub(crate) fn apply_stage_mode_change(
+    target: TerminalPresentationMode,
+    presentation: &mut TerminalPresentation,
+    plane_view: &TerminalPlaneView,
+    mobius: &mut MobiusTransition,
+) -> bool {
+    if target == presentation.mode {
+        return false;
+    }
+    let current = presentation.mode;
+    if current == TerminalPresentationMode::Mobius3d {
+        let current_zoom = if mobius.active {
+            mobius.current_zoom()
+        } else {
+            plane_view.zoom
+        };
+        mobius.source_mode = target;
+        mobius.begin_exit(plane_view, current_zoom);
+    } else if target == TerminalPresentationMode::Mobius3d {
+        presentation.mode = TerminalPresentationMode::Mobius3d;
+        mobius.begin_enter(current, plane_view);
+    } else {
+        presentation.mode = target;
+        mobius.stop();
+    }
+    true
 }
 
 /// Camera state for 3D presentation.
@@ -623,4 +658,84 @@ fn terminal_plane_mesh(x_segments: u32, y_segments: u32) -> Mesh {
     .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
     .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, uvs)
     .with_inserted_indices(Indices::U32(indices))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixtures() -> (TerminalPresentation, TerminalPlaneView, MobiusTransition) {
+        (
+            TerminalPresentation {
+                mode: TerminalPresentationMode::Flat2d,
+            },
+            TerminalPlaneView::default(),
+            MobiusTransition::default(),
+        )
+    }
+
+    #[test]
+    fn plain_mode_change_is_instant_and_stops_the_transition() {
+        let (mut presentation, view, mut mobius) = fixtures();
+        mobius.active = true;
+        let changed = apply_stage_mode_change(
+            TerminalPresentationMode::Plane3d,
+            &mut presentation,
+            &view,
+            &mut mobius,
+        );
+        assert!(changed);
+        assert_eq!(presentation.mode, TerminalPresentationMode::Plane3d);
+        assert!(!mobius.active);
+    }
+
+    #[test]
+    fn entering_mobius_starts_the_camera_transition() {
+        let (mut presentation, view, mut mobius) = fixtures();
+        let changed = apply_stage_mode_change(
+            TerminalPresentationMode::Mobius3d,
+            &mut presentation,
+            &view,
+            &mut mobius,
+        );
+        assert!(changed);
+        assert_eq!(presentation.mode, TerminalPresentationMode::Mobius3d);
+        assert!(mobius.active);
+        assert_eq!(mobius.direction, MobiusTransitionDirection::Entering);
+        assert_eq!(mobius.source_mode, TerminalPresentationMode::Flat2d);
+    }
+
+    #[test]
+    fn leaving_mobius_exits_toward_the_requested_mode() {
+        let (mut presentation, view, mut mobius) = fixtures();
+        presentation.mode = TerminalPresentationMode::Mobius3d;
+        mobius.source_mode = TerminalPresentationMode::Flat2d;
+        let changed = apply_stage_mode_change(
+            TerminalPresentationMode::Plane3d,
+            &mut presentation,
+            &view,
+            &mut mobius,
+        );
+        assert!(changed);
+        // The mode stays Mobius3d until the exit transition finishes, which
+        // then restores `source_mode` - now the requested target.
+        assert_eq!(presentation.mode, TerminalPresentationMode::Mobius3d);
+        assert!(mobius.active);
+        assert_eq!(mobius.direction, MobiusTransitionDirection::Exiting);
+        assert_eq!(mobius.source_mode, TerminalPresentationMode::Plane3d);
+        assert_eq!(mobius.start_zoom, view.zoom);
+    }
+
+    #[test]
+    fn same_mode_is_a_no_op() {
+        let (mut presentation, view, mut mobius) = fixtures();
+        let changed = apply_stage_mode_change(
+            TerminalPresentationMode::Flat2d,
+            &mut presentation,
+            &view,
+            &mut mobius,
+        );
+        assert!(!changed);
+        assert!(!mobius.active);
+    }
 }

@@ -6,6 +6,8 @@
 //! - [`crate::keyboard::handle_keyboard_input`]
 //! - [`crate::mouse::handle_mouse_input`]
 //! - [`handle_window_resize`]
+//! - [`apply_rgp_stage`]
+//! - [`animate_stage_tween`]
 //! - [`crate::scene::apply_terminal_presentation`]
 //! - [`apply_inline_objects`]
 //! - [`render_terminal_widget`]
@@ -33,12 +35,13 @@ use crate::model::spawn_cursor_model;
 use crate::mouse::TerminalSelection;
 use crate::present::TerminalPresentMaterial;
 use crate::rendering::{sync_plane_texture, sync_terminal_debug_image};
+use crate::rgp::RgpStageMode;
 use crate::runtime::TerminalRuntime;
 use crate::scene::{
-    MobiusTransition, ModelLoadState, TerminalPlane, TerminalPlaneBack,
+    MobiusTransition, ModelLoadState, StageChannel, StageTween, TerminalPlane, TerminalPlaneBack,
     TerminalPlaneBackLayoutQuery, TerminalPlaneLayoutQuery, TerminalPlaneMeshes, TerminalPlaneView,
     TerminalPlaneWarp, TerminalPresentation, TerminalPresentationMode, TerminalViewport,
-    sync_terminal_layout,
+    apply_stage_mode_change, sync_terminal_layout,
 };
 use crate::terminal::{
     TerminalRedrawState, TerminalSurface, TerminalWidget, render_scale_for_window,
@@ -1468,6 +1471,143 @@ pub fn animate_mobius_transition(
         }
         mobius_transition.stop();
         redraw.request();
+    }
+}
+
+/// Applies stage updates queued from RGP `c` sequences to the presentation
+/// resources, mirroring the keyboard and web-control semantics. Mode changes
+/// dispatch instantly (the Möbius transition owns its own clock); the other
+/// fields apply instantly or start a [`StageTween`] when `dur` is set.
+pub fn apply_rgp_stage(
+    mut inline_objects: ResMut<TerminalInlineObjects>,
+    mut presentation: ResMut<TerminalPresentation>,
+    mut plane_warp: ResMut<TerminalPlaneWarp>,
+    mut plane_view: ResMut<TerminalPlaneView>,
+    mut mobius_transition: ResMut<MobiusTransition>,
+    mut stage_tween: ResMut<StageTween>,
+    mut redraw: ResMut<TerminalRedrawState>,
+) {
+    for update in inline_objects.take_stage_updates() {
+        let mut applied = false;
+
+        if let Some(mode) = update.mode {
+            let target = match mode {
+                RgpStageMode::Flat2d => TerminalPresentationMode::Flat2d,
+                RgpStageMode::Plane3d => TerminalPresentationMode::Plane3d,
+                RgpStageMode::Mobius3d => TerminalPresentationMode::Mobius3d,
+            };
+            if apply_stage_mode_change(
+                target,
+                &mut presentation,
+                &plane_view,
+                &mut mobius_transition,
+            ) {
+                // A mode change is a scene cut: it cancels any camera tween.
+                stage_tween.stop();
+                applied = true;
+            }
+        }
+
+        // While the Möbius transition owns the camera, view fields are
+        // dropped (mirroring the mouse gate); warp is never gated.
+        let camera_gated = mobius_transition.active;
+        let warp = update.warp.map(|value| value.clamp(0.0, 1.0));
+        let yaw = if camera_gated { None } else { update.yaw };
+        let pitch = if camera_gated { None } else { update.pitch };
+        let zoom = if camera_gated {
+            None
+        } else {
+            update.zoom.map(|value| value.clamp(0.1, 4.0))
+        };
+
+        if warp.is_some() || yaw.is_some() || pitch.is_some() || zoom.is_some() {
+            let duration = update.dur.unwrap_or(0.0);
+            if duration > 0.0 {
+                // A new tween replaces the previous one wholesale and
+                // retargets from the current live values.
+                *stage_tween = StageTween {
+                    active: true,
+                    elapsed_secs: 0.0,
+                    duration_secs: duration,
+                    ease: update.ease.unwrap_or_default(),
+                    warp: warp.map(|end| StageChannel {
+                        start: plane_warp.amount,
+                        end,
+                    }),
+                    yaw: yaw.map(|end| StageChannel {
+                        start: plane_view.yaw,
+                        end,
+                    }),
+                    pitch: pitch.map(|end| StageChannel {
+                        start: plane_view.pitch,
+                        end,
+                    }),
+                    zoom: zoom.map(|end| StageChannel {
+                        start: plane_view.zoom,
+                        end,
+                    }),
+                };
+            } else {
+                if stage_tween.active {
+                    stage_tween.stop();
+                }
+                if let Some(value) = warp {
+                    plane_warp.amount = value;
+                }
+                if let Some(value) = yaw {
+                    plane_view.yaw = value;
+                }
+                if let Some(value) = pitch {
+                    plane_view.pitch = value;
+                }
+                if let Some(value) = zoom {
+                    plane_view.zoom = value;
+                }
+            }
+            applied = true;
+        }
+
+        if applied {
+            redraw.request();
+        }
+    }
+}
+
+/// Advances the stage tween, feeding the warp and camera resources every
+/// frame so the change-driven presentation systems keep firing.
+pub fn animate_stage_tween(
+    time: Res<Time>,
+    mut stage_tween: ResMut<StageTween>,
+    mut plane_warp: ResMut<TerminalPlaneWarp>,
+    mut plane_view: ResMut<TerminalPlaneView>,
+    mut redraw: ResMut<TerminalRedrawState>,
+) {
+    if !stage_tween.active {
+        return;
+    }
+
+    stage_tween.elapsed_secs += time.delta_secs();
+    let progress = (stage_tween.elapsed_secs / stage_tween.duration_secs).clamp(0.0, 1.0);
+    let eased = stage_tween.ease.apply(progress);
+
+    if let Some(channel) = stage_tween.warp {
+        plane_warp.amount = channel.sample(eased).clamp(0.0, 1.0);
+    }
+    if let Some(channel) = stage_tween.yaw {
+        plane_view.yaw = channel.sample(eased);
+    }
+    if let Some(channel) = stage_tween.pitch {
+        plane_view.pitch = channel.sample(eased);
+    }
+    if let Some(channel) = stage_tween.zoom {
+        plane_view.zoom = channel.sample(eased).clamp(0.1, 4.0);
+    }
+    redraw.request();
+
+    if progress >= 1.0 {
+        // Eased progress is exactly 1.0 at the end for every curve, so the
+        // final write above landed the exact target values.
+        stage_tween.stop();
     }
 }
 

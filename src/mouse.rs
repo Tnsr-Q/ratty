@@ -10,8 +10,8 @@ use vt100::{MouseProtocolEncoding, MouseProtocolMode};
 
 use crate::runtime::TerminalRuntime;
 use crate::scene::{
-    MobiusTransition, TerminalPlaneView, TerminalPresentation, TerminalPresentationMode,
-    TerminalViewport,
+    MobiusTransition, StageTween, TerminalPlaneView, TerminalPresentation,
+    TerminalPresentationMode, TerminalViewport,
 };
 use crate::terminal::TerminalSurface;
 
@@ -243,6 +243,7 @@ pub struct MouseSystemParams<'w, 's> {
     presentation: Res<'w, TerminalPresentation>,
     mobius_transition: Res<'w, MobiusTransition>,
     plane_view: ResMut<'w, TerminalPlaneView>,
+    stage_tween: ResMut<'w, StageTween>,
     selection: ResMut<'w, TerminalSelection>,
     redraw: ResMut<'w, crate::terminal::TerminalRedrawState>,
 }
@@ -264,6 +265,7 @@ pub(crate) fn handle_mouse_input(
         presentation,
         mobius_transition,
         plane_view,
+        stage_tween,
         selection,
         redraw,
     } = &mut params;
@@ -295,6 +297,9 @@ pub(crate) fn handle_mouse_input(
             if plane_view.rotating {
                 if let Some(last) = plane_view.last_rotate_cursor {
                     let delta = event.position - last;
+                    if stage_tween.active {
+                        stage_tween.stop();
+                    }
                     plane_view.yaw += delta.x * 0.005;
                     plane_view.pitch -= delta.y * 0.005;
                     redraw.request();
@@ -303,6 +308,9 @@ pub(crate) fn handle_mouse_input(
             } else if plane_view.panning {
                 if let Some(last) = plane_view.last_pan_cursor {
                     let delta = event.position - last;
+                    if stage_tween.active {
+                        stage_tween.stop();
+                    }
                     plane_view.camera_offset.x -= delta.x * plane_view.zoom;
                     plane_view.camera_offset.y += delta.y * plane_view.zoom;
                     redraw.request();
@@ -530,6 +538,9 @@ pub(crate) fn handle_mouse_input(
             TerminalPresentationMode::Plane3d | TerminalPresentationMode::Mobius3d
         ) && delta != 0.0
         {
+            if stage_tween.active {
+                stage_tween.stop();
+            }
             plane_view.zoom = (plane_view.zoom - delta).clamp(0.1, 4.0);
             redraw.request();
         }
