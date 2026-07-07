@@ -61,6 +61,7 @@ pub fn compile(scene: &Scene, scene_dir: &Path) -> Result<Cast> {
             warp: scene.stage.warp,
             view: scene.stage.view,
             loop_: scene.stage.loop_.then_some(true),
+            site_name: scene.meta.site_name.clone(),
             checksum: None,
         }),
     };

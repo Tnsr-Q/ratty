@@ -40,6 +40,11 @@ pub struct Meta {
     /// Art-direction mood tag.
     #[serde(default)]
     pub mood: Option<String>,
+    /// The site name this transmission establishes. Set ONLY by a naming
+    /// ceremony (see the rgp-composer skill's naming-transmission brief);
+    /// the site masthead renders it in place of ⟨unnamed⟩.
+    #[serde(default)]
+    pub site_name: Option<String>,
 }
 
 /// Stage configuration.

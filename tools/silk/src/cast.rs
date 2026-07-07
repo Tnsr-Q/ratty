@@ -66,6 +66,11 @@ pub struct XRatty {
     /// Player should loop the transmission.
     #[serde(rename = "loop", skip_serializing_if = "Option::is_none")]
     pub loop_: Option<bool>,
+    /// The site name this transmission establishes — set ONLY by a naming
+    /// ceremony (see the rgp-composer skill). The founding artifact carries
+    /// the name it founds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub site_name: Option<String>,
     /// Optional `sha256:<hex>` checksum of all event lines.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub checksum: Option<String>,
@@ -162,6 +167,10 @@ struct IndexEntry {
     mode: Option<String>,
     #[serde(rename = "loop")]
     loop_: Option<bool>,
+    /// Surfaced from the cast's `x_ratty.site_name`: the site masthead
+    /// renders this instead of the ⟨unnamed⟩ placeholder.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    site_name: Option<String>,
     duration_secs: f64,
     events: usize,
     bytes: usize,
@@ -192,6 +201,7 @@ pub fn write_index(dir: &Path) -> Result<usize> {
             mood: x_ratty.and_then(|x| x.mood.clone()),
             mode: x_ratty.and_then(|x| x.mode.clone()),
             loop_: x_ratty.and_then(|x| x.loop_),
+            site_name: x_ratty.and_then(|x| x.site_name.clone()),
             duration_secs: cast.duration_secs(),
             events: cast.events.len(),
             bytes: fs::metadata(&cast_path)?.len() as usize,

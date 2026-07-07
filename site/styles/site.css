@@ -58,6 +58,12 @@ header.masthead {
   text-decoration-thickness: 3px;
 }
 
+/* The named state: the ceremony has happened. */
+.masthead .name.named {
+  color: var(--accent);
+  text-decoration: none;
+}
+
 .masthead .vow {
   margin-top: 0.4rem;
   color: var(--mute);
