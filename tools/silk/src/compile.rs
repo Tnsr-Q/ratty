@@ -761,24 +761,27 @@ mod tests {
         assert!(cast.events[0].data.ends_with("hi\x1b[K\x1b[0m"));
     }
 
-    /// Golden back-compat proof: the committed orchard transmission (pure
-    /// v1) must recompile byte-identically. If this fails, a compiler
-    /// change altered v1 output — that is a regression, not a test to
-    /// update casually.
+    /// Golden proof: every committed transmission must recompile
+    /// byte-identically. The orchard is pure v1 (back-compat lock);
+    /// predator-and-frame exercises the full v2 surface. If this fails, a
+    /// compiler change altered shipped output — that is a regression, not
+    /// a test to update casually.
     #[test]
-    fn golden_orchard_compiles_byte_identically() {
+    fn golden_transmissions_compile_byte_identically() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../transmissions");
-        let scene_path = root.join("orchard-upside-down/scene.json");
-        let source = fs::read_to_string(&scene_path).expect("read orchard scene");
-        let scene: Scene = serde_json::from_str(&source).expect("parse orchard scene");
-        let cast = compile(&scene, scene_path.parent().expect("scene dir")).expect("compile");
-        let jsonl = cast.to_jsonl().expect("serialize");
-        let committed =
-            fs::read_to_string(root.join("orchard-upside-down/cast.silk")).expect("read cast");
-        assert_eq!(
-            jsonl, committed,
-            "orchard cast drifted from its committed bytes"
-        );
+        for slug in ["orchard-upside-down", "predator-and-frame"] {
+            let scene_path = root.join(slug).join("scene.json");
+            let source = fs::read_to_string(&scene_path).expect("read scene");
+            let scene: Scene = serde_json::from_str(&source).expect("parse scene");
+            let cast = compile(&scene, scene_path.parent().expect("scene dir")).expect("compile");
+            let jsonl = cast.to_jsonl().expect("serialize");
+            let committed =
+                fs::read_to_string(root.join(slug).join("cast.silk")).expect("read cast");
+            assert_eq!(
+                jsonl, committed,
+                "{slug} cast drifted from its committed bytes"
+            );
+        }
     }
 
     #[test]

@@ -10,5 +10,17 @@
     "events": 489,
     "bytes": 52350,
     "cast": "orchard-upside-down/cast.silk"
+  },
+  {
+    "slug": "predator-and-frame",
+    "title": "Predator and Frame",
+    "agent": "loom/prototype-0",
+    "mood": "patient-predatory",
+    "mode": "plane3d",
+    "loop": true,
+    "duration_secs": 23.5,
+    "events": 405,
+    "bytes": 36739,
+    "cast": "predator-and-frame/cast.silk"
   }
 ]
