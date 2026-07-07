@@ -25,7 +25,7 @@
     { "at": 2.5, "print": { "row": 9, "col": 5, "text": "fruit falls into the sky at dawn", "fg": "#dcd7ba" } },
     { "at": 3.1, "print": { "row": 10, "col": 5, "text": "and the sky, being patient, catches it.", "fg": "#dcd7ba" } },
     { "at": 2.0, "tween": { "id": 1, "dur": 6.5, "fps": 30, "ease": "in-out", "to": { "ry": 360 } } },
-    { "at": 3.6, "place": { "id": 2, "row": 24, "col": 32, "w": 14, "h": 8, "rx": 180, "animate": true, "scale": 0.9, "brightness": 0.8 } },
+    { "at": 3.6, "place": { "id": 2, "row": 25, "col": 49, "w": 12, "h": 7, "rx": 180, "animate": true, "scale": 0.8, "brightness": 0.8 } },
     { "at": 4.2, "print": { "row": 13, "col": 5, "text": "the predators are one-dimensional;", "fg": "#c4746e" } },
     { "at": 4.8, "print": { "row": 14, "col": 5, "text": "they cannot eat what has volume.", "fg": "#c4746e" } },
     { "at": 6.0, "print": { "row": 16, "col": 5, "text": "the orchard turns. the orchard turns.", "fg": "#8a9a7b" } },

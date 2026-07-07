@@ -51,6 +51,7 @@ Each object has:
 - `p` [place object](#3-place-object)
 - `u` [update object](#4-update-object)
 - `d` [delete object](#5-delete-object)
+- `c` [stage / camera](#6-stage--camera) (v2)
 
 ### 1. Support Query
 
@@ -65,12 +66,12 @@ ESC _ ratty;g;s ESC \
 Ratty replies:
 
 ```text
-ESC _ ratty;g;s;v=1;fmt=obj|glb|stl;path=1;payload=1;chunk=1;anim=1;depth=1;color=1;brightness=1;transform=1;update=1;normalize=1 ESC \
+ESC _ ratty;g;s;v=2;fmt=obj|glb|stl;path=1;payload=1;chunk=1;anim=1;depth=1;color=1;brightness=1;transform=1;update=1;normalize=1;stage=1;tween=1 ESC \
 ```
 
 Fields:
 
-- `v=1`: protocol version
+- `v=2`: protocol version
 - `fmt=glb`: `obj`, `glb` and `stl` are supported
 - `path=1`: path-based object registration is supported
 - `payload=1`: payload-based asset registration is supported
@@ -82,8 +83,18 @@ Fields:
 - `transform=1`: transform fields such as rotation and offsets are supported
 - `update=1`: `u` object updates are supported
 - `normalize=1`: `normalize=<0|1>` registration is supported for OBJ assets
+- `stage=1`: the `c` stage/camera verb is supported (v2)
+- `tween=1`: `dur`/`ease` stage tweening on `c` is supported (v2)
+- `objanim=1`: per-object `spin`/`bob`/`bobamp`/`phase` animation is supported (v2)
 
 If no reply arrives, the terminal does not support the protocol.
+
+#### Versioning
+
+Unknown verbs and unknown `key=value` fields are silently ignored, so v2
+constructs degrade gracefully on v1 terminals: a cast that stages the camera
+still plays there, just without the staging. New capability keys are always
+appended to the reply, so v1 reply parsers keep working.
 
 ### 2. Register Object Asset
 
@@ -179,7 +190,29 @@ Fields:
 - `rx`, `ry`, `rz`: optional rotation in degrees, defaults to `0`
 - `sx`, `sy`, `sz`: optional non-uniform scale, defaults to `1`
 
-Clients that only send the original v1 fields still work unchanged.
+Per-object animation fields (v2), all optional:
+
+- `spin`: spin speed in radians per second
+- `bob`: bob speed in radians per second
+- `bobamp`: bob amplitude as a fraction of the cell height
+- `phase`: constant phase offset in radians applied to spin and bob
+
+The animation truth table:
+
+| `animate` | v2 fields          | behavior                                             |
+| --------- | ------------------ | ---------------------------------------------------- |
+| absent/0  | any                | rest pose; all animation fields are inert            |
+| 1         | none               | global-config spin+tilt+bob, exactly as in v1        |
+| 1         | any subset         | per-channel rates; absent channels use the global    |
+
+`animate` stays the single master switch. A rate of `0` holds the current
+value (`spin=0` freezes the angle mid-pose), and `phase` desynchronizes
+objects that would otherwise move in lockstep. Tilt remains coupled to spin
+(`0.7 ×`), as in v1. Rates integrate frame-to-frame, so changing them
+mid-flight is smooth rather than snapping.
+
+Clients that only send the original v1 fields still work unchanged — the
+motion is identical to v1.
 
 ### 4. Update Object
 
@@ -202,6 +235,13 @@ Fields are optional and mirror the mutable fields from `p`:
 - `px`, `py`, `pz`
 - `rx`, `ry`, `rz`
 - `sx`, `sy`, `sz`
+- `spin`, `bob`, `bobamp`, `phase` (v2)
+
+`depth`, `color` and `brightness` force the object to respawn; every other
+field — including the v2 animation fields — applies live to the placed
+object, which makes them suitable for per-frame streaming. Like `color`,
+the v2 animation fields are set-only: an update can change them but not
+clear them back to the configured globals.
 
 ### 5. Delete Object
 
@@ -218,6 +258,53 @@ Delete all Ratty graphics objects:
 ```text
 ESC _ ratty;g;d ESC \
 ```
+
+### 6. Stage / Camera
+
+*Added in v2.* Controls the terminal's own presentation — the stage the
+objects and cells live on — from the byte stream: presentation mode, plane
+warp, and the 3D camera.
+
+Client sends:
+
+```text
+ESC _ ratty;g;c;mode=plane3d;warp=0.35;yaw=0.18;pitch=0.08;zoom=1.0;dur=2.0;ease=inout ESC \
+```
+
+Every field is optional and absolute; absent fields leave the terminal's
+current state untouched. A bare `c` is a legal no-op.
+
+Fields:
+
+- `mode`: presentation mode, `flat2d`, `plane3d`, or `mobius3d`
+- `warp`: plane warp amount, clamped to `0.0..=1.0`
+- `yaw`: camera yaw in radians
+- `pitch`: camera pitch in radians
+- `zoom`: orthographic camera zoom, clamped to `0.1..=4.0`
+- `dur`: optional tween duration in seconds for `warp`/`yaw`/`pitch`/`zoom`;
+  absent or `<= 0` applies instantly
+- `ease`: optional tween easing, `linear`, `in`, `out`, or `inout`
+  (default `inout`)
+
+Rules, kept deliberately boring:
+
+- `mode` changes always dispatch instantly; entering or leaving `mobius3d`
+  animates through the terminal's own Möbius camera transition, which owns
+  its own clock. `dur`/`ease` never apply to `mode`.
+- A `mode` change cancels any in-flight stage tween — it is a scene cut,
+  not a blend.
+- A second `c` replaces a running tween entirely; re-specified fields
+  retarget from their current interpolated values, unspecified in-flight
+  fields freeze where they are.
+- Direct user input (mouse rotate/pan/zoom, warp and mode keys) wins:
+  it cancels a running stage tween.
+- While a Möbius transition is animating, `yaw`/`pitch`/`zoom` in a `c`
+  are dropped (matching the mouse gate); `warp` still applies.
+- Camera fields sent in `flat2d` are stored and take effect when a 3D
+  mode is next entered.
+
+Malformed or non-finite values are dropped per-key, like every other RGP
+field. On v1 terminals the whole verb is ignored and the cast still plays.
 
 ## Example Session
 
@@ -237,6 +324,13 @@ Rotate it later:
 
 ```text
 ESC _ ratty;g;u;id=7;ry=180 ESC \
+```
+
+Glide the stage into the warped 3D view over two seconds (v2):
+
+```text
+ESC _ ratty;g;c;mode=plane3d ESC \
+ESC _ ratty;g;c;warp=0.4;pitch=0.12;dur=2.0 ESC \
 ```
 
 Delete it:

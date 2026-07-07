@@ -42,7 +42,7 @@ pub struct MobiusTransition {
 }
 
 /// Direction of the Mobius transition.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MobiusTransitionDirection {
     /// Entering the Mobius view.
     Entering,

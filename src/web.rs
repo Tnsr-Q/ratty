@@ -22,8 +22,8 @@ use crate::config::AppConfig;
 use crate::plugin::TerminalPlugin;
 use crate::runtime::TerminalRuntime;
 use crate::scene::{
-    MobiusTransition, TerminalPlaneView, TerminalPlaneWarp, TerminalPresentation,
-    TerminalPresentationMode,
+    MobiusTransition, StageTween, TerminalPlaneView, TerminalPlaneWarp, TerminalPresentation,
+    TerminalPresentationMode, apply_stage_mode_change,
 };
 use crate::terminal::{TerminalRedrawState, TerminalSurface};
 
@@ -185,6 +185,7 @@ fn drain_web_controls(
     mut warp: ResMut<TerminalPlaneWarp>,
     mut view: ResMut<TerminalPlaneView>,
     mut mobius: ResMut<MobiusTransition>,
+    mut stage_tween: ResMut<StageTween>,
     mut redraw: ResMut<TerminalRedrawState>,
 ) {
     let pending = match queue.0.lock() {
@@ -192,24 +193,16 @@ fn drain_web_controls(
         Err(_) => return,
     };
 
-    if let Some(mode) = pending.mode
-        && mode != presentation.mode
+    // JS controls are user input: they win over any scripted stage tween.
+    if (pending.mode.is_some() || pending.warp.is_some() || pending.view.is_some())
+        && stage_tween.active
     {
-        let current = presentation.mode;
-        if current == TerminalPresentationMode::Mobius3d {
-            let current_zoom = if mobius.active {
-                mobius.current_zoom()
-            } else {
-                view.zoom
-            };
-            mobius.begin_exit(&view, current_zoom);
-        } else if mode == TerminalPresentationMode::Mobius3d {
-            presentation.mode = TerminalPresentationMode::Mobius3d;
-            mobius.begin_enter(current, &view);
-        } else {
-            presentation.mode = mode;
-            mobius.stop();
-        }
+        stage_tween.stop();
+    }
+
+    if let Some(mode) = pending.mode
+        && apply_stage_mode_change(mode, &mut presentation, &view, &mut mobius)
+    {
         redraw.request();
     }
 

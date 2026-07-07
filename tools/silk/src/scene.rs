@@ -2,9 +2,10 @@
 //!
 //! A scene is JSON with `meta`, `stage`, and a `cast` of timed steps. Each
 //! step carries `at` (absolute seconds) plus exactly one verb field:
-//! `print`, `register`, `place`, `update`, `tween`, `delete`, `marker`, or
-//! `clear`. Rows and columns are 0-based terminal cells; `place.row`/`col`
-//! are the CENTER of the placement, matching RGP semantics.
+//! `print`, `register`, `place`, `update`, `tween`, `camera`, `delete`,
+//! `marker`, or `clear`. Rows and columns are 0-based terminal cells;
+//! `place.row`/`col` are the CENTER of the placement, matching RGP
+//! semantics.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -39,6 +40,11 @@ pub struct Meta {
     /// Art-direction mood tag.
     #[serde(default)]
     pub mood: Option<String>,
+    /// The site name this transmission establishes. Set ONLY by a naming
+    /// ceremony (see the rgp-composer skill's naming-transmission brief);
+    /// the site masthead renders it in place of ⟨unnamed⟩.
+    #[serde(default)]
+    pub site_name: Option<String>,
 }
 
 /// Stage configuration.
@@ -115,6 +121,9 @@ pub struct Step {
     /// Interpolate live-update fields over a duration.
     #[serde(default)]
     pub tween: Option<TweenArgs>,
+    /// Stage/camera move (RGP v2 `c` verb).
+    #[serde(default)]
+    pub camera: Option<CameraArgs>,
     /// Delete one object (`{"id": N}`) or all (`"all"`).
     #[serde(default)]
     pub delete: Option<DeleteArg>,
@@ -134,6 +143,7 @@ impl Step {
             + usize::from(self.place.is_some())
             + usize::from(self.update.is_some())
             + usize::from(self.tween.is_some())
+            + usize::from(self.camera.is_some())
             + usize::from(self.delete.is_some())
             + usize::from(self.marker.is_some())
             + usize::from(self.clear.is_some())
@@ -159,6 +169,9 @@ pub struct PrintArgs {
     /// Bold text.
     #[serde(default)]
     pub bold: bool,
+    /// Erase to end of line after the text (hygiene when reusing a row).
+    #[serde(default)]
+    pub el: bool,
 }
 
 /// `register` verb arguments.
@@ -242,6 +255,18 @@ pub struct PlaceArgs {
     /// Non-uniform scale.
     #[serde(default)]
     pub sz: Option<f32>,
+    /// Spin speed in radians per second (RGP v2); omitted = global config.
+    #[serde(default)]
+    pub spin: Option<f32>,
+    /// Bob speed in radians per second (RGP v2); omitted = global config.
+    #[serde(default)]
+    pub bob: Option<f32>,
+    /// Bob amplitude as a fraction of cell height (RGP v2).
+    #[serde(default)]
+    pub bobamp: Option<f32>,
+    /// Phase offset in radians applied to spin and bob (RGP v2).
+    #[serde(default)]
+    pub phase: Option<f32>,
 }
 
 /// `update` verb arguments: partial style/transform update.
@@ -292,6 +317,18 @@ pub struct UpdateArgs {
     /// Non-uniform scale.
     #[serde(default)]
     pub sz: Option<f32>,
+    /// See [`PlaceArgs::spin`]. Set-only: cannot revert to the global rate.
+    #[serde(default)]
+    pub spin: Option<f32>,
+    /// See [`PlaceArgs::bob`]. Set-only.
+    #[serde(default)]
+    pub bob: Option<f32>,
+    /// See [`PlaceArgs::bobamp`]. Set-only.
+    #[serde(default)]
+    pub bobamp: Option<f32>,
+    /// See [`PlaceArgs::phase`].
+    #[serde(default)]
+    pub phase: Option<f32>,
 }
 
 /// `tween` verb arguments: interpolated live updates.
@@ -315,10 +352,40 @@ pub struct TweenArgs {
 
 /// Fields a tween may animate: live-update fields only. `depth`, `color`,
 /// and `brightness` force the renderer to despawn/respawn the object every
-/// update and are rejected in tweens.
-pub const TWEENABLE_FIELDS: [&str; 10] = [
-    "px", "py", "pz", "rx", "ry", "rz", "sx", "sy", "sz", "scale",
+/// update and are rejected in tweens. The v2 animation rates are live and
+/// therefore tweenable (a tween over `spin` accelerates the spin smoothly).
+pub const TWEENABLE_FIELDS: [&str; 14] = [
+    "px", "py", "pz", "rx", "ry", "rz", "sx", "sy", "sz", "scale", "spin", "bob", "bobamp", "phase",
 ];
+
+/// `camera` verb arguments: an RGP v2 `c` stage move. All fields optional
+/// and absolute; `dur`/`ease` tween warp/yaw/pitch/zoom engine-side (mode
+/// changes are always instant).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CameraArgs {
+    /// Presentation mode: `flat2d`, `plane3d`, `mobius3d`.
+    #[serde(default)]
+    pub mode: Option<String>,
+    /// Plane warp amount, `0.0..=1.0`.
+    #[serde(default)]
+    pub warp: Option<f32>,
+    /// Camera yaw in radians.
+    #[serde(default)]
+    pub yaw: Option<f32>,
+    /// Camera pitch in radians.
+    #[serde(default)]
+    pub pitch: Option<f32>,
+    /// Camera zoom, `0.1..=4.0`.
+    #[serde(default)]
+    pub zoom: Option<f32>,
+    /// Tween duration in seconds; omitted = instant.
+    #[serde(default)]
+    pub dur: Option<f64>,
+    /// Easing: `linear`, `in`, `out`, or `in-out` (default `in-out`).
+    #[serde(default)]
+    pub ease: Option<String>,
+}
 
 /// `delete` verb argument.
 #[derive(Debug, Deserialize)]

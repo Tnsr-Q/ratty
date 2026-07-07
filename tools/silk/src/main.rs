@@ -6,6 +6,7 @@
 mod cast;
 mod compile;
 mod play;
+mod probe;
 mod scene;
 mod validate;
 
@@ -62,6 +63,15 @@ enum Command {
     Index {
         /// Directory containing <slug>/cast.silk transmissions
         dir: PathBuf,
+    },
+    /// Report a cast's capability requirements and/or the terminal's support
+    Probe {
+        /// Cast file to inspect for RGP capability requirements
+        cast: Option<PathBuf>,
+        /// Query the controlling terminal with the RGP support sequence
+        /// (run inside ratty: `ratty -e silk probe --terminal`)
+        #[arg(long)]
+        terminal: bool,
     },
 }
 
@@ -123,6 +133,53 @@ fn run() -> Result<ExitCode> {
                 "indexed {count} transmissions -> {}/index.json",
                 dir.display()
             );
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Probe { cast, terminal } => {
+            if cast.is_none() && !terminal {
+                anyhow::bail!("probe needs a cast file, --terminal, or both");
+            }
+
+            let requirements = cast
+                .as_deref()
+                .map(|path| {
+                    probe::probe_cast(path)
+                        .with_context(|| format!("failed to probe {}", path.display()))
+                })
+                .transpose()?;
+            if let Some(requirements) = &requirements {
+                println!("{}", requirements.summary());
+                if requirements.errors > 0 {
+                    eprintln!(
+                        "warning: cast has {} validation errors (see `silk validate`)",
+                        requirements.errors
+                    );
+                }
+            }
+
+            let capabilities = if terminal {
+                let Some(capabilities) = probe::query_terminal()? else {
+                    eprintln!("no RGP support reply: this terminal is not ratty");
+                    return Ok(ExitCode::FAILURE);
+                };
+                println!("{}", probe::capabilities_summary(&capabilities));
+                Some(capabilities)
+            } else {
+                None
+            };
+
+            if let (Some(requirements), Some(capabilities)) = (&requirements, &capabilities) {
+                let unmet = probe::unmet_requirements(requirements, capabilities);
+                if unmet.is_empty() {
+                    println!("playable: yes");
+                } else {
+                    println!("playable: no");
+                    for reason in &unmet {
+                        eprintln!("  {reason}");
+                    }
+                    return Ok(ExitCode::FAILURE);
+                }
+            }
             Ok(ExitCode::SUCCESS)
         }
     }

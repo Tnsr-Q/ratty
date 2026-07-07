@@ -77,6 +77,13 @@ Unknown `x_ratty` keys MUST be ignored by players.
 Stage directives (`mode`, `warp`, `view`) describe the *opening* state. A
 renderer that cannot honor them (a flat text player) simply ignores them.
 
+Since RGP v2, the stage is also controllable **in-band** with the `c`
+(stage/camera) verb — see `protocols/graphics.md`. Prefer an `at: 0.0`
+camera step over header directives for self-contained casts: both write the
+same terminal state, applied in chronological order (header at load, `c` at
+its timestamp), so the last writer wins. The header path remains for players
+that pre-configure the renderer before feeding bytes.
+
 ## Events
 
 Each event is `[time, code, data]`:

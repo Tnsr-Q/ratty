@@ -1,0 +1,51 @@
+{
+  "meta": {
+    "title": "Predator and Frame",
+    "agent": "loom/prototype-0",
+    "mood": "patient-predatory"
+  },
+  "stage": {
+    "cols": 104,
+    "rows": 32,
+    "mode": "plane3d",
+    "warp": 0.25,
+    "theme": { "fg": "#dcd7ba", "bg": "#1f1f28" },
+    "loop": true
+  },
+  "cast": [
+    { "at": 0.0, "clear": true },
+    { "at": 0.0, "camera": { "mode": "plane3d", "warp": 0.25, "yaw": 0.18, "pitch": 0.08, "zoom": 1.0 } },
+    { "at": 0.2, "print": { "row": 1, "col": 3, "text": "TRANSMISSION 002 :: PREDATOR AND FRAME", "fg": "#e4bf56", "bold": true } },
+    { "at": 0.55, "print": { "row": 2, "col": 3, "text": "mood: patient-predatory // spun by loom/prototype-0", "fg": "#727169" } },
+    { "at": 0.6, "register": { "id": 1, "fmt": "obj", "file": "assets/frame.obj" } },
+    { "at": 0.8, "register": { "id": 2, "fmt": "obj", "file": "assets/predator.obj" } },
+
+    { "at": 1.2, "print": { "row": 6, "col": 5, "text": "the gallery hangs one painting at a time.", "fg": "#dcd7ba" } },
+    { "at": 1.6, "place": { "id": 1, "row": 12, "col": 72, "w": 26, "h": 14, "depth": 1.2, "animate": true, "spin": 0.12, "bob": 0.5, "bobamp": 0.02, "brightness": 1.05 } },
+    { "at": 2.2, "print": { "row": 7, "col": 5, "text": "it has volume. it is therefore safe.", "fg": "#dcd7ba" } },
+
+    { "at": 3.4, "marker": "chapter:the-line" },
+    { "at": 3.6, "print": { "row": 10, "col": 5, "text": "the predator is one-dimensional;", "fg": "#c4746e" } },
+    { "at": 4.0, "place": { "id": 2, "row": 22, "col": 12, "w": 18, "h": 3, "animate": true, "spin": 0.6, "bob": 0.9, "bobamp": 0.015, "phase": 1.7, "scale": 0.9, "brightness": 0.9 } },
+    { "at": 4.4, "print": { "row": 11, "col": 5, "text": "it hunts along a single line of sight.", "fg": "#c4746e" } },
+
+    { "at": 5.5, "tween": { "id": 2, "dur": 6.0, "fps": 30, "ease": "in-out", "to": { "px": 0.28, "py": 0.12 } } },
+    { "at": 6.4, "print": { "row": 14, "col": 5, "text": "it cannot eat what has volume.", "fg": "#dcd7ba" } },
+    { "at": 8.6, "print": { "row": 15, "col": 5, "text": "still, it waits. lines are patient.", "fg": "#dcd7ba" } },
+
+    { "at": 9.5, "camera": { "warp": 0.5, "pitch": 0.14, "dur": 5.0, "ease": "in-out" } },
+
+    { "at": 11.8, "marker": "chapter:the-strike" },
+    { "at": 12.0, "tween": { "id": 2, "dur": 2.2, "fps": 30, "ease": "in", "to": { "spin": 3.2 } } },
+    { "at": 14.4, "update": { "id": 2, "spin": 0, "bob": 0 } },
+
+    { "at": 14.8, "print": { "row": 18, "col": 5, "text": "(the frame does not acknowledge the line.", "fg": "#727169" } },
+    { "at": 15.5, "print": { "row": 19, "col": 5, "text": " this is how it survives.)", "fg": "#727169" } },
+
+    { "at": 16.8, "tween": { "id": 2, "dur": 4.5, "fps": 30, "ease": "out", "to": { "px": 0.02, "py": 0.0, "spin": 0.4 } } },
+    { "at": 17.2, "camera": { "warp": 0.3, "pitch": 0.08, "dur": 3.0, "ease": "out" } },
+
+    { "at": 21.5, "print": { "row": 27, "col": 3, "text": "nothing is consumed. the exhibit continues.", "fg": "#e4bf56" } },
+    { "at": 23.5, "delete": "all" }
+  ]
+}

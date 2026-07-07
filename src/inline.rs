@@ -12,12 +12,27 @@ use crate::model::{
     ObjectLoadOptions, load_object_source_from_bytes_with_options, load_object_source_with_options,
 };
 use crate::rgp::{
-    RgpOperation, RgpPlacementStyle, RgpPlacementUpdate, RgpRegisterSource,
+    RgpOperation, RgpPlacementStyle, RgpPlacementUpdate, RgpRegisterSource, RgpStageUpdate,
     consume_sequence as consume_rgp_sequence, support_reply,
 };
 const APC_START: &[u8] = b"\x1b_";
 const ST: &[u8] = b"\x1b\\";
 const C1_ST: u8 = 0x9c;
+
+/// Integrated built-in animation state for an RGP object root entity.
+///
+/// The angles integrate per-frame so per-object animation rates can change
+/// mid-flight without snapping. Objects using only the global config rates
+/// keep the v1 absolute-time expressions, with this state refreshed in
+/// lockstep so a later switch to per-object rates stays continuous. Tilt is
+/// derived as `0.7 * spin`, preserving the v1 coupling.
+#[derive(Component, Default, Clone, Copy)]
+pub struct RgpAnimationState {
+    /// Accumulated spin angle in radians.
+    pub spin_angle: f32,
+    /// Accumulated bob phase in radians.
+    pub bob_phase: f32,
+}
 
 /// Marker for 2D inline object sprites.
 #[derive(Component)]
@@ -68,6 +83,7 @@ pub struct TerminalRgpObject {
 pub struct TerminalInlineObjects {
     pending_bytes: Vec<u8>,
     pending_rgp_payloads: HashMap<u32, PendingRgpPayload>,
+    pending_stage: Vec<RgpStageUpdate>,
     kitty: KittyParserState,
     dirty: bool,
     last_viewport_size: Vec2,
@@ -203,6 +219,16 @@ impl TerminalInlineObjects {
         self.anchors.clear();
         self.pending_rgp_payloads.clear();
         self.dirty = true;
+    }
+
+    /// Returns whether stage updates parsed from `c` sequences are queued.
+    pub fn has_pending_stage(&self) -> bool {
+        !self.pending_stage.is_empty()
+    }
+
+    /// Drains queued stage updates in arrival order.
+    pub fn take_stage_updates(&mut self) -> Vec<RgpStageUpdate> {
+        std::mem::take(&mut self.pending_stage)
     }
 
     fn handle_apc_sequence(
@@ -362,6 +388,12 @@ impl TerminalInlineObjects {
                 } else {
                     self.clear_objects();
                 }
+                None
+            }
+            // Stage changes never touch `dirty`: dirty despawns and respawns
+            // inline objects, and a camera move must not do that.
+            RgpOperation::Stage { update } => {
+                self.pending_stage.push(update);
                 None
             }
             RgpOperation::Ignored => None,
@@ -631,6 +663,15 @@ pub struct InlineStyle {
     pub rotation: Vec3,
     /// Non-uniform scale multiplier.
     pub scale3: Vec3,
+    /// Spin speed in radians per second; `None` uses the configured speed.
+    pub spin: Option<f32>,
+    /// Bob speed in radians per second; `None` uses the configured speed.
+    pub bob: Option<f32>,
+    /// Bob amplitude as a fraction of the cell height; `None` uses the
+    /// configured amplitude.
+    pub bob_amplitude: Option<f32>,
+    /// Constant phase offset in radians applied to spin and bob.
+    pub phase: f32,
 }
 
 impl From<RgpPlacementStyle> for InlineStyle {
@@ -644,6 +685,10 @@ impl From<RgpPlacementStyle> for InlineStyle {
             offset: Vec3::from_array(value.offset),
             rotation: Vec3::from_array(value.rotation),
             scale3: Vec3::from_array(value.scale3),
+            spin: value.spin,
+            bob: value.bob,
+            bob_amplitude: value.bob_amplitude,
+            phase: value.phase,
         }
     }
 }
@@ -667,6 +712,20 @@ fn apply_rgp_update(style: &mut InlineStyle, update: RgpPlacementUpdate) {
     apply_vec3_update(&mut style.offset, update.offset);
     apply_vec3_update(&mut style.rotation, update.rotation);
     apply_vec3_update(&mut style.scale3, update.scale3);
+    // Like `color`, the animation rates are set-only: an update can change
+    // them but not clear them back to the configured globals.
+    if let Some(spin) = update.spin {
+        style.spin = Some(spin);
+    }
+    if let Some(bob) = update.bob {
+        style.bob = Some(bob);
+    }
+    if let Some(bob_amplitude) = update.bob_amplitude {
+        style.bob_amplitude = Some(bob_amplitude);
+    }
+    if let Some(phase) = update.phase {
+        style.phase = phase;
+    }
 }
 
 fn apply_vec3_update(target: &mut Vec3, update: [Option<f32>; 3]) {
@@ -678,5 +737,100 @@ fn apply_vec3_update(target: &mut Vec3, update: [Option<f32>; 3]) {
     }
     if let Some(z) = update[2] {
         target.z = z;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rgp_sequence(content: &str) -> Vec<u8> {
+        format!("\x1b_ratty;g;{content}\x1b\\").into_bytes()
+    }
+
+    #[test]
+    fn stage_sequences_queue_in_order_without_dirtying_objects() {
+        let mut inline = TerminalInlineObjects::default();
+        let first = inline.handle_rgp_sequence(&rgp_sequence("c;warp=0.1"));
+        let second = inline.handle_rgp_sequence(&rgp_sequence("c;warp=0.9;dur=2"));
+        assert_eq!(first, Some(None), "stage sequences produce no reply");
+        assert_eq!(second, Some(None));
+        assert!(!inline.dirty, "stage sequences must not respawn objects");
+        assert!(inline.has_pending_stage());
+
+        let updates = inline.take_stage_updates();
+        assert_eq!(updates.len(), 2);
+        assert_eq!(updates[0].warp, Some(0.1));
+        assert_eq!(updates[1].warp, Some(0.9));
+        assert_eq!(updates[1].dur, Some(2.0));
+        assert!(!inline.has_pending_stage());
+    }
+
+    #[test]
+    fn v1_place_style_converts_field_identically() {
+        let sequence = rgp_sequence(
+            "p;id=1;row=13;col=74;w=28;h=16;animate=1;scale=1.15;depth=0.2;color=aabbcc;\
+             brightness=1.1;px=0.1;py=0.2;pz=0.3;rx=180;ry=90;rz=45;sx=1;sy=2;sz=3",
+        );
+        let Some(RgpOperation::Place { anchor, .. }) = consume_rgp_sequence(&sequence) else {
+            panic!("place sequence did not parse");
+        };
+        let style: InlineStyle = anchor.style.into();
+        assert!(style.animate);
+        assert_eq!(style.scale, 1.15);
+        assert_eq!(style.depth, 0.2);
+        assert_eq!(style.color, Some([0xaa, 0xbb, 0xcc]));
+        assert_eq!(style.brightness, 1.1);
+        assert_eq!(style.offset, Vec3::new(0.1, 0.2, 0.3));
+        assert_eq!(style.rotation, Vec3::new(180.0, 90.0, 45.0));
+        assert_eq!(style.scale3, Vec3::new(1.0, 2.0, 3.0));
+        // v2 animation fields stay neutral when a v1 sequence places.
+        assert!(style.spin.is_none());
+        assert!(style.bob.is_none());
+        assert!(style.bob_amplitude.is_none());
+        assert_eq!(style.phase, 0.0);
+    }
+
+    fn inline_with_anchor(object_id: u32) -> TerminalInlineObjects {
+        let mut inline = TerminalInlineObjects::default();
+        inline.anchors.insert(
+            object_id,
+            InlineAnchor {
+                row: 4,
+                col: 6,
+                columns: 8,
+                rows: 4,
+                style: InlineStyle {
+                    animate: true,
+                    scale: 1.0,
+                    brightness: 1.0,
+                    scale3: Vec3::ONE,
+                    ..Default::default()
+                },
+            },
+        );
+        inline
+    }
+
+    #[test]
+    fn animation_updates_apply_live_without_respawning() {
+        let mut inline = inline_with_anchor(1);
+        inline.dirty = false;
+        inline.handle_rgp_sequence(&rgp_sequence("u;id=1;spin=2.0;phase=0.5"));
+        let style = inline.anchors[&1].style;
+        assert_eq!(style.spin, Some(2.0));
+        assert_eq!(style.phase, 0.5);
+        assert!(!inline.dirty, "animation fields are live updates");
+    }
+
+    #[test]
+    fn respawn_fields_still_dirty_while_animation_fields_apply() {
+        let mut inline = inline_with_anchor(1);
+        inline.dirty = false;
+        inline.handle_rgp_sequence(&rgp_sequence("u;id=1;depth=1.0;spin=2.0"));
+        let style = inline.anchors[&1].style;
+        assert_eq!(style.depth, 1.0);
+        assert_eq!(style.spin, Some(2.0));
+        assert!(inline.dirty, "depth still forces a respawn");
     }
 }

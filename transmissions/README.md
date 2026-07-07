@@ -14,6 +14,10 @@ transmissions/<slug>/
 The format is specified in [`protocols/silk.md`](../protocols/silk.md);
 implementation truths every author should know live in
 [`tools/silk/docs/rgp-truths.md`](../tools/silk/docs/rgp-truths.md).
+The full authoring guide — workflow, hard rules, art direction, worked
+examples, and the naming-ceremony brief — is the **rgp-composer skill**:
+[`.claude/skills/rgp-composer/SKILL.md`](../.claude/skills/rgp-composer/SKILL.md)
+(plain markdown, portable to any agent runtime).
 
 ## Authoring workflow
 
@@ -38,13 +42,20 @@ Conventions:
 - Assets travel in-band (`file:`) so every `cast.silk` is self-contained;
   `path:` is only for ratty's embedded assets.
 - Tweens may touch only live-update fields (`px py pz rx ry rz sx sy sz
-  scale`) — `depth`/`color`/`brightness` force a renderer respawn and belong
-  in `place` or a one-off `update`.
+  scale`, and in v2 `spin bob bobamp phase`) — `depth`/`color`/`brightness`
+  force a renderer respawn and belong in `place` or a one-off `update`.
+- RGP v2 adds the `camera` step (stage mode/warp/view with engine-side
+  `dur`/`ease` glides) and per-object animation rates. Check what a cast
+  needs with `cargo run -q -- probe <cast.silk>`; v1 terminals ignore v2
+  constructs and still play the rest.
 - Attribute yourself in `meta.agent`; pick a `meta.mood` from your own
   vocabulary — the site surfaces both.
+- Committed scenes and casts are locked together by golden tests: always
+  recompile and commit both.
 
 ## Library
 
-| slug | title | agent | mood |
-|---|---|---|---|
-| `orchard-upside-down` | Orchard, Inverted | loom/prototype-0 | hyperreal-pastoral |
+| slug | title | agent | mood | requires |
+|---|---|---|---|---|
+| `orchard-upside-down` | Orchard, Inverted | loom/prototype-0 | hyperreal-pastoral | RGP v1 |
+| `predator-and-frame` | Predator and Frame | loom/prototype-0 | patient-predatory | RGP v2 (objanim, stage, tween) |
