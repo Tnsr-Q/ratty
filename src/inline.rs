@@ -1,7 +1,7 @@
 //! Inline object state and APC handling.
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use bevy::prelude::*;
@@ -86,6 +86,8 @@ pub struct TerminalInlineObjects {
     pending_stage: Vec<RgpStageUpdate>,
     kitty: KittyParserState,
     dirty: bool,
+    rebuild_objects: HashSet<u32>,
+    restyle_objects: HashSet<u32>,
     last_viewport_size: Vec2,
     last_cols: u16,
     last_rows: u16,
@@ -155,11 +157,45 @@ impl TerminalInlineObjects {
     }
 
     /// Marks synchronization as complete.
+    ///
+    /// A full rebuild spawns every object from its current style, so any
+    /// queued per-object rebuilds and restyles are subsumed and cleared.
     pub fn finish_sync(&mut self, viewport_size: Vec2, cols: u16, rows: u16) {
         self.dirty = false;
+        self.rebuild_objects.clear();
+        self.restyle_objects.clear();
         self.last_viewport_size = viewport_size;
         self.last_cols = cols;
         self.last_rows = rows;
+    }
+
+    /// Drains object ids whose entities must be despawned and respawned
+    /// (`depth` changes re-extrude meshes; glTF styles live in the scene).
+    pub fn take_rebuild_objects(&mut self) -> HashSet<u32> {
+        std::mem::take(&mut self.rebuild_objects)
+    }
+
+    /// Drains object ids whose materials can be rewritten in place
+    /// (`color`/`brightness` changes on mesh-backed objects).
+    pub fn take_restyle_objects(&mut self) -> HashSet<u32> {
+        std::mem::take(&mut self.restyle_objects)
+    }
+
+    /// Returns whether any in-place material restyles are queued.
+    pub fn has_restyle_objects(&self) -> bool {
+        !self.restyle_objects.is_empty()
+    }
+
+    /// Mesh-backed RGP objects derive their materials entirely from
+    /// [`InlineStyle`], so those materials can be rewritten in place. glTF
+    /// scenes own their materials and Kitty images have none.
+    fn supports_restyle(&self, object_id: u32) -> bool {
+        matches!(
+            self.objects.get(&object_id),
+            Some(InlineObject::RgpObject(
+                RgpInlineObject::Obj { .. } | RgpInlineObject::Stl { .. }
+            ))
+        )
     }
 
     /// Applies upward scroll to anchored objects.
@@ -372,12 +408,23 @@ impl TerminalInlineObjects {
             }
             RgpOperation::Update { object_id, update } => {
                 if let Some(anchor) = self.anchors.get_mut(&object_id) {
-                    let needs_respawn = update.depth.is_some()
-                        || update.color.is_some()
-                        || update.brightness.is_some();
+                    let needs_rebuild = update.depth.is_some();
+                    let needs_restyle = update.color.is_some() || update.brightness.is_some();
                     apply_rgp_update(&mut anchor.style, update);
-                    if needs_respawn {
-                        self.dirty = true;
+                    if needs_rebuild || needs_restyle {
+                        if !matches!(
+                            self.objects.get(&object_id),
+                            Some(InlineObject::RgpObject(_))
+                        ) {
+                            // Kitty images have no per-object entity mapping;
+                            // keep the conservative full rebuild for them.
+                            self.dirty = true;
+                        } else if !needs_rebuild && self.supports_restyle(object_id) {
+                            self.restyle_objects.insert(object_id);
+                        } else {
+                            self.rebuild_objects.insert(object_id);
+                            self.restyle_objects.remove(&object_id);
+                        }
                     }
                 }
                 None
@@ -812,25 +859,122 @@ mod tests {
         inline
     }
 
+    fn register_mesh_object(inline: &mut TerminalInlineObjects, object_id: u32) {
+        inline.objects.insert(
+            object_id,
+            InlineObject::RgpObject(RgpInlineObject::Obj {
+                meshes: Vec::new(),
+                handles: None,
+            }),
+        );
+    }
+
+    fn register_gltf_object(inline: &mut TerminalInlineObjects, object_id: u32) {
+        inline.objects.insert(
+            object_id,
+            InlineObject::RgpObject(RgpInlineObject::Gltf {
+                asset_path: "test.glb".to_string(),
+                handle: None,
+            }),
+        );
+    }
+
     #[test]
     fn animation_updates_apply_live_without_respawning() {
         let mut inline = inline_with_anchor(1);
+        register_mesh_object(&mut inline, 1);
         inline.dirty = false;
         inline.handle_rgp_sequence(&rgp_sequence("u;id=1;spin=2.0;phase=0.5"));
         let style = inline.anchors[&1].style;
         assert_eq!(style.spin, Some(2.0));
         assert_eq!(style.phase, 0.5);
         assert!(!inline.dirty, "animation fields are live updates");
+        assert!(inline.rebuild_objects.is_empty());
+        assert!(inline.restyle_objects.is_empty());
     }
 
     #[test]
-    fn respawn_fields_still_dirty_while_animation_fields_apply() {
+    fn depth_updates_rebuild_only_their_object() {
         let mut inline = inline_with_anchor(1);
+        register_mesh_object(&mut inline, 1);
         inline.dirty = false;
         inline.handle_rgp_sequence(&rgp_sequence("u;id=1;depth=1.0;spin=2.0"));
         let style = inline.anchors[&1].style;
         assert_eq!(style.depth, 1.0);
         assert_eq!(style.spin, Some(2.0));
-        assert!(inline.dirty, "depth still forces a respawn");
+        assert!(!inline.dirty, "depth must not respawn the whole scene");
+        assert_eq!(inline.take_rebuild_objects(), HashSet::from([1]));
+        assert!(inline.restyle_objects.is_empty());
+    }
+
+    #[test]
+    fn color_and_brightness_updates_restyle_in_place() {
+        let mut inline = inline_with_anchor(1);
+        register_mesh_object(&mut inline, 1);
+        inline.dirty = false;
+        inline.handle_rgp_sequence(&rgp_sequence("u;id=1;color=ff8844"));
+        inline.handle_rgp_sequence(&rgp_sequence("u;id=1;brightness=1.5"));
+        let style = inline.anchors[&1].style;
+        assert_eq!(style.color, Some([0xff, 0x88, 0x44]));
+        assert_eq!(style.brightness, 1.5);
+        assert!(!inline.dirty, "mesh restyles must not respawn anything");
+        assert!(inline.rebuild_objects.is_empty());
+        assert!(inline.has_restyle_objects());
+        assert_eq!(inline.take_restyle_objects(), HashSet::from([1]));
+    }
+
+    #[test]
+    fn depth_supersedes_a_pending_restyle() {
+        let mut inline = inline_with_anchor(1);
+        register_mesh_object(&mut inline, 1);
+        inline.dirty = false;
+        inline.handle_rgp_sequence(&rgp_sequence("u;id=1;color=ff8844"));
+        inline.handle_rgp_sequence(&rgp_sequence("u;id=1;depth=1.0"));
+        assert!(!inline.dirty);
+        assert!(
+            !inline.has_restyle_objects(),
+            "the rebuild respawns from current style, covering the restyle"
+        );
+        assert_eq!(inline.take_rebuild_objects(), HashSet::from([1]));
+    }
+
+    #[test]
+    fn gltf_styles_take_the_rebuild_path() {
+        let mut inline = inline_with_anchor(1);
+        register_gltf_object(&mut inline, 1);
+        inline.dirty = false;
+        inline.handle_rgp_sequence(&rgp_sequence("u;id=1;color=ff8844"));
+        assert!(!inline.dirty);
+        assert!(
+            !inline.has_restyle_objects(),
+            "glTF scenes own their materials; style cannot rewrite them"
+        );
+        assert_eq!(inline.take_rebuild_objects(), HashSet::from([1]));
+    }
+
+    #[test]
+    fn updates_without_an_object_mapping_respawn_globally() {
+        let mut inline = inline_with_anchor(1);
+        inline.dirty = false;
+        inline.handle_rgp_sequence(&rgp_sequence("u;id=1;color=ff8844"));
+        assert!(
+            inline.dirty,
+            "no per-object entity mapping exists; keep the full rebuild"
+        );
+        assert!(inline.rebuild_objects.is_empty());
+        assert!(inline.restyle_objects.is_empty());
+    }
+
+    #[test]
+    fn finish_sync_clears_pending_granular_work() {
+        let mut inline = inline_with_anchor(1);
+        register_mesh_object(&mut inline, 1);
+        inline.handle_rgp_sequence(&rgp_sequence("u;id=1;color=ff8844"));
+        inline.handle_rgp_sequence(&rgp_sequence("u;id=2;depth=1.0"));
+        inline.rebuild_objects.insert(7);
+        inline.finish_sync(Vec2::new(800.0, 600.0), 104, 32);
+        assert!(!inline.dirty);
+        assert!(inline.rebuild_objects.is_empty());
+        assert!(inline.restyle_objects.is_empty());
     }
 }

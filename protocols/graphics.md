@@ -237,11 +237,15 @@ Fields are optional and mirror the mutable fields from `p`:
 - `sx`, `sy`, `sz`
 - `spin`, `bob`, `bobamp`, `phase` (v2)
 
-`depth`, `color` and `brightness` force the object to respawn; every other
-field — including the v2 animation fields — applies live to the placed
-object, which makes them suitable for per-frame streaming. Like `color`,
-the v2 animation fields are set-only: an update can change them but not
-clear them back to the configured globals.
+`depth` forces the object to respawn (its geometry is re-extruded).
+`color` and `brightness` are applied in place where the renderer can
+rewrite the object's materials (mesh-backed objects in ratty) and force a
+respawn where it cannot (glTF objects, older renderers) — treat all three
+as scene-setup fields, not per-frame streaming fields. Every other field —
+including the v2 animation fields — applies live to the placed object,
+which makes it suitable for per-frame streaming. Like `color`, the v2
+animation fields are set-only: an update can change them but not clear
+them back to the configured globals.
 
 ### 5. Delete Object
 

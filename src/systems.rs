@@ -540,7 +540,7 @@ pub(crate) struct SyncInlineParams<'w, 's> {
     plane_query: Query<'w, 's, (Entity, &'static Transform), With<TerminalPlane>>,
     sprite_query: Query<'w, 's, Entity, With<TerminalInlineObjectSprite>>,
     plane_image_query: Query<'w, 's, Entity, With<TerminalInlineObjectPlane>>,
-    rgp_query: Query<'w, 's, Entity, With<TerminalRgpObject>>,
+    rgp_query: Query<'w, 's, (Entity, &'static TerminalRgpObject)>,
     asset_server: Res<'w, AssetServer>,
     materials: ResMut<'w, Assets<StandardMaterial>>,
     images: ResMut<'w, Assets<Image>>,
@@ -574,18 +574,38 @@ pub(crate) fn sync_inline_objects(mut params: SyncInlineParams) {
         images,
         meshes,
     } = &mut params;
-    if !inline_objects.needs_sync(viewport.size, terminal.cols, terminal.rows) {
-        return;
-    }
+    // Per-object rebuilds (queued by `depth` updates and glTF restyles) only
+    // run when no full rebuild is due; a full rebuild subsumes them.
+    let full_sync = inline_objects.needs_sync(viewport.size, terminal.cols, terminal.rows);
+    let rebuild_ids = if full_sync {
+        None
+    } else {
+        let ids = inline_objects.take_rebuild_objects();
+        if ids.is_empty() {
+            return;
+        }
+        Some(ids)
+    };
 
-    for entity in sprite_query.iter() {
-        commands.entity(entity).despawn();
-    }
-    for entity in plane_image_query.iter() {
-        commands.entity(entity).despawn();
-    }
-    for entity in rgp_query.iter() {
-        commands.entity(entity).despawn();
+    match &rebuild_ids {
+        None => {
+            for entity in sprite_query.iter() {
+                commands.entity(entity).despawn();
+            }
+            for entity in plane_image_query.iter() {
+                commands.entity(entity).despawn();
+            }
+            for (entity, _) in rgp_query.iter() {
+                commands.entity(entity).despawn();
+            }
+        }
+        Some(ids) => {
+            for (entity, object) in rgp_query.iter() {
+                if ids.contains(&object.object_id) {
+                    commands.entity(entity).despawn();
+                }
+            }
+        }
     }
 
     let Ok((plane_entity, _plane_transform)) = plane_query.single() else {
@@ -600,6 +620,12 @@ pub(crate) fn sync_inline_objects(mut params: SyncInlineParams) {
         .iter()
         .filter_map(|(object_id, anchor)| {
             inline_objects.objects.get(object_id)?;
+            if rebuild_ids
+                .as_ref()
+                .is_some_and(|ids| !ids.contains(object_id))
+            {
+                return None;
+            }
             let start = anchor.row as i32;
             let end = start + anchor.rows as i32;
             (start < terminal.rows as i32 && end > 0).then_some(*object_id)
@@ -647,7 +673,9 @@ pub(crate) fn sync_inline_objects(mut params: SyncInlineParams) {
         commands.entity(plane_entity).add_children(&plane_children);
     }
 
-    inline_objects.finish_sync(viewport.size, terminal.cols, terminal.rows);
+    if full_sync {
+        inline_objects.finish_sync(viewport.size, terminal.cols, terminal.rows);
+    }
 }
 
 fn inline_layout(
@@ -944,25 +972,7 @@ fn spawn_rgp_object(
                 *handles = Some((depth_key, mesh_handles.clone()));
                 mesh_handles
             };
-            let use_lighting = true;
-            let [r, g, b] = match style.color {
-                Some([r, g, b]) => [r, g, b],
-                None => [255, 255, 255],
-            };
-            let material = materials.add(StandardMaterial {
-                base_color: Color::srgb_u8(r, g, b),
-                emissive: if use_lighting {
-                    LinearRgba::rgb(0.02, 0.02, 0.02)
-                } else {
-                    LinearRgba::rgb(0.0, 0.0, 0.0)
-                },
-                metallic: 0.0,
-                perceptual_roughness: if use_lighting { 0.88 } else { 1.0 },
-                reflectance: if use_lighting { 0.18 } else { 0.0 },
-                cull_mode: None,
-                unlit: !use_lighting,
-                ..default()
-            });
+            let material = materials.add(rgp_object_material(style.color));
             let root = commands
                 .spawn((
                     TerminalRgpObject { object_id },
@@ -1020,25 +1030,7 @@ fn spawn_rgp_object(
                     mesh_handle
                 }
             };
-            let use_lighting = true;
-            let [r, g, b] = match style.color {
-                Some([r, g, b]) => [r, g, b],
-                None => [255, 255, 255],
-            };
-            let material = materials.add(StandardMaterial {
-                base_color: Color::srgb_u8(r, g, b),
-                emissive: if use_lighting {
-                    LinearRgba::rgb(0.02, 0.02, 0.02)
-                } else {
-                    LinearRgba::rgb(0.0, 0.0, 0.0)
-                },
-                metallic: 0.0,
-                perceptual_roughness: if use_lighting { 0.88 } else { 1.0 },
-                reflectance: if use_lighting { 0.18 } else { 0.0 },
-                cull_mode: None,
-                unlit: !use_lighting,
-                ..default()
-            });
+            let material = materials.add(rgp_object_material(style.color));
             let root = commands
                 .spawn((
                     TerminalRgpObject { object_id },
@@ -1058,6 +1050,48 @@ fn spawn_rgp_object(
             commands.entity(root).add_child(child);
         }
     }
+}
+
+/// Builds the material RGP mesh objects spawn with. `color` is the raw style
+/// color; the brightness multiplier is applied afterwards, either by
+/// [`apply_instance_brightness`] or by [`apply_rgp_restyle`].
+fn rgp_object_material(color: Option<[u8; 3]>) -> StandardMaterial {
+    let use_lighting = true;
+    let [r, g, b] = match color {
+        Some([r, g, b]) => [r, g, b],
+        None => [255, 255, 255],
+    };
+    StandardMaterial {
+        base_color: Color::srgb_u8(r, g, b),
+        emissive: if use_lighting {
+            LinearRgba::rgb(0.02, 0.02, 0.02)
+        } else {
+            LinearRgba::rgb(0.0, 0.0, 0.0)
+        },
+        metallic: 0.0,
+        perceptual_roughness: if use_lighting { 0.88 } else { 1.0 },
+        reflectance: if use_lighting { 0.18 } else { 0.0 },
+        cull_mode: None,
+        unlit: !use_lighting,
+        ..default()
+    }
+}
+
+/// Bakes a brightness multiplier into a material's base color and emissive.
+fn apply_brightness(material: &mut StandardMaterial, brightness: f32) {
+    let linear = material.base_color.to_linear();
+    material.base_color = Color::linear_rgba(
+        linear.red * brightness,
+        linear.green * brightness,
+        linear.blue * brightness,
+        linear.alpha,
+    );
+    material.emissive = LinearRgba::new(
+        material.emissive.red * brightness,
+        material.emissive.green * brightness,
+        material.emissive.blue * brightness,
+        material.emissive.alpha,
+    );
 }
 
 /// Synchronizes RGP inline objects.
@@ -1328,6 +1362,89 @@ mod rgp_animation_tests {
     }
 }
 
+/// Restyle application parameters.
+#[derive(SystemParam)]
+pub(crate) struct RgpRestyleParams<'w, 's> {
+    inline_objects: ResMut<'w, TerminalInlineObjects>,
+    rgp_roots: Query<'w, 's, (Entity, &'static TerminalRgpObject)>,
+    parent_query: Query<'w, 's, &'static ChildOf>,
+    material_query: Query<
+        'w,
+        's,
+        (
+            Entity,
+            &'static MeshMaterial3d<StandardMaterial>,
+            &'static ChildOf,
+        ),
+    >,
+    materials: ResMut<'w, Assets<StandardMaterial>>,
+    commands: Commands<'w, 's>,
+}
+
+/// Rewrites materials in place for objects whose `color`/`brightness`
+/// changed, instead of despawning and respawning anything.
+///
+/// Only mesh-backed (OBJ/STL) objects are routed here: their materials are
+/// derived entirely from [`crate::inline::InlineStyle`], so the full
+/// brightened material can be recomputed from the anchor style and written
+/// through [`Assets::get_mut`]. The rewritten entities are marked
+/// [`BrightnessAdjusted`] so [`apply_instance_brightness`] — which runs
+/// afterwards — never multiplies brightness on top of the already-adjusted
+/// result. Transforms, children, and [`RgpAnimationState`] accumulators are
+/// untouched, so the pose stays continuous.
+pub(crate) fn apply_rgp_restyle(mut params: RgpRestyleParams) {
+    let RgpRestyleParams {
+        inline_objects,
+        rgp_roots,
+        parent_query,
+        material_query,
+        materials,
+        commands,
+    } = &mut params;
+    let restyle = inline_objects.take_restyle_objects();
+    if restyle.is_empty() {
+        return;
+    }
+
+    let targets = rgp_roots
+        .iter()
+        .filter(|(_, object)| restyle.contains(&object.object_id))
+        .map(|(entity, object)| (entity, object.object_id))
+        .collect::<HashMap<_, _>>();
+    if targets.is_empty() {
+        return;
+    }
+
+    for (entity, material_handle, child_of) in material_query.iter() {
+        let mut current = child_of.parent();
+        let object_id = loop {
+            if let Some(object_id) = targets.get(&current) {
+                break Some(*object_id);
+            }
+            let Ok(next) = parent_query.get(current) else {
+                break None;
+            };
+            current = next.parent();
+        };
+        let Some(object_id) = object_id else {
+            continue;
+        };
+        let Some(style) = inline_objects
+            .anchors
+            .get(&object_id)
+            .map(|anchor| anchor.style)
+        else {
+            continue;
+        };
+        let Some(mut material) = materials.get_mut(&material_handle.0) else {
+            continue;
+        };
+        *material = rgp_object_material(style.color);
+        apply_brightness(&mut material, style.brightness);
+        commands.entity(entity).insert(BrightnessAdjusted);
+    }
+}
+
 /// Brightness application parameters.
 #[derive(SystemParam)]
 pub(crate) struct BrightnessParams<'w, 's> {
@@ -1413,19 +1530,7 @@ pub(crate) fn apply_instance_brightness(mut params: BrightnessParams) {
             continue;
         };
         let mut adjusted = source_material;
-        let linear = adjusted.base_color.to_linear();
-        adjusted.base_color = Color::linear_rgba(
-            linear.red * brightness,
-            linear.green * brightness,
-            linear.blue * brightness,
-            linear.alpha,
-        );
-        adjusted.emissive = LinearRgba::new(
-            adjusted.emissive.red * brightness,
-            adjusted.emissive.green * brightness,
-            adjusted.emissive.blue * brightness,
-            adjusted.emissive.alpha,
-        );
+        apply_brightness(&mut adjusted, brightness);
         material_handle.0 = materials.add(adjusted);
         commands.entity(entity).insert(BrightnessAdjusted);
     }

@@ -24,14 +24,24 @@ this document answers "what will X really do?".
 - `u` fields `px/py/pz`, `rx/ry/rz`, `sx/sy/sz`, `scale`, `animate` — and
   the v2 animation fields `spin/bob/bobamp/phase` — are read live every
   frame by `sync_rgp_objects` — **zero-cost, smooth, ideal for per-frame
-  streaming** (`src/systems.rs:1130-1200`, `src/inline.rs:375-381`).
-- `u` fields **`depth`, `color`, `brightness` set a dirty flag that despawns
-  and respawns the whole object** (`src/inline.rs:375-381`). Never stream
-  them per-frame; set them at placement or in a one-off update.
-- Because of that, the widget's `update_sequence()` — which always emits
-  `depth`, `color`, and `brightness` (`widget/src/lib.rs:332-354`) — forces a
-  respawn on *every* call. The `silk` compiler emits minimal `u` sequences
-  (only the tweened fields) instead.
+  streaming** (`src/systems.rs:1130-1200`, `src/inline.rs`).
+- `u` fields **`color` and `brightness` on OBJ/STL objects rewrite the
+  object's materials in place** (`apply_rgp_restyle`, `src/systems.rs`) —
+  no despawn, no animation reset. They are still material asset writes
+  (GPU re-upload), not transform pokes: fine for scene beats, not per-frame
+  streaming. Historically these forced a scene-wide despawn/respawn of
+  every inline object; that is gone.
+- `u` field **`depth` despawns and respawns that one object** (it re-extrudes
+  the mesh), resetting its animation accumulator — the pose jumps, but only
+  for that object. `color`/`brightness` on **glTF** objects take the same
+  per-object rebuild path (glTF scenes own their materials, so style cannot
+  rewrite them in place). Updates on ids without an RGP object mapping
+  (e.g. Kitty images) keep the old conservative full rebuild.
+- The widget's `update_sequence()` — which always emits `depth`, `color`,
+  and `brightness` (`widget/src/lib.rs:332-354`) — therefore still forces a
+  per-object respawn on *every* call (the `depth` field routes it to the
+  rebuild path). The `silk` compiler emits minimal `u` sequences (only the
+  tweened fields) instead.
 - `color` via `u` is set-only: you cannot clear a color back to "unset".
   The same applies to `spin`, `bob`, and `bobamp` — once set, an object
   cannot return to "use the configured global rate"
@@ -75,8 +85,10 @@ this document answers "what will X really do?".
   later rate changes integrate smoothly. `spin=0` therefore HOLDS the
   current angle (pose-hold), and a fresh v2 placement starts
   deterministically at `phase` instead of at wall-clock position.
-- **A respawn (depth/color/brightness update, or re-place) resets the
-  accumulator to zero** — expect the pose to jump along with the respawn.
+- **A respawn (depth update, glTF color/brightness update, or re-place)
+  resets the accumulator to zero** — expect the pose to jump along with the
+  respawn. OBJ/STL color/brightness updates restyle in place and do NOT
+  reset it.
 - The 3D cursor still animates from the global config only
   (`src/systems.rs:1601+`); RGP fields never affect it.
 - `phase` is the tool for breaking lockstep between objects; different
