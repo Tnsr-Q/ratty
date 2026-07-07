@@ -14,7 +14,8 @@ use ratatui_ratty::{ObjectFormat, RattyGraphic, RattyGraphicSettings};
 
 use crate::cast::{Cast, Event, Header, XRatty};
 use crate::scene::{
-    PlaceArgs, PrintArgs, RegisterArgs, Scene, Step, TWEENABLE_FIELDS, TweenArgs, UpdateArgs,
+    CameraArgs, PlaceArgs, PrintArgs, RegisterArgs, Scene, Step, TWEENABLE_FIELDS, TweenArgs,
+    UpdateArgs,
 };
 
 /// Compilation stats for reporting.
@@ -88,6 +89,10 @@ pub fn compile(scene: &Scene, scene_dir: &Path) -> Result<Cast> {
 }
 
 /// Live transform state tracked per object for tween interpolation.
+///
+/// The v2 animation rates are `Option` because their wire-level defaults
+/// are the terminal's *config* values, which the compiler cannot know —
+/// tweening one before it has been set explicitly is an authoring error.
 #[derive(Clone, Copy)]
 struct ObjectState {
     px: f64,
@@ -100,6 +105,10 @@ struct ObjectState {
     sy: f64,
     sz: f64,
     scale: f64,
+    spin: Option<f64>,
+    bob: Option<f64>,
+    bobamp: Option<f64>,
+    phase: Option<f64>,
 }
 
 impl Default for ObjectState {
@@ -115,24 +124,32 @@ impl Default for ObjectState {
             sy: 1.0,
             sz: 1.0,
             scale: 1.0,
+            spin: None,
+            bob: None,
+            bobamp: None,
+            phase: None,
         }
     }
 }
 
 impl ObjectState {
-    fn get(&self, field: &str) -> f64 {
+    fn get(&self, field: &str) -> Option<f64> {
         match field {
-            "px" => self.px,
-            "py" => self.py,
-            "pz" => self.pz,
-            "rx" => self.rx,
-            "ry" => self.ry,
-            "rz" => self.rz,
-            "sx" => self.sx,
-            "sy" => self.sy,
-            "sz" => self.sz,
-            "scale" => self.scale,
-            _ => 0.0,
+            "px" => Some(self.px),
+            "py" => Some(self.py),
+            "pz" => Some(self.pz),
+            "rx" => Some(self.rx),
+            "ry" => Some(self.ry),
+            "rz" => Some(self.rz),
+            "sx" => Some(self.sx),
+            "sy" => Some(self.sy),
+            "sz" => Some(self.sz),
+            "scale" => Some(self.scale),
+            "spin" => self.spin,
+            "bob" => self.bob,
+            "bobamp" => self.bobamp,
+            "phase" => self.phase,
+            _ => None,
         }
     }
 
@@ -148,6 +165,10 @@ impl ObjectState {
             "sy" => self.sy = value,
             "sz" => self.sz = value,
             "scale" => self.scale = value,
+            "spin" => self.spin = Some(value),
+            "bob" => self.bob = Some(value),
+            "bobamp" => self.bobamp = Some(value),
+            "phase" => self.phase = Some(value),
             _ => {}
         }
     }
@@ -172,7 +193,7 @@ impl Compiler<'_> {
         if step.verb_count() != 1 {
             bail!(
                 "each step must have exactly one verb \
-                 (print/register/place/update/tween/delete/marker/clear)"
+                 (print/register/place/update/tween/camera/delete/marker/clear)"
             );
         }
         if let Some(print) = &step.print {
@@ -185,6 +206,8 @@ impl Compiler<'_> {
             self.update(step.at, update)?;
         } else if let Some(tween) = &step.tween {
             self.tween(step.at, tween)?;
+        } else if let Some(camera) = &step.camera {
+            self.camera(step.at, camera)?;
         } else if let Some(delete) = &step.delete {
             match delete.id()? {
                 Some(id) => {
@@ -222,6 +245,11 @@ impl Compiler<'_> {
             data.push_str(&format!("\x1b[48;2;{r};{g};{b}m"));
         }
         data.push_str(&print.text);
+        if print.el {
+            // Erase to end of line while the SGR state (background) is
+            // still active, so the erased cells take the print's colors.
+            data.push_str("\x1b[K");
+        }
         data.push_str("\x1b[0m");
         self.out(at, data);
         Ok(())
@@ -310,6 +338,10 @@ impl Compiler<'_> {
             ("sx", place.sx),
             ("sy", place.sy),
             ("sz", place.sz),
+            ("spin", place.spin),
+            ("bob", place.bob),
+            ("bobamp", place.bobamp),
+            ("phase", place.phase),
         ] {
             if let Some(value) = value {
                 fields.push(format!("{key}={}", fmt_f32(value)));
@@ -348,6 +380,10 @@ impl Compiler<'_> {
             ("sx", update.sx),
             ("sy", update.sy),
             ("sz", update.sz),
+            ("spin", update.spin),
+            ("bob", update.bob),
+            ("bobamp", update.bobamp),
+            ("phase", update.phase),
         ] {
             if let Some(value) = value {
                 fields.push(format!("{key}={}", fmt_f32(value)));
@@ -382,20 +418,28 @@ impl Compiler<'_> {
         if fps <= 0.0 {
             bail!("tween fps must be positive");
         }
-        let ease = match tween.ease.as_deref() {
-            None | Some("linear") => Ease::Linear,
-            Some("in-out") => Ease::InOut,
-            Some(other) => bail!("unknown ease \"{other}\" (linear, in-out)"),
-        };
+        let ease = parse_ease(tween.ease.as_deref())?;
 
         let from = *self.objects.entry(tween.id).or_default();
+        let mut starts = BTreeMap::new();
+        for field in tween.to.keys() {
+            let Some(start) = from.get(field) else {
+                bail!(
+                    "tween field \"{field}\" has no current value for id={} — set it \
+                     explicitly via place/update first (its wire default is the \
+                     terminal's config, which the compiler cannot know)",
+                    tween.id
+                );
+            };
+            starts.insert(field.clone(), start);
+        }
         let steps = ((tween.dur * fps).ceil() as usize).max(1);
         for step in 1..=steps {
             let progress = step as f64 / steps as f64;
             let eased = ease.apply(progress);
             let mut fields = vec![format!("id={}", tween.id)];
             for (field, target) in &tween.to {
-                let start = from.get(field);
+                let start = starts[field];
                 let value = start + (target - start) * eased;
                 fields.push(format!("{field}={}", fmt_f64(value)));
             }
@@ -411,10 +455,86 @@ impl Compiler<'_> {
         }
         Ok(())
     }
+
+    /// Emits exactly one RGP v2 `c` sequence. Camera tweens are engine-side
+    /// (`dur`/`ease` ride along in the sequence): the terminal interpolates
+    /// at frame rate, which is smoother and hundreds of times smaller than
+    /// per-frame `c` spam — which would also self-cancel, since each `c`
+    /// replaces the previous stage tween.
+    fn camera(&mut self, at: f64, camera: &CameraArgs) -> Result<()> {
+        let mut fields = Vec::new();
+        if let Some(mode) = &camera.mode {
+            if !matches!(mode.as_str(), "flat2d" | "plane3d" | "mobius3d") {
+                bail!("unknown camera mode \"{mode}\" (flat2d, plane3d, mobius3d)");
+            }
+            fields.push(format!("mode={mode}"));
+        }
+        if let Some(warp) = camera.warp {
+            if !(0.0..=1.0).contains(&warp) {
+                bail!("camera warp {warp} out of range 0.0..=1.0");
+            }
+            fields.push(format!("warp={}", fmt_f32(warp)));
+        }
+        if let Some(yaw) = camera.yaw {
+            fields.push(format!("yaw={}", fmt_f32(yaw)));
+        }
+        if let Some(pitch) = camera.pitch {
+            fields.push(format!("pitch={}", fmt_f32(pitch)));
+        }
+        if let Some(zoom) = camera.zoom {
+            if !(0.1..=4.0).contains(&zoom) {
+                bail!("camera zoom {zoom} out of range 0.1..=4.0");
+            }
+            fields.push(format!("zoom={}", fmt_f32(zoom)));
+        }
+        if fields.is_empty() {
+            bail!("camera step sets no fields");
+        }
+        let tweening = match camera.dur {
+            Some(dur) if dur < 0.0 => bail!("camera dur must not be negative"),
+            Some(dur) if dur > 0.0 => {
+                // `dur` only tweens the stage fields; a lone mode change
+                // has nothing to tween.
+                if camera.mode.is_some() && fields.len() == 1 {
+                    bail!("camera dur has no effect on a mode-only step (mode is always instant)");
+                }
+                fields.push(format!("dur={}", fmt_f64(dur)));
+                true
+            }
+            _ => false,
+        };
+        if let Some(ease) = &camera.ease {
+            if !tweening {
+                bail!("camera ease requires a positive dur");
+            }
+            let wire = match ease.as_str() {
+                "linear" => "linear",
+                "in" => "in",
+                "out" => "out",
+                "in-out" => "inout",
+                other => bail!("unknown camera ease \"{other}\" (linear, in, out, in-out)"),
+            };
+            fields.push(format!("ease={wire}"));
+        }
+        self.out(at, format!("\x1b_ratty;g;c;{}\x1b\\", fields.join(";")));
+        Ok(())
+    }
+}
+
+fn parse_ease(name: Option<&str>) -> Result<Ease> {
+    match name {
+        None | Some("linear") => Ok(Ease::Linear),
+        Some("in") => Ok(Ease::In),
+        Some("out") => Ok(Ease::Out),
+        Some("in-out") => Ok(Ease::InOut),
+        Some(other) => bail!("unknown ease \"{other}\" (linear, in, out, in-out)"),
+    }
 }
 
 enum Ease {
     Linear,
+    In,
+    Out,
     InOut,
 }
 
@@ -422,6 +542,8 @@ impl Ease {
     fn apply(&self, t: f64) -> f64 {
         match self {
             Self::Linear => t,
+            Self::In => t * t,
+            Self::Out => 1.0 - (1.0 - t) * (1.0 - t),
             Self::InOut => t * t * (3.0 - 2.0 * t),
         }
     }
@@ -516,6 +638,145 @@ mod tests {
                 "\x1b_ratty;g;u;id=1;ry=135\x1b\\",
                 "\x1b_ratty;g;u;id=1;ry=180\x1b\\"
             ]
+        );
+    }
+
+    #[test]
+    fn camera_step_emits_exactly_one_c_sequence() {
+        let scene: Scene = serde_json::from_str(
+            r#"{
+                "meta": {"title": "t"},
+                "cast": [
+                    {"at": 0.0, "camera": {"mode": "plane3d", "warp": 0.4, "pitch": 0.12,
+                                            "dur": 2.0, "ease": "in-out"}}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let cast = compile(&scene, Path::new(".")).unwrap();
+        assert_eq!(cast.events.len(), 1);
+        assert_eq!(
+            cast.events[0].data,
+            "\x1b_ratty;g;c;mode=plane3d;warp=0.4;pitch=0.12;dur=2;ease=inout\x1b\\"
+        );
+    }
+
+    #[test]
+    fn camera_rejects_ease_without_dur_and_bad_ranges() {
+        for (scene_json, expected) in [
+            (
+                r#"{"meta": {"title": "t"}, "cast": [
+                    {"at": 0.0, "camera": {"warp": 0.4, "ease": "linear"}}]}"#,
+                "requires a positive dur",
+            ),
+            (
+                r#"{"meta": {"title": "t"}, "cast": [
+                    {"at": 0.0, "camera": {"warp": 1.5}}]}"#,
+                "out of range",
+            ),
+            (
+                r#"{"meta": {"title": "t"}, "cast": [
+                    {"at": 0.0, "camera": {"zoom": 9.0}}]}"#,
+                "out of range",
+            ),
+            (
+                r#"{"meta": {"title": "t"}, "cast": [
+                    {"at": 0.0, "camera": {"mode": "cube4d"}}]}"#,
+                "unknown camera mode",
+            ),
+            (
+                r#"{"meta": {"title": "t"}, "cast": [
+                    {"at": 0.0, "camera": {"mode": "plane3d", "dur": 2.0}}]}"#,
+                "mode is always instant",
+            ),
+        ] {
+            let scene: Scene = serde_json::from_str(scene_json).unwrap();
+            let error = compile(&scene, Path::new(".")).unwrap_err();
+            assert!(
+                format!("{error:#}").contains(expected),
+                "expected \"{expected}\" in: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn tween_over_unset_animation_field_errors() {
+        let scene: Scene = serde_json::from_str(
+            r#"{
+                "meta": {"title": "t"},
+                "cast": [
+                    {"at": 0.0, "place": {"id": 1, "row": 5, "col": 5, "w": 2, "h": 2}},
+                    {"at": 1.0, "tween": {"id": 1, "dur": 1.0, "to": {"spin": 3.0}}}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let error = compile(&scene, Path::new(".")).unwrap_err();
+        assert!(format!("{error:#}").contains("set it explicitly via place/update first"));
+    }
+
+    #[test]
+    fn tween_over_set_animation_field_interpolates() {
+        let scene: Scene = serde_json::from_str(
+            r#"{
+                "meta": {"title": "t"},
+                "cast": [
+                    {"at": 0.0, "place": {"id": 1, "row": 5, "col": 5, "w": 2, "h": 2,
+                                           "animate": true, "spin": 1.0}},
+                    {"at": 1.0, "tween": {"id": 1, "dur": 1.0, "fps": 2, "to": {"spin": 3.0}}}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let cast = compile(&scene, Path::new(".")).unwrap();
+        let updates: Vec<&str> = cast
+            .events
+            .iter()
+            .filter(|event| event.data.contains(";u;"))
+            .map(|event| event.data.as_str())
+            .collect();
+        assert_eq!(
+            updates,
+            [
+                "\x1b_ratty;g;u;id=1;spin=2\x1b\\",
+                "\x1b_ratty;g;u;id=1;spin=3\x1b\\"
+            ]
+        );
+    }
+
+    #[test]
+    fn print_el_erases_to_end_of_line_inside_sgr() {
+        let scene: Scene = serde_json::from_str(
+            r#"{
+                "meta": {"title": "t"},
+                "cast": [
+                    {"at": 0.0, "print": {"row": 0, "col": 0, "text": "hi",
+                                           "bg": "101010", "el": true}}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let cast = compile(&scene, Path::new(".")).unwrap();
+        assert!(cast.events[0].data.ends_with("hi\x1b[K\x1b[0m"));
+    }
+
+    /// Golden back-compat proof: the committed orchard transmission (pure
+    /// v1) must recompile byte-identically. If this fails, a compiler
+    /// change altered v1 output — that is a regression, not a test to
+    /// update casually.
+    #[test]
+    fn golden_orchard_compiles_byte_identically() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../transmissions");
+        let scene_path = root.join("orchard-upside-down/scene.json");
+        let source = fs::read_to_string(&scene_path).expect("read orchard scene");
+        let scene: Scene = serde_json::from_str(&source).expect("parse orchard scene");
+        let cast = compile(&scene, scene_path.parent().expect("scene dir")).expect("compile");
+        let jsonl = cast.to_jsonl().expect("serialize");
+        let committed =
+            fs::read_to_string(root.join("orchard-upside-down/cast.silk")).expect("read cast");
+        assert_eq!(
+            jsonl, committed,
+            "orchard cast drifted from its committed bytes"
         );
     }
 

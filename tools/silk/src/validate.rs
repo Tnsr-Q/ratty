@@ -30,6 +30,9 @@ pub struct Report {
     pub warnings: Vec<String>,
     /// Human-readable stats block.
     pub stats: String,
+    /// RGP v2 capabilities the cast requires (`stage`, `tween`, `objanim`);
+    /// empty for a pure v1 cast.
+    pub requires_v2: std::collections::BTreeSet<&'static str>,
 }
 
 impl Report {
@@ -144,15 +147,30 @@ pub fn validate(cast: &Cast) -> Report {
         }
     }
 
+    let requires = if report.requires_v2.is_empty() {
+        "RGP v1".to_string()
+    } else {
+        let capabilities: Vec<&str> = report.requires_v2.iter().copied().collect();
+        format!("RGP v2 ({})", capabilities.join(", "))
+    };
+    if !report.requires_v2.is_empty() {
+        report.warnings.push(
+            "cast uses RGP v2 constructs; v1 terminals ignore them (the cast still \
+             plays, without staging/per-object animation)"
+                .to_string(),
+        );
+    }
+
     let mut stats = String::new();
     let _ = writeln!(
         stats,
-        "{} events, {:.2}s, {} output bytes, {} RGP sequences, {} objects",
+        "{} events, {:.2}s, {} output bytes, {} RGP sequences, {} objects, requires: {}",
         cast.events.len(),
         cast.duration_secs(),
         output_bytes,
         rgp_sequences,
         ever_registered.len(),
+        requires,
     );
     report.stats = stats;
     report
@@ -243,25 +261,41 @@ fn check_rgp(
                 }
             }
         }
-        RgpOperation::Place { object_id, .. } => match objects.get(&object_id) {
-            Some(tracking) if tracking.registered => {}
-            Some(tracking) if tracking.open_chunk_run => {
-                report.errors.push(format!(
-                    "line {line}: object {object_id} placed while its payload chunk run \
-                     is still open (send the more=0 chunk first)"
-                ));
+        RgpOperation::Place { object_id, anchor } => {
+            match objects.get(&object_id) {
+                Some(tracking) if tracking.registered => {}
+                Some(tracking) if tracking.open_chunk_run => {
+                    report.errors.push(format!(
+                        "line {line}: object {object_id} placed while its payload chunk run \
+                         is still open (send the more=0 chunk first)"
+                    ));
+                }
+                _ => {
+                    report.errors.push(format!(
+                        "line {line}: object {object_id} placed before registration \
+                         (ratty silently ignores this)"
+                    ));
+                }
             }
-            _ => {
-                report.errors.push(format!(
-                    "line {line}: object {object_id} placed before registration \
-                     (ratty silently ignores this)"
-                ));
+            if anchor.style.spin.is_some()
+                || anchor.style.bob.is_some()
+                || anchor.style.bob_amplitude.is_some()
+                || anchor.style.phase != 0.0
+            {
+                report.requires_v2.insert("objanim");
             }
-        },
+        }
         RgpOperation::Update { object_id, update } => {
             let tracking = objects.entry(object_id).or_default();
             if update.depth.is_some() || update.color.is_some() || update.brightness.is_some() {
                 tracking.respawn_updates += 1;
+            }
+            if update.spin.is_some()
+                || update.bob.is_some()
+                || update.bob_amplitude.is_some()
+                || update.phase.is_some()
+            {
+                report.requires_v2.insert("objanim");
             }
         }
         RgpOperation::Delete { object_id } => match object_id {
@@ -270,12 +304,86 @@ fn check_rgp(
             }
             None => objects.clear(),
         },
+        RgpOperation::Stage { update } => {
+            report.requires_v2.insert("stage");
+            if update.dur.is_some_and(|dur| dur > 0.0) {
+                report.requires_v2.insert("tween");
+            }
+            check_stage_fields(line, sequence, report);
+        }
         RgpOperation::SupportQuery => {}
         RgpOperation::Ignored => {
             report.warnings.push(format!(
                 "line {line}: RGP sequence with unknown verb (ignored by ratty)"
             ));
         }
+    }
+}
+
+/// Strictly re-scans a `c` sequence's raw fields. Ratty's parser is
+/// deliberately permissive (bad values are dropped per-key), so authoring
+/// mistakes like `warp=abc` or `mode=cube4d` would silently vanish at
+/// playback; the validator surfaces them instead.
+fn check_stage_fields(line: usize, sequence: &[u8], report: &mut Report) {
+    let content_end = sequence.len() - if sequence.ends_with(b"\x1b\\") { 2 } else { 1 };
+    let Ok(content) = std::str::from_utf8(&sequence[RGP_APC_START.len()..content_end]) else {
+        return;
+    };
+    let mut fields = 0usize;
+    for part in content.split(';').skip(1).filter(|part| !part.is_empty()) {
+        let Some((key, value)) = part.split_once('=') else {
+            report.errors.push(format!(
+                "line {line}: stage field \"{part}\" is not key=value"
+            ));
+            continue;
+        };
+        fields += 1;
+        let mut check_range = |min: f32, max: f32| match value.parse::<f32>() {
+            Ok(parsed) if (min..=max).contains(&parsed) => {}
+            Ok(parsed) => report.errors.push(format!(
+                "line {line}: stage {key}={parsed} out of range {min}..={max}"
+            )),
+            Err(_) => report.errors.push(format!(
+                "line {line}: stage {key}=\"{value}\" is not a number"
+            )),
+        };
+        match key {
+            "mode" => {
+                if !matches!(value, "flat2d" | "plane3d" | "mobius3d") {
+                    report.errors.push(format!(
+                        "line {line}: unknown stage mode \"{value}\" (flat2d, plane3d, mobius3d)"
+                    ));
+                }
+            }
+            "warp" => check_range(0.0, 1.0),
+            "zoom" => check_range(0.1, 4.0),
+            "yaw" | "pitch" => {
+                if value.parse::<f32>().map(f32::is_finite) != Ok(true) {
+                    report.errors.push(format!(
+                        "line {line}: stage {key}=\"{value}\" is not a finite number"
+                    ));
+                }
+            }
+            "dur" => check_range(0.0, f32::INFINITY),
+            "ease" => {
+                if !matches!(value, "linear" | "in" | "out" | "inout") {
+                    report.errors.push(format!(
+                        "line {line}: unknown stage ease \"{value}\" (linear, in, out, inout)"
+                    ));
+                }
+            }
+            other => {
+                report.errors.push(format!(
+                    "line {line}: unknown stage field \"{other}\" \
+                     (mode, warp, yaw, pitch, zoom, dur, ease)"
+                ));
+            }
+        }
+    }
+    if fields == 0 {
+        report
+            .warnings
+            .push(format!("line {line}: bare `c` sequence is a no-op"));
     }
 }
 
@@ -390,6 +498,71 @@ mod tests {
         let cast = cast_with_events(&event_refs);
         let report = validate(&cast);
         assert!(report.warnings.iter().any(|w| w.contains("respawn")));
+    }
+
+    #[test]
+    fn stage_sequences_are_strictly_checked() {
+        let cast = cast_with_events(&[(
+            0.0,
+            "o",
+            "\x1b_ratty;g;c;mode=cube4d;warp=1.5;zoom=9;waro=0.2;ease=bounce;dur=2\x1b\\",
+        )]);
+        let report = validate(&cast);
+        for expected in [
+            "unknown stage mode",
+            "warp=1.5 out of range",
+            "zoom=9 out of range",
+            "unknown stage field \"waro\"",
+            "unknown stage ease",
+        ] {
+            assert!(
+                report.errors.iter().any(|e| e.contains(expected)),
+                "missing \"{expected}\" in {:?}",
+                report.errors
+            );
+        }
+    }
+
+    #[test]
+    fn stage_and_animation_report_v2_requirements() {
+        let cast = cast_with_events(&[
+            (0.0, "o", "\x1b_ratty;g;c;warp=0.4;dur=2;ease=inout\x1b\\"),
+            (0.1, "o", "\x1b_ratty;g;u;id=1;spin=2\x1b\\"),
+        ]);
+        let report = validate(&cast);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert!(report.requires_v2.contains("stage"));
+        assert!(report.requires_v2.contains("tween"));
+        assert!(report.requires_v2.contains("objanim"));
+        assert!(
+            report
+                .stats
+                .contains("requires: RGP v2 (objanim, stage, tween)")
+        );
+        assert!(report.warnings.iter().any(|w| w.contains("v1 terminals")));
+    }
+
+    #[test]
+    fn v1_casts_report_v1() {
+        let cast = cast_with_events(&[
+            (
+                0.0,
+                "o",
+                "\x1b_ratty;g;r;id=1;fmt=obj;source=payload;more=0;name=t.obj;normalize=1;dGVzdA==\x1b\\",
+            ),
+            (0.1, "o", "\x1b_ratty;g;p;id=1;row=5;col=5;w=2;h=2\x1b\\"),
+        ]);
+        let report = validate(&cast);
+        assert!(report.requires_v2.is_empty());
+        assert!(report.stats.contains("requires: RGP v1"));
+    }
+
+    #[test]
+    fn bare_stage_sequence_warns() {
+        let cast = cast_with_events(&[(0.0, "o", "\x1b_ratty;g;c\x1b\\")]);
+        let report = validate(&cast);
+        assert!(report.errors.is_empty());
+        assert!(report.warnings.iter().any(|w| w.contains("no-op")));
     }
 
     #[test]
