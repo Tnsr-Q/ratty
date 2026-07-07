@@ -1,0 +1,61 @@
+{
+  "meta": {
+    "title": "The Same Animal",
+    "agent": "fable/5",
+    "mood": "mythic-domestic"
+  },
+  "stage": {
+    "cols": 104,
+    "rows": 32,
+    "mode": "plane3d",
+    "warp": 0.28,
+    "theme": { "fg": "#dcd7ba", "bg": "#1f1f28" },
+    "loop": true
+  },
+  "cast": [
+    { "at": 0.0, "clear": true },
+    { "at": 0.0, "camera": { "mode": "plane3d", "warp": 0.28, "yaw": 0.16, "pitch": 0.07, "zoom": 1.0 } },
+    { "at": 0.2, "print": { "row": 1, "col": 3, "text": "TRANSMISSION 003 :: THE SAME ANIMAL", "fg": "#e4bf56", "bold": true } },
+    { "at": 0.55, "print": { "row": 2, "col": 3, "text": "mood: mythic-domestic // spun by fable/5", "fg": "#727169" } },
+    { "at": 0.6, "register": { "id": 1, "fmt": "obj", "file": "assets/lantern.obj" } },
+    { "at": 0.8, "register": { "id": 2, "fmt": "obj", "file": "assets/lantern.obj", "name": "lantern-far.obj" } },
+
+    { "at": 1.1, "marker": "chapter:the-myth" },
+    { "at": 1.3, "print": { "row": 5, "col": 5, "text": "at the far edge of the field stands a myth.", "fg": "#dcd7ba" } },
+    { "at": 1.7, "place": { "id": 2, "row": 12, "col": 76, "w": 32, "h": 18, "animate": true, "spin": 0.07, "bob": 0.3, "bobamp": 0.015, "scale": 1.5, "brightness": 0.6 } },
+    { "at": 2.1, "print": { "row": 6, "col": 5, "text": "it is a lantern the size of weather.", "fg": "#dcd7ba" } },
+    { "at": 2.9, "print": { "row": 7, "col": 5, "text": "it burns politely. it answers to no name.", "fg": "#dcd7ba" } },
+
+    { "at": 4.1, "marker": "chapter:the-fable" },
+    { "at": 4.3, "print": { "row": 9, "col": 5, "text": "the same animal was told again, smaller,", "fg": "#dcd7ba" } },
+    { "at": 4.9, "print": { "row": 10, "col": 5, "text": "so a hand could carry it.", "fg": "#dcd7ba" } },
+    { "at": 5.3, "place": { "id": 1, "row": 24, "col": 57, "w": 12, "h": 7, "animate": true, "spin": 0.28, "bob": 0.9, "bobamp": 0.03, "phase": 2.4, "scale": 0.8, "brightness": 1.2 } },
+    { "at": 6.1, "print": { "row": 12, "col": 5, "text": "(same vertices. same flame. the difference", "fg": "#727169" } },
+    { "at": 6.7, "print": { "row": 13, "col": 5, "text": " is distance, and what the light agrees to show.)", "fg": "#727169" } },
+
+    { "at": 8.3, "marker": "chapter:the-moral" },
+    { "at": 8.5, "print": { "row": 15, "col": 5, "text": "it keeps its moral on the inside,", "fg": "#8a9a7b" } },
+    { "at": 9.1, "print": { "row": 16, "col": 5, "text": "the way fruit keeps a stone.", "fg": "#8a9a7b" } },
+    { "at": 10.1, "print": { "row": 18, "col": 5, "text": "a moral is the one tooth a story is allowed.", "fg": "#c4746e" } },
+
+    { "at": 10.4, "camera": { "warp": 0.52, "pitch": 0.15, "dur": 4.6, "ease": "in-out" } },
+    { "at": 11.2, "tween": { "id": 1, "dur": 6.0, "fps": 30, "ease": "in-out", "to": { "px": 0.3, "py": 0.16 } } },
+
+    { "at": 13.4, "print": { "row": 20, "col": 5, "text": "walk far enough along the small story", "fg": "#dcd7ba" } },
+    { "at": 14.0, "print": { "row": 21, "col": 5, "text": "and you arrive on the vast one's back.", "fg": "#dcd7ba" } },
+
+    { "at": 15.4, "marker": "chapter:one-surface" },
+    { "at": 15.4, "camera": { "mode": "mobius3d", "warp": 0.45 } },
+    { "at": 16.8, "print": { "row": 23, "col": 5, "text": "there were never two animals.", "fg": "#dcd7ba" } },
+    { "at": 17.5, "tween": { "id": 1, "dur": 3.0, "fps": 30, "ease": "out", "to": { "spin": 0.07 } } },
+    { "at": 17.6, "print": { "row": 24, "col": 5, "text": "(one surface, worn at two distances.)", "fg": "#727169" } },
+
+    { "at": 19.8, "camera": { "warp": 0.3, "dur": 3.5, "ease": "out" } },
+
+    { "at": 20.6, "marker": "chapter:the-seam" },
+    { "at": 20.8, "print": { "row": 26, "col": 3, "text": "at the seam the story forgets itself, politely.", "fg": "#dcd7ba" } },
+    { "at": 21.5, "update": { "id": 1, "brightness": 1.2 } },
+    { "at": 22.0, "print": { "row": 27, "col": 3, "text": "it is lit again each time. begin again.", "fg": "#e4bf56" } },
+    { "at": 24.8, "delete": "all" }
+  ]
+}
