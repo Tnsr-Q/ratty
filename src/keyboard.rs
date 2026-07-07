@@ -7,6 +7,7 @@ use bevy::input::keyboard::{Key, KeyboardInput};
 use bevy::prelude::*;
 use bevy::window::{PrimaryWindow, Window};
 
+#[cfg(not(target_arch = "wasm32"))]
 use arboard::Clipboard;
 
 use crate::config::{AppConfig, BindingAction, FontConfig, KeyBindingConfig};
@@ -20,18 +21,24 @@ use crate::scene::{
 use crate::terminal::{TerminalRedrawState, TerminalSurface, render_scale_for_window};
 
 /// Clipboard bridge for terminal copy and paste.
+///
+/// On wasm there is no synchronous clipboard; copy/paste degrade to no-ops
+/// (the async Web Clipboard API can be layered on by the embedder later).
 pub struct TerminalClipboard {
+    #[cfg(not(target_arch = "wasm32"))]
     clipboard: Option<Clipboard>,
 }
 
 impl FromWorld for TerminalClipboard {
     fn from_world(_world: &mut World) -> Self {
         Self {
+            #[cfg(not(target_arch = "wasm32"))]
             clipboard: Clipboard::new().ok(),
         }
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl TerminalClipboard {
     fn copy(&mut self, text: &str) {
         let Some(clipboard) = self.clipboard.as_mut() else {
@@ -47,6 +54,17 @@ impl TerminalClipboard {
     fn paste(&mut self) -> Option<String> {
         let clipboard = self.clipboard.as_mut()?;
         clipboard.get_text().ok()
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+impl TerminalClipboard {
+    fn copy(&mut self, _text: &str) {
+        warn!("clipboard copy is not supported in the web build yet");
+    }
+
+    fn paste(&mut self) -> Option<String> {
+        None
     }
 }
 

@@ -1,0 +1,40 @@
+{
+  "meta": {
+    "title": "Orchard, Inverted",
+    "agent": "loom/prototype-0",
+    "mood": "hyperreal-pastoral"
+  },
+  "stage": {
+    "cols": 104,
+    "rows": 32,
+    "mode": "plane3d",
+    "warp": 0.35,
+    "theme": { "fg": "#dcd7ba", "bg": "#1f1f28" },
+    "loop": true
+  },
+  "cast": [
+    { "at": 0.0, "clear": true },
+    { "at": 0.2, "print": { "row": 1, "col": 3, "text": "TRANSMISSION 001 :: ORCHARD, INVERTED", "fg": "#e4bf56", "bold": true } },
+    { "at": 0.55, "print": { "row": 2, "col": 3, "text": "mood: hyperreal-pastoral // spun by loom/prototype-0", "fg": "#727169" } },
+    { "at": 0.6, "register": { "id": 1, "fmt": "obj", "file": "assets/tree.obj" } },
+    { "at": 0.8, "register": { "id": 2, "fmt": "obj", "file": "assets/tree.obj", "name": "tree-far.obj" } },
+    { "at": 1.0, "place": { "id": 1, "row": 13, "col": 74, "w": 28, "h": 16, "rx": 180, "scale": 1.15, "brightness": 1.1 } },
+    { "at": 1.1, "marker": "chapter:orchard" },
+    { "at": 1.3, "print": { "row": 6, "col": 5, "text": "the trees grow downward here, politely.", "fg": "#dcd7ba" } },
+    { "at": 1.9, "print": { "row": 7, "col": 5, "text": "gravity files no complaint.", "fg": "#dcd7ba" } },
+    { "at": 2.5, "print": { "row": 9, "col": 5, "text": "fruit falls into the sky at dawn", "fg": "#dcd7ba" } },
+    { "at": 3.1, "print": { "row": 10, "col": 5, "text": "and the sky, being patient, catches it.", "fg": "#dcd7ba" } },
+    { "at": 2.0, "tween": { "id": 1, "dur": 6.5, "fps": 30, "ease": "in-out", "to": { "ry": 360 } } },
+    { "at": 3.6, "place": { "id": 2, "row": 24, "col": 32, "w": 14, "h": 8, "rx": 180, "animate": true, "scale": 0.9, "brightness": 0.8 } },
+    { "at": 4.2, "print": { "row": 13, "col": 5, "text": "the predators are one-dimensional;", "fg": "#c4746e" } },
+    { "at": 4.8, "print": { "row": 14, "col": 5, "text": "they cannot eat what has volume.", "fg": "#c4746e" } },
+    { "at": 6.0, "print": { "row": 16, "col": 5, "text": "the orchard turns. the orchard turns.", "fg": "#8a9a7b" } },
+    { "at": 9.0, "marker": "chapter:ascension" },
+    { "at": 9.0, "tween": { "id": 1, "dur": 5.5, "fps": 30, "ease": "in-out", "to": { "ry": 540, "py": 0.55 } } },
+    { "at": 10.0, "print": { "row": 19, "col": 5, "text": "(the far tree spins on the house rhythm.", "fg": "#727169" } },
+    { "at": 10.6, "print": { "row": 20, "col": 5, "text": " the near one keeps its own time.)", "fg": "#727169" } },
+    { "at": 15.0, "tween": { "id": 1, "dur": 3.5, "fps": 30, "ease": "in-out", "to": { "py": 0, "rx": 172 } } },
+    { "at": 19.2, "print": { "row": 27, "col": 3, "text": "the loop is a promise. begin again.", "fg": "#e4bf56" } },
+    { "at": 21.0, "delete": "all" }
+  ]
+}

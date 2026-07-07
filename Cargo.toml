@@ -10,11 +10,23 @@ repository = "https://github.com/orhun/ratty"
 keywords = ["terminal", "emulator", "3d", "graphics"]
 categories = ["command-line-utilities", "graphics"]
 edition = "2024"
-exclude = ["website/**", ".github/**", "widget/**"]
+exclude = [
+    "website/**",
+    ".github/**",
+    "widget/**",
+    "graphify-out/**",
+    "site/**",
+    "tools/**",
+    "transmissions/**",
+]
+
+[lib]
+# `cdylib` is what wasm-bindgen consumes for the web build; `rlib` keeps the
+# native binary and tests linking as before.
+crate-type = ["rlib", "cdylib"]
 
 [dependencies]
 anyhow = "1.0"
-arboard = { version = "3.6", features = ["wayland-data-control"] }
 base64 = "0.22"
 bevy = { version = "0.19.0", default-features = false, features = [
     "std",
@@ -31,28 +43,49 @@ bevy = { version = "0.19.0", default-features = false, features = [
     "gltf_animation",
     "keyboard",
     "mouse",
-    "multi_threaded",
     "png",
     "reflect_auto_register",
     "tonemapping_luts",
-    "wayland",
-    "x11",
     "zstd_rust",
 ] }
 clap = { version = "4.5", features = ["derive"] }
-etcetera = "0.11"
 image = { version = "0.25", default-features = false, features = ["png", "ico"] }
 parley_ratatui = "0.3.4"
-portable-pty = "0.8"
-ratatui = "0.30"
+# Used exclusively through the parley_ratatui::ratatui re-export; default
+# features would pull crossterm, which is unused and does not build on wasm.
+ratatui = { version = "0.30", default-features = false }
 rust-embed = "8.5"
 serde = { version = "1.0", features = ["derive"] }
-shellexpand = "3.1"
 stl_io = "0.11.0"
 tobj = "4.0"
 toml = "0.8"
 vt100 = "0.16"
 winit = { version = "0.30", default-features = false }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+arboard = { version = "3.6", features = ["wayland-data-control"] }
+bevy = { version = "0.19.0", default-features = false, features = [
+    "multi_threaded",
+    "wayland",
+    "x11",
+] }
+etcetera = "0.11"
+portable-pty = "0.8"
+shellexpand = "3.1"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+bevy = { version = "0.19.0", default-features = false, features = [
+    "web",
+    "webgpu",
+] }
+console_error_panic_hook = "0.1"
+# Must match the wasm-bindgen-cli version used by site/build-wasm.sh.
+wasm-bindgen = "=0.2.118"
+# Web entropy backends for every getrandom major in the tree; 0.3+ also
+# needs RUSTFLAGS='--cfg getrandom_backend="wasm_js"' (set by the build
+# script and workflow).
+getrandom02 = { package = "getrandom", version = "0.2", features = ["js"] }
+getrandom03 = { package = "getrandom", version = "0.3", features = ["wasm_js"] }
 
 [build-dependencies]
 winresource = "0.1.31"
@@ -73,3 +106,10 @@ opt-level = 3
 [profile.dist]
 inherits = "release"
 lto = "thin"
+
+# Web bundle profile: size-lean but fast enough to build in CI.
+[profile.wasm-release]
+inherits = "release"
+lto = "thin"
+opt-level = "z"
+codegen-units = 1

@@ -1,4 +1,7 @@
-//! Shared filesystem path helpers.
+//! Shared filesystem path helpers (native targets only — the web build has
+//! no filesystem; assets are embedded or delivered in-band).
+
+#![cfg(not(target_arch = "wasm32"))]
 
 use std::path::{Path, PathBuf};
 

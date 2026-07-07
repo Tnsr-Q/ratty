@@ -1,0 +1,95 @@
+name: Deploy web vessel
+
+# Builds the ratty wasm bundle and deploys site/ (plus transmissions/) to
+# GitHub Pages. This workflow owns the `pages` concurrency slot in this fork;
+# the stock "Deploy website" workflow must stay disabled in the repository's
+# Actions settings so the two never race (see site/README.md).
+
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - "site/**"
+      - "transmissions/**"
+      - "src/**"
+      - "assets/fonts/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/web.yml"
+  pull_request:
+    paths:
+      - "site/**"
+      - "transmissions/**"
+      - "src/**"
+      - "assets/fonts/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/web.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # getrandom 0.3+ web backend; 0.2 uses the "js" feature from Cargo.toml.
+  RUSTFLAGS: --cfg getrandom_backend="wasm_js"
+
+jobs:
+  check-wasm:
+    name: Check wasm target
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo check (wasm32)
+        run: cargo check --lib --target wasm32-unknown-unknown
+
+  deploy:
+    name: Build bundle and deploy Pages
+    if: github.event_name != 'pull_request'
+    needs: check-wasm
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    concurrency:
+      group: pages
+      cancel-in-progress: false
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: Install wasm-bindgen-cli and wasm-opt
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen@0.2.118,wasm-opt
+      - name: Build wasm bundle
+        run: |
+          cargo build --lib --target wasm32-unknown-unknown --profile wasm-release
+          wasm-bindgen --target web --out-dir site/pkg --no-typescript \
+            target/wasm32-unknown-unknown/wasm-release/ratty.wasm
+          wasm-opt -Oz --output site/pkg/ratty_bg.wasm.opt site/pkg/ratty_bg.wasm
+          mv site/pkg/ratty_bg.wasm.opt site/pkg/ratty_bg.wasm
+          ls -lh site/pkg/
+      - name: Assemble Pages artifact
+        run: |
+          mkdir -p _pages
+          cp -r site/. _pages/
+          rm -f _pages/build-wasm.sh
+          mkdir -p _pages/transmissions
+          cp -r transmissions/. _pages/transmissions/
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _pages
+      - id: deployment
+        uses: actions/deploy-pages@v4

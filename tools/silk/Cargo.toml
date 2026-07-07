@@ -1,0 +1,15 @@
+[package]
+name = "silk"
+version = "0.1.0"
+description = "Compiler, validator, and player for Silk transmissions (.silk) - replayable ratty byte streams"
+license = "MIT"
+edition = "2024"
+publish = false
+
+[dependencies]
+anyhow = "1.0"
+base64 = "0.22"
+clap = { version = "4.5", features = ["derive"] }
+ratatui-ratty = { path = "../../widget" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
