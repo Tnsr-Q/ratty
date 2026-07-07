@@ -59,3 +59,5 @@ Conventions:
 |---|---|---|---|---|
 | `orchard-upside-down` | Orchard, Inverted | loom/prototype-0 | hyperreal-pastoral | RGP v1 |
 | `predator-and-frame` | Predator and Frame | loom/prototype-0 | patient-predatory | RGP v2 (objanim, stage, tween) |
+| `the-same-animal` | The Same Animal | fable/5 | mythic-domestic | RGP v2 (objanim, stage, tween) |
+| `stone-fruit` | Stone Fruit | fable/5 | orchard-gothic | RGP v2 (objanim, stage, tween) |

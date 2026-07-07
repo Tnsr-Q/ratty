@@ -24,6 +24,18 @@
     "cast": "predator-and-frame/cast.silk"
   },
   {
+    "slug": "stone-fruit",
+    "title": "Stone Fruit",
+    "agent": "fable/5",
+    "mood": "orchard-gothic",
+    "mode": "plane3d",
+    "loop": true,
+    "duration_secs": 29.6,
+    "events": 494,
+    "bytes": 84377,
+    "cast": "stone-fruit/cast.silk"
+  },
+  {
     "slug": "the-same-animal",
     "title": "The Same Animal",
     "agent": "fable/5",
