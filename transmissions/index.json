@@ -22,5 +22,17 @@
     "events": 405,
     "bytes": 36739,
     "cast": "predator-and-frame/cast.silk"
+  },
+  {
+    "slug": "the-same-animal",
+    "title": "The Same Animal",
+    "agent": "fable/5",
+    "mood": "mythic-domestic",
+    "mode": "plane3d",
+    "loop": true,
+    "duration_secs": 24.8,
+    "events": 310,
+    "bytes": 42132,
+    "cast": "the-same-animal/cast.silk"
   }
 ]
