@@ -24,11 +24,12 @@
 use std::collections::HashMap;
 use std::sync::mpsc::TryRecvError;
 
-use crate::config::{AppConfig, CURSOR_DEPTH};
+use crate::config::{AppConfig, CURSOR_DEPTH, CursorAnimationConfig};
 use crate::direct_render::DirectTerminalSceneExchange;
 use crate::inline::{
-    InlineKittyPlaneLayout, InlineObject, TerminalInlineObjectPlane, TerminalInlineObjectSprite,
-    TerminalInlineObjects, TerminalRgpObject,
+    InlineKittyPlaneLayout, InlineObject, InlineStyle, RgpAnimationState,
+    TerminalInlineObjectPlane, TerminalInlineObjectSprite, TerminalInlineObjects,
+    TerminalRgpObject,
 };
 use crate::model::CursorModel;
 use crate::model::spawn_cursor_model;
@@ -965,6 +966,7 @@ fn spawn_rgp_object(
             let root = commands
                 .spawn((
                     TerminalRgpObject { object_id },
+                    RgpAnimationState::default(),
                     Transform::default(),
                     Visibility::Visible,
                 ))
@@ -994,6 +996,7 @@ fn spawn_rgp_object(
             };
             commands.spawn((
                 TerminalRgpObject { object_id },
+                RgpAnimationState::default(),
                 Transform::default(),
                 Visibility::Visible,
                 WorldAssetRoot(handle),
@@ -1039,6 +1042,7 @@ fn spawn_rgp_object(
             let root = commands
                 .spawn((
                     TerminalRgpObject { object_id },
+                    RgpAnimationState::default(),
                     Transform::default(),
                     Visibility::Visible,
                 ))
@@ -1075,6 +1079,7 @@ pub(crate) struct RgpSyncParams<'w, 's> {
             &'static TerminalRgpObject,
             &'static mut Transform,
             &'static mut Visibility,
+            &'static mut RgpAnimationState,
         ),
     >,
 }
@@ -1103,9 +1108,10 @@ pub(crate) fn sync_rgp_objects(mut params: RgpSyncParams) {
     let cell_width = viewport.size.x / terminal.cols.max(1) as f32;
     let cell_height = viewport.size.y / terminal.rows.max(1) as f32;
     let elapsed_secs = time.elapsed_secs();
+    let delta_secs = time.delta_secs();
     let mobius_progress = active_mobius_progress(presentation.mode, mobius_transition);
 
-    for (object, mut transform, mut visibility) in query.iter_mut() {
+    for (object, mut transform, mut visibility, mut animation_state) in query.iter_mut() {
         let Some(anchor) = inline_objects.anchors.get(&object.object_id) else {
             *visibility = Visibility::Hidden;
             continue;
@@ -1129,17 +1135,14 @@ pub(crate) fn sync_rgp_objects(mut params: RgpSyncParams) {
             anchor.style.rotation.y.to_radians(),
             anchor.style.rotation.z.to_radians(),
         );
-        let (spin, tilt, bob) = if anchor.style.animate {
-            (
-                elapsed_secs * app_config.cursor.animation.spin_speed,
-                elapsed_secs * app_config.cursor.animation.spin_speed * 0.7,
-                (elapsed_secs * app_config.cursor.animation.bob_speed).sin()
-                    * cell_height
-                    * app_config.cursor.animation.bob_amplitude,
-            )
-        } else {
-            (0.0, 0.0, 0.0)
-        };
+        let (spin, tilt, bob) = rgp_object_animation(
+            &anchor.style,
+            &mut animation_state,
+            &app_config.cursor.animation,
+            elapsed_secs,
+            delta_secs,
+            cell_height,
+        );
         let animated_rotation = Quat::from_rotation_y(spin) * Quat::from_rotation_x(tilt);
         let object_rotation = base_oblique * explicit_rotation * animated_rotation;
         let object_scale = Vec3::splat(scale) * scale3;
@@ -1178,6 +1181,150 @@ pub(crate) fn sync_rgp_objects(mut params: RgpSyncParams) {
                 *visibility = Visibility::Visible;
             }
         }
+    }
+}
+
+/// Computes the built-in spin/tilt/bob animation for one RGP object and
+/// advances its integrated state.
+///
+/// Objects without per-object animation fields evaluate the v1 absolute-time
+/// expressions verbatim, so their motion is bit-identical to v1; the
+/// accumulators are refreshed in lockstep so switching to per-object rates
+/// later is continuous. Objects with per-object fields integrate
+/// `state += delta * rate`, which makes mid-flight rate changes smooth:
+/// `spin=0` holds the current angle, and `phase` offsets both channels
+/// (desynchronizing otherwise-lockstep objects). A respawn resets the state,
+/// which is already a visual discontinuity.
+fn rgp_object_animation(
+    style: &InlineStyle,
+    state: &mut RgpAnimationState,
+    animation: &CursorAnimationConfig,
+    elapsed_secs: f32,
+    delta_secs: f32,
+    cell_height: f32,
+) -> (f32, f32, f32) {
+    if !style.animate {
+        return (0.0, 0.0, 0.0);
+    }
+
+    let has_custom = style.spin.is_some()
+        || style.bob.is_some()
+        || style.bob_amplitude.is_some()
+        || style.phase != 0.0;
+    if !has_custom {
+        state.spin_angle = elapsed_secs * animation.spin_speed;
+        state.bob_phase = elapsed_secs * animation.bob_speed;
+        return (
+            elapsed_secs * animation.spin_speed,
+            elapsed_secs * animation.spin_speed * 0.7,
+            (elapsed_secs * animation.bob_speed).sin() * cell_height * animation.bob_amplitude,
+        );
+    }
+
+    state.spin_angle += delta_secs * style.spin.unwrap_or(animation.spin_speed);
+    state.bob_phase += delta_secs * style.bob.unwrap_or(animation.bob_speed);
+    let spin = state.spin_angle + style.phase;
+    let tilt = spin * 0.7;
+    let bob = (state.bob_phase + style.phase).sin()
+        * cell_height
+        * style.bob_amplitude.unwrap_or(animation.bob_amplitude);
+    (spin, tilt, bob)
+}
+
+#[cfg(test)]
+mod rgp_animation_tests {
+    use super::*;
+
+    fn config() -> CursorAnimationConfig {
+        CursorAnimationConfig::default()
+    }
+
+    fn v1_style() -> InlineStyle {
+        InlineStyle {
+            animate: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn v1_path_matches_the_absolute_time_expressions_bit_exactly() {
+        let animation = config();
+        let style = v1_style();
+        let mut state = RgpAnimationState::default();
+        for elapsed in [0.0_f32, 0.25, 1.0, 7.5, 3600.0] {
+            let (spin, tilt, bob) =
+                rgp_object_animation(&style, &mut state, &animation, elapsed, 0.016, 20.0);
+            assert_eq!(spin, elapsed * animation.spin_speed);
+            assert_eq!(tilt, elapsed * animation.spin_speed * 0.7);
+            assert_eq!(
+                bob,
+                (elapsed * animation.bob_speed).sin() * 20.0 * animation.bob_amplitude
+            );
+        }
+    }
+
+    #[test]
+    fn switching_to_per_object_rates_is_continuous() {
+        let animation = config();
+        let mut state = RgpAnimationState::default();
+        let mut style = v1_style();
+
+        // Run the v1 path for a while; the accumulator tracks it.
+        let elapsed = 5.0_f32;
+        let (v1_spin, ..) =
+            rgp_object_animation(&style, &mut state, &animation, elapsed, 0.016, 20.0);
+
+        // A `u;spin=` arrives: the very next frame advances from the v1
+        // angle by exactly delta * new_rate. No snap.
+        style.spin = Some(0.4);
+        let delta = 0.016_f32;
+        let (spin, ..) =
+            rgp_object_animation(&style, &mut state, &animation, elapsed + delta, delta, 20.0);
+        assert!((spin - (v1_spin + delta * 0.4)).abs() < 1e-5);
+    }
+
+    #[test]
+    fn animate_off_is_a_rest_pose_and_freezes_state() {
+        let animation = config();
+        let style = InlineStyle::default();
+        let mut state = RgpAnimationState {
+            spin_angle: 3.0,
+            bob_phase: 1.0,
+        };
+        let result = rgp_object_animation(&style, &mut state, &animation, 9.0, 0.016, 20.0);
+        assert_eq!(result, (0.0, 0.0, 0.0));
+        assert_eq!(state.spin_angle, 3.0);
+        assert_eq!(state.bob_phase, 1.0);
+    }
+
+    #[test]
+    fn zero_spin_rate_holds_the_current_angle() {
+        let animation = config();
+        let mut style = v1_style();
+        style.spin = Some(0.0);
+        let mut state = RgpAnimationState {
+            spin_angle: 2.5,
+            bob_phase: 0.0,
+        };
+        for _ in 0..10 {
+            let (spin, ..) = rgp_object_animation(&style, &mut state, &animation, 1.0, 0.016, 20.0);
+            assert_eq!(spin, 2.5);
+        }
+    }
+
+    #[test]
+    fn phase_offsets_both_channels() {
+        let animation = config();
+        let mut style = v1_style();
+        style.spin = Some(0.0);
+        style.bob = Some(0.0);
+        style.phase = 1.0;
+        let mut state = RgpAnimationState::default();
+        let (spin, tilt, bob) =
+            rgp_object_animation(&style, &mut state, &animation, 0.0, 0.0, 20.0);
+        assert_eq!(spin, 1.0);
+        assert_eq!(tilt, 0.7);
+        assert_eq!(bob, 1.0_f32.sin() * 20.0 * animation.bob_amplitude);
     }
 }
 

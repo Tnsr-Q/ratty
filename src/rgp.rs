@@ -407,10 +407,10 @@ pub enum RgpOperation {
 /// Returns the RGP support reply sequence.
 ///
 /// New capability keys are appended so v1 reply parsers that scan known
-/// keys keep working: `stage` (the `c` verb) and `tween` (`dur`/`ease`
-/// on `c`).
+/// keys keep working: `stage` (the `c` verb), `tween` (`dur`/`ease` on
+/// `c`), and `objanim` (per-object `spin`/`bob`/`bobamp`/`phase`).
 pub fn support_reply() -> Vec<u8> {
-    b"\x1b_ratty;g;s;v=2;fmt=obj|glb|stl;path=1;payload=1;chunk=1;anim=1;depth=1;color=1;brightness=1;transform=1;update=1;normalize=1;stage=1;tween=1\x1b\\".to_vec()
+    b"\x1b_ratty;g;s;v=2;fmt=obj|glb|stl;path=1;payload=1;chunk=1;anim=1;depth=1;color=1;brightness=1;transform=1;update=1;normalize=1;stage=1;tween=1;objanim=1\x1b\\".to_vec()
 }
 
 fn parse_color(value: &str) -> Option<[u8; 3]> {
@@ -600,7 +600,7 @@ mod tests {
         for part in parts {
             assert!(part.contains('='), "`{part}` is not a key=value pair");
         }
-        for capability in ["v=2", "stage=1", "tween=1"] {
+        for capability in ["v=2", "stage=1", "tween=1", "objanim=1"] {
             assert!(
                 content.split(';').any(|part| part == capability),
                 "reply must advertise `{capability}`"

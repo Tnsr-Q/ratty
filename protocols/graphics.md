@@ -85,6 +85,7 @@ Fields:
 - `normalize=1`: `normalize=<0|1>` registration is supported for OBJ assets
 - `stage=1`: the `c` stage/camera verb is supported (v2)
 - `tween=1`: `dur`/`ease` stage tweening on `c` is supported (v2)
+- `objanim=1`: per-object `spin`/`bob`/`bobamp`/`phase` animation is supported (v2)
 
 If no reply arrives, the terminal does not support the protocol.
 
@@ -189,7 +190,29 @@ Fields:
 - `rx`, `ry`, `rz`: optional rotation in degrees, defaults to `0`
 - `sx`, `sy`, `sz`: optional non-uniform scale, defaults to `1`
 
-Clients that only send the original v1 fields still work unchanged.
+Per-object animation fields (v2), all optional:
+
+- `spin`: spin speed in radians per second
+- `bob`: bob speed in radians per second
+- `bobamp`: bob amplitude as a fraction of the cell height
+- `phase`: constant phase offset in radians applied to spin and bob
+
+The animation truth table:
+
+| `animate` | v2 fields          | behavior                                             |
+| --------- | ------------------ | ---------------------------------------------------- |
+| absent/0  | any                | rest pose; all animation fields are inert            |
+| 1         | none               | global-config spin+tilt+bob, exactly as in v1        |
+| 1         | any subset         | per-channel rates; absent channels use the global    |
+
+`animate` stays the single master switch. A rate of `0` holds the current
+value (`spin=0` freezes the angle mid-pose), and `phase` desynchronizes
+objects that would otherwise move in lockstep. Tilt remains coupled to spin
+(`0.7 ×`), as in v1. Rates integrate frame-to-frame, so changing them
+mid-flight is smooth rather than snapping.
+
+Clients that only send the original v1 fields still work unchanged — the
+motion is identical to v1.
 
 ### 4. Update Object
 
@@ -212,6 +235,13 @@ Fields are optional and mirror the mutable fields from `p`:
 - `px`, `py`, `pz`
 - `rx`, `ry`, `rz`
 - `sx`, `sy`, `sz`
+- `spin`, `bob`, `bobamp`, `phase` (v2)
+
+`depth`, `color` and `brightness` force the object to respawn; every other
+field — including the v2 animation fields — applies live to the placed
+object, which makes them suitable for per-frame streaming. Like `color`,
+the v2 animation fields are set-only: an update can change them but not
+clear them back to the configured globals.
 
 ### 5. Delete Object
 
