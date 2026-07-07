@@ -350,10 +350,14 @@ pub struct TweenArgs {
     pub to: BTreeMap<String, f64>,
 }
 
-/// Fields a tween may animate: live-update fields only. `depth`, `color`,
-/// and `brightness` force the renderer to despawn/respawn the object every
-/// update and are rejected in tweens. The v2 animation rates are live and
-/// therefore tweenable (a tween over `spin` accelerates the spin smoothly).
+/// Fields a tween may animate: live-update fields only. `depth` forces the
+/// renderer to despawn/respawn the object and is rejected in tweens. As of
+/// the restyle-granularity change, ratty applies `color`/`brightness` on
+/// mesh-backed objects as in-place material rewrites, but they stay
+/// non-tweenable here: older terminals still respawn on them, glTF objects
+/// still rebuild, and lifting the ban is a protocol-level decision. The v2
+/// animation rates are live and therefore tweenable (a tween over `spin`
+/// accelerates the spin smoothly).
 pub const TWEENABLE_FIELDS: [&str; 14] = [
     "px", "py", "pz", "rx", "ry", "rz", "sx", "sy", "sz", "scale", "spin", "bob", "bobamp", "phase",
 ];

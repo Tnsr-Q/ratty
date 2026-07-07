@@ -17,10 +17,10 @@ use crate::scene::{
 use crate::systems::{
     TerminalFrameDirty, TerminalRedrawSet, animate_inline_kitty_planes, animate_mobius_transition,
     animate_stage_tween, animate_terminal_plane_warp, apply_inline_objects,
-    apply_instance_brightness, apply_rgp_stage, finish_terminal_model_load, handle_window_resize,
-    pump_pty_output, render_terminal_widget, request_exit_on_primary_window_close,
-    shutdown_terminal_runtime_on_exit, sync_asset_to_terminal_cursor, sync_inline_objects,
-    sync_rgp_objects, sync_terminal_materials,
+    apply_instance_brightness, apply_rgp_restyle, apply_rgp_stage, finish_terminal_model_load,
+    handle_window_resize, pump_pty_output, render_terminal_widget,
+    request_exit_on_primary_window_close, shutdown_terminal_runtime_on_exit,
+    sync_asset_to_terminal_cursor, sync_inline_objects, sync_rgp_objects, sync_terminal_materials,
 };
 use crate::terminal::TerminalRedrawState;
 
@@ -123,7 +123,18 @@ impl Plugin for TerminalPlugin {
                     .after(sync_inline_objects)
                     .run_if(|objects: Query<(), With<TerminalRgpObject>>| !objects.is_empty()),
             )
-            .add_systems(Update, apply_instance_brightness.after(sync_rgp_objects))
+            .add_systems(
+                Update,
+                apply_rgp_restyle
+                    .after(sync_inline_objects)
+                    .run_if(|objects: Res<TerminalInlineObjects>| objects.has_restyle_objects()),
+            )
+            .add_systems(
+                Update,
+                apply_instance_brightness
+                    .after(sync_rgp_objects)
+                    .after(apply_rgp_restyle),
+            )
             .add_systems(
                 Update,
                 animate_mobius_transition.run_if(
