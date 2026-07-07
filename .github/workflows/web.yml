@@ -77,7 +77,11 @@ jobs:
           cargo build --lib --target wasm32-unknown-unknown --profile wasm-release
           wasm-bindgen --target web --out-dir site/pkg --no-typescript \
             target/wasm32-unknown-unknown/wasm-release/ratty.wasm
-          wasm-opt -Oz --output site/pkg/ratty_bg.wasm.opt site/pkg/ratty_bg.wasm
+          # rustc emits bulk-memory / nontrapping-fptoint / sign-ext by
+          # default; wasm-opt validates against MVP unless told otherwise.
+          wasm-opt -Oz \
+            --enable-bulk-memory --enable-nontrapping-float-to-int --enable-sign-ext \
+            --output site/pkg/ratty_bg.wasm.opt site/pkg/ratty_bg.wasm
           mv site/pkg/ratty_bg.wasm.opt site/pkg/ratty_bg.wasm
           ls -lh site/pkg/
       - name: Assemble Pages artifact
@@ -88,6 +92,10 @@ jobs:
           mkdir -p _pages/transmissions
           cp -r transmissions/. _pages/transmissions/
       - uses: actions/configure-pages@v5
+        with:
+          # First-run bootstrap: create/enable the Pages site (source:
+          # GitHub Actions) if the repository doesn't have one yet.
+          enablement: true
       - uses: actions/upload-pages-artifact@v3
         with:
           path: _pages

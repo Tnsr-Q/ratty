@@ -22,7 +22,11 @@ wasm-bindgen \
     target/wasm32-unknown-unknown/wasm-release/ratty.wasm
 
 if command -v wasm-opt >/dev/null 2>&1; then
-    wasm-opt -Oz --output site/pkg/ratty_bg.wasm.opt site/pkg/ratty_bg.wasm
+    # rustc emits bulk-memory / nontrapping-fptoint / sign-ext by default;
+    # wasm-opt validates against MVP unless told otherwise.
+    wasm-opt -Oz \
+        --enable-bulk-memory --enable-nontrapping-float-to-int --enable-sign-ext \
+        --output site/pkg/ratty_bg.wasm.opt site/pkg/ratty_bg.wasm
     mv site/pkg/ratty_bg.wasm.opt site/pkg/ratty_bg.wasm
     echo "wasm-opt: optimized"
 else
