@@ -33,6 +33,8 @@ pub struct Report {
     /// RGP v2 capabilities the cast requires (`stage`, `tween`, `objanim`);
     /// empty for a pure v1 cast.
     pub requires_v2: std::collections::BTreeSet<&'static str>,
+    /// Asset formats the cast registers (`obj`, `glb`, `stl`).
+    pub formats: std::collections::BTreeSet<String>,
 }
 
 impl Report {
@@ -228,9 +230,13 @@ fn check_rgp(
     };
     match operation {
         RgpOperation::Register {
-            object_id, source, ..
+            object_id,
+            source,
+            format,
+            ..
         } => {
             ever_registered.insert(object_id);
+            report.formats.insert(format);
             let open_elsewhere = objects
                 .iter()
                 .any(|(id, tracking)| *id != object_id && tracking.open_chunk_run);
