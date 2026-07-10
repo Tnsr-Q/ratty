@@ -1,0 +1,206 @@
+
+ — A Single CLI Binary
+Install
+cargo install ratty-ai
+The AI uses it like any other shell tool
+ratty-ai <command> [args]
+----
+Commands
+1.  3D Objects
+Place an inline 3D object at terminal cell (x=10, y=5)
+ratty-ai object add --path model.obj --x 10 --y 5 --scale 1.5
+Remove an object by ID
+ratty-ai object remove --id 3
+List all inline objects
+ratty-ai object list
+→ [{"id":1,"path":"rat.obj","x":10,"y":5}, ...]
+Update an object (spin it faster)
+ratty-ai object update --id 1 --spin 5.0 --brightness 2.0
+2.  Terminal Mode
+Toggle 2D/3D/Mobius
+ratty-ai mode 3d
+ratty-ai mode 2d
+ratty-ai mode mobius
+Adjust warp intensity (0.0 to 1.0)
+ratty-ai warp 0.5
+Reset view
+ratty-ai reset
+3.  Cursor
+Change cursor model
+ratty-ai cursor --model "CairoSpinyMouse.obj" --spin 2.0 --bob 0.1
+Hide/show custom cursor
+ratty-ai cursor --visible false
+ratty-ai cursor --visible true
+4.  Visual Feedback
+Flash the screen (AI "thinking" indicator)
+ratty-ai flash --color "#ffaa00" --duration 0.5
+Pulse the terminal warp (AI "alert" indicator)
+ratty-ai pulse --intensity 0.8 --duration 1.0
+Set a "status" color tint on the terminal
+ratty-ai tint --color "#00ff00" --opacity 0.1
+5.  Buffer / State
+Dump visible terminal text as JSON
+ratty-ai buffer --json
+→ {"lines": ["user@host:~$ ls", "file1  file2  file3", ...]}
+Get cursor position
+ratty-ai cursor-pos
+→ {"x": 45, "y": 12}
+Get terminal dimensions
+ratty-ai size
+→ {"rows": 40, "cols": 120, "mode": "3d", "warp": 0.3}
+6.  Screenshots
+Capture terminal as PNG (for AI vision)
+ratty-ai screenshot --output /tmp/ratty-state.png
+Capture just the 3D view
+ratty-ai screenshot --mode 3d --output /tmp/ratty-3d.png
+----
+Pipe-Friendly Design
+AI generates a chart, pipes it to Ratty
+echo '[1, 5, 3, 8, 2]' | ratty-ai chart --type bar --x 10 --y 5
+AI reads git log, visualizes as 3D timeline
+git log --oneline -20 | ratty-ai timeline --x 5 --y 10
+AI monitors a file, shows live 3D preview
+tail -f /var/log/syslog | ratty-ai stream --mode particles
+AI runs a command, shows success/failure visually
+make && ratty-ai flash --color green || ratty-ai flash --color red
+----
+JSON Mode (For AI Parsing)
+Every command supports --json:
+ratty-ai state --json
+→ {
+"mode": "3d",
+"warp": 0.3,
+"cursor": {"x": 45, "y": 12, "model": "rat.obj"},
+"objects": 3,
+"size": {"rows": 40, "cols": 120}
+}
+ratty-ai object list --json
+→ [{"id": 1, "path": "rat.obj", "position": [10, 5], "scale": 1.0}]
+----
+How the AI Uses It
+AI is helping debug a Rust build
+user: "Why is my build failing?"
+AI runs:
+cargo build 2>&1 | tee /tmp/build.log
+AI checks the error:
+ratty-ai flash --color red --duration 0.3
+ratty-ai object add --path "error_indicator.obj" --x 10 --y 5
+AI explains, then clears visual:
+ratty-ai object remove --id 1
+ratty-ai flash --color green --duration 0.2
+Or:
+AI is showing a 3D visualization of a data structure
+user: "Show me my dependency graph"
+AI runs:
+cargo tree --json | ratty-ai graph --type force-directed --x 5 --y 5
+AI monitors:
+ratty-ai state --json | jq '.objects[] | select(.path | contains("graph"))'
+----
+Implementation Sketch
+// src/main.rs
+use clap::{Parser, Subcommand};
+use serde_json::json;
+#[derive(Parser)]
+#[command(name = "ratty-ai")]
+struct Cli {
+#[command(subcommand)]
+command: Commands,
+#[arg(long, global = true)]
+json: bool,
+
+}
+#[derive(Subcommand)]
+enum Commands {
+/// Manage inline 3D objects
+Object {
+#[command(subcommand)]
+action: ObjectAction,
+},
+/// Toggle terminal mode
+Mode {
+mode: String,
+},
+/// Adjust warp
+Warp {
+intensity: f32,
+},
+/// Cursor control
+Cursor {
+#[arg(long)]
+model: Option<String>,
+#[arg(long)]
+spin: Option<f32>,
+#[arg(long)]
+visible: Option<bool>,
+},
+/// Visual feedback
+Flash {
+#[arg(long, default_value = "#ffffff")]
+color: String,
+#[arg(long, default_value = "0.5")]
+duration: f32,
+},
+/// Dump terminal state
+State,
+/// Screenshot
+Screenshot {
+#[arg(long, default_value = "ratty-screenshot.png")]
+output: String,
+},
+}
+fn main() {
+let cli = Cli::parse();
+// Connect to Ratty via IPC (Unix socket / named pipe)
+let ratty = RattyConnection::connect("/tmp/ratty.sock");
+
+match cli.command {
+    Commands::Object { action } => handle_object(action, &ratty, cli.json),
+    Commands::Mode { mode } => ratty.send(json!({"type": "mode", "mode": mode})),
+    Commands::Warp { intensity } => ratty.send(json!({"type": "warp", "intensity": intensity})),
+    Commands::Cursor { model, spin, visible } => {
+        ratty.send(json!({
+            "type": "cursor",
+            "model": model,
+            "spin": spin,
+            "visible": visible
+        }))
+    }
+    Commands::Flash { color, duration } => {
+        ratty.send(json!({
+            "type": "flash",
+            "color": color,
+            "duration": duration
+        }))
+    }
+    Commands::State => {
+        let state = ratty.query_state();
+        if cli.json {
+            println!("{}", serde_json::to_string_pretty(&state).unwrap());
+        } else {
+            println!("Mode: {}", state.mode);
+            println!("Warp: {:.1}", state.warp);
+            println!("Objects: {}", state.objects.len());
+        }
+    }
+    Commands::Screenshot { output } => {
+        ratty.send(json!({"type": "screenshot", "path": output}));
+        println!("Screenshot saved to {}", output);
+    }
+}
+
+}
+----
+Why This Works
+Feature	Benefit
+Single binary	Easy to install, easy to document
+Subcommands	Discoverable via --help
+JSON I/O	AI can parse output, generate input
+Pipes	Composes with existing Unix tools
+No daemon	Stateless, runs on demand
+IPC to Ratty	Ratty exposes a socket; CLI is just a client
+What Ratty Needs to Add
+1.  Unix socket at /tmp/ratty.sock — accepts JSON commands
+2.  Query API — responds to state, buffer, screenshot requests
+3.  Command registry — maps JSON "type" to internal actions
+This is a small addition to Ratty's existing architecture and unlocks the entire AI ecosystem.
+Want me to draft the Ratty-side IPC handler?

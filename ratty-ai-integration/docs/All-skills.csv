@@ -1,0 +1,14 @@
+Category,Commands,What They Do
+Originals,"`mode`, `warp`, `object`, `flash`, `pulse`, `cursor`, `reset`, `screenshot`, `chart`, `timeline`, `tint`",Core 3D terminal control
+Process,"`ps --visualize`, `kill --effect`","Processes as glowing orbs, kill with explosion"
+File System,"`cd --visualize`, `ls --visualize`, `tree --visualize`","Directories as 3D rooms, files as icons"
+Git,"`git branch --visualize`, `git diff --visualize`, `git merge --visualize`, `git stash --visualize`","Branches as rivers, diffs as before/after"
+Network,`net --visualize --host`,"Connections as animated lines, packet orbs"
+AI State,"`think --start/--end`, `confidence`, `mood`","Thinking pulse, confidence aura, mood effects"
+Panes,"`split`, `focus`, `resize`, `close`",Multi-pane terminal in 3D space
+History,"`history --visualize`, `bookmark`, `jump`","Command timeline, save/restore states"
+Collaboration,"`user join/leave/cursor`, `note`","Multi-user cursors, floating notes"
+Sound,`sound click/error/success/warning/ambient/notify`,Audio feedback
+Avatar,`avatar set/gesture/speak/hide`,AI presence as 3D character
+Macro,`macro record/stop/play/export/run`,Record and replay command sequences
+Reactive,`react --on-cpu-high --on-memory-high --on-battery-low`,Auto-trigger effects on system events

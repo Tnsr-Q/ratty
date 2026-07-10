@@ -1,0 +1,479 @@
+//! Bevy Systems for ratty-ai v2 — All new commands handled
+
+use bevy::prelude::*;
+use crate::osc_parser::RattyAiCommand;
+
+pub struct RattyAiPlugin;
+
+impl Plugin for RattyAiPlugin {
+    fn build(&self, app: &mut App) {
+        app.add_event::<RattyAiCommand>()
+           .add_systems(Update, (
+               // Originals
+               handle_mode, handle_warp, handle_objects, handle_flash, handle_cursor,
+               handle_reset, handle_screenshot, handle_chart, handle_timeline, handle_tint,
+               // NEW
+               handle_ps, handle_kill, handle_fs, handle_git, handle_net,
+               handle_ai_state, handle_panes, handle_history, handle_collab,
+               handle_sound, handle_avatar, handle_macro, handle_reactive,
+           ));
+    }
+}
+
+// ─── ORIGINAL HANDLERS (abbreviated) ───
+
+fn handle_mode(mut events: EventReader<RattyAiCommand>, /* ... */) { /* ... */ }
+fn handle_warp(mut events: EventReader<RattyAiCommand>, /* ... */) { /* ... */ }
+fn handle_objects(mut events: EventReader<RattyAiCommand>, /* ... */) { /* ... */ }
+fn handle_flash(mut events: EventReader<RattyAiCommand>, /* ... */) { /* ... */ }
+fn handle_cursor(mut events: EventReader<RattyAiCommand>, /* ... */) { /* ... */ }
+fn handle_reset(mut events: EventReader<RattyAiCommand>, /* ... */) { /* ... */ }
+fn handle_screenshot(mut events: EventReader<RattyAiCommand>, /* ... */) { /* ... */ }
+fn handle_chart(mut events: EventReader<RattyAiCommand>, /* ... */) { /* ... */ }
+fn handle_timeline(mut events: EventReader<RattyAiCommand>, /* ... */) { /* ... */ }
+fn handle_tint(mut events: EventReader<RattyAiCommand>, /* ... */) { /* ... */ }
+
+// ─── NEW: PROCESS VISUALIZATION ───
+
+#[derive(Component)]
+pub struct ProcessOrb {
+    pub pid: u32,
+    pub cpu_usage: f32,
+    pub mem_usage: f32,
+}
+
+fn handle_ps(
+    mut events: EventReader<RattyAiCommand>,
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+) {
+    for event in events.read() {
+        if let RattyAiCommand::Ps { visualize, highlight, color } = event {
+            if *visualize {
+                info!("Ratty AI: Visualizing processes");
+                // Spawn process orbs — size = memory, brightness = CPU
+                // Highlighted PID glows with specified color
+            }
+        }
+    }
+}
+
+fn handle_kill(
+    mut events: EventReader<RattyAiCommand>,
+    mut commands: Commands,
+    query: Query<(Entity, &ProcessOrb)>,
+) {
+    for event in events.read() {
+        if let RattyAiCommand::Kill { pid, effect } = event {
+            for (entity, orb) in query.iter() {
+                if orb.pid == *pid {
+                    match effect.as_str() {
+                        "explode" => {
+                            // Spawn particle explosion at orb position
+                            info!("Ratty AI: Process {} explodes!", pid);
+                        }
+                        "shrink" => {
+                            // Animate scale to zero
+                            info!("Ratty AI: Process {} shrinks away", pid);
+                        }
+                        "dissolve" => {
+                            // Fade out with noise
+                            info!("Ratty AI: Process {} dissolves", pid);
+                        }
+                        _ => {}
+                    }
+                    commands.entity(entity).despawn_recursive();
+                }
+            }
+        }
+    }
+}
+
+// ─── NEW: FILE SYSTEM AS 3D SPACE ───
+
+#[derive(Component)]
+pub struct FileIcon {
+    pub path: String,
+    pub file_type: String,
+}
+
+fn handle_fs(
+    mut events: EventReader<RattyAiCommand>,
+    mut commands: Commands,
+) {
+    for event in events.read() {
+        match event {
+            RattyAiCommand::Cd { path, visualize } => {
+                if *visualize {
+                    info!("Ratty AI: Entering 3D directory {}", path);
+                    // Clear current room, load new directory as 3D space
+                    // Files become objects on pedestals
+                    // Directories are doorways
+                }
+            }
+            RattyAiCommand::Ls { path, visualize } => {
+                if *visualize {
+                    info!("Ratty AI: 3D listing of {}", path);
+                    // Spawn floating file icons
+                    // .rs = rust-colored cube, .md = document, etc.
+                }
+            }
+            RattyAiCommand::Tree { depth, visualize } => {
+                if *visualize {
+                    info!("Ratty AI: 3D tree depth {}", depth);
+                    // Recursive branching structure in 3D
+                    // Root at center, branches spread outward
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+// ─── NEW: GIT INTEGRATION ───
+
+fn handle_git(
+    mut events: EventReader<RattyAiCommand>,
+) {
+    for event in events.read() {
+        match event {
+            RattyAiCommand::GitBranch { visualize } => {
+                if *visualize {
+                    info!("Ratty AI: Visualizing git branches as 3D rivers");
+                    // Main branch = wide central river
+                    // Feature branches = tributaries
+                    // Merges = confluence points
+                }
+            }
+            RattyAiCommand::GitDiff { visualize } => {
+                if *visualize {
+                    info!("Ratty AI: Visualizing diff as before/after");
+                    // Two models side by side
+                    // Added = green glow, Removed = red fade
+                }
+            }
+            RattyAiCommand::GitMerge { visualize } => {
+                if *visualize {
+                    info!("Ratty AI: Visualizing merge");
+                    // Conflicting files glow red, float apart
+                    // Resolved files snap together
+                }
+            }
+            RattyAiCommand::GitStash { visualize } => {
+                if *visualize {
+                    info!("Ratty AI: Visualizing stash");
+                    // Changes compress into a small cube
+                    // Stash pop = cube expands back
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+// ─── NEW: NETWORK ───
+
+#[derive(Component)]
+pub struct ConnectionLine {
+    pub target_host: String,
+    pub latency: f32,
+}
+
+fn handle_net(
+    mut events: EventReader<RattyAiCommand>,
+    mut commands: Commands,
+) {
+    for event in events.read() {
+        if let RattyAiCommand::Net { visualize, host } = event {
+            if *visualize {
+                if let Some(h) = host {
+                    info!("Ratty AI: Visualizing connection to {}", h);
+                    // Draw animated line from terminal to host
+                    // Packet orbs travel along the line
+                    // Timeout = line breaks, sparks
+                } else {
+                    info!("Ratty AI: Visualizing all connections");
+                    // Star topology with terminal at center
+                }
+            }
+        }
+    }
+}
+
+// ─── NEW: AI STATE INDICATORS ───
+
+#[derive(Resource, Default)]
+pub struct AiState {
+    pub thinking: bool,
+    pub confidence: f32,
+    pub mood: String,
+}
+
+fn handle_ai_state(
+    mut events: EventReader<RattyAiCommand>,
+    mut state: ResMut<AiState>,
+) {
+    for event in events.read() {
+        match event {
+            RattyAiCommand::Think { state: s } => {
+                state.thinking = match s.as_str() {
+                    "start" => true,
+                    "end" => false,
+                    _ => !state.thinking,
+                };
+                info!("Ratty AI: Thinking = {}", state.thinking);
+                // Cursor pulses slowly, faint ambient sound
+            }
+            RattyAiCommand::Confidence { level } => {
+                state.confidence = *level;
+                info!("Ratty AI: Confidence = {:.0}%", level * 100.0);
+                // Green aura (high) → Yellow (medium) → Red (low)
+            }
+            RattyAiCommand::Mood { mood } => {
+                state.mood = mood.clone();
+                info!("Ratty AI: Mood = {}", mood);
+                match mood.as_str() {
+                    "excited" => { /* Fast spin, bright colors */ }
+                    "cautious" => { /* Slow, dim, careful */ }
+                    "confused" => { /* Erratic warp, tilted */ }
+                    "focused" => { /* Steady, minimal motion */ }
+                    "celebratory" => { /* Confetti, fast spin */ }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+// ─── NEW: PANES ───
+
+#[derive(Component)]
+pub struct TerminalPane {
+    pub pane_id: u8,
+    pub direction: String,
+}
+
+fn handle_panes(
+    mut events: EventReader<RattyAiCommand>,
+    mut commands: Commands,
+) {
+    for event in events.read() {
+        match event {
+            RattyAiCommand::SplitPane { direction, ratio } => {
+                info!("Ratty AI: Split pane {} at ratio {}", direction, ratio);
+                // Create new pane entity
+                // In 3D: panes float at different Z-depths
+            }
+            RattyAiCommand::FocusPane { pane } => {
+                info!("Ratty AI: Focus pane {}", pane);
+                // Bring pane forward, dim others
+            }
+            RattyAiCommand::ResizePane { pane, width, height } => {
+                info!("Ratty AI: Resize pane {}", pane);
+                // Animate resize
+            }
+            RattyAiCommand::ClosePane { pane } => {
+                info!("Ratty AI: Close pane {}", pane);
+                // Shrink and dissolve
+            }
+            _ => {}
+        }
+    }
+}
+
+// ─── NEW: HISTORY / BOOKMARKS ───
+
+#[derive(Resource, Default)]
+pub struct BookmarkRegistry {
+    pub bookmarks: Vec<(String, Transform)>,
+}
+
+fn handle_history(
+    mut events: EventReader<RattyAiCommand>,
+) {
+    for event in events.read() {
+        match event {
+            RattyAiCommand::History { last, visualize } => {
+                if *visualize {
+                    info!("Ratty AI: Visualizing last {} commands", last);
+                    // Commands as floating cards in a timeline
+                    // Recent = bright, old = faded
+                }
+            }
+            RattyAiCommand::Bookmark { name } => {
+                info!("Ratty AI: Bookmark '{}' saved", name);
+                // Save current terminal state + camera position
+            }
+            RattyAiCommand::Jump { name } => {
+                info!("Ratty AI: Jump to bookmark '{}'", name);
+                // Animate camera to bookmarked position
+                // Terminal state rewinds visually
+            }
+            _ => {}
+        }
+    }
+}
+
+// ─── NEW: COLLABORATION ───
+
+#[derive(Component)]
+pub struct RemoteCursor {
+    pub user_name: String,
+    pub color: Color,
+}
+
+fn handle_collab(
+    mut events: EventReader<RattyAiCommand>,
+    mut commands: Commands,
+) {
+    for event in events.read() {
+        match event {
+            RattyAiCommand::UserJoin { name, color } => {
+                info!("Ratty AI: User {} joined ({})", name, color);
+                // Spawn remote cursor with user's color
+            }
+            RattyAiCommand::UserLeave { name } => {
+                info!("Ratty AI: User {} left", name);
+                // Fade out their cursor
+            }
+            RattyAiCommand::UserCursor { name, x, y } => {
+                // Update remote cursor position
+            }
+            RattyAiCommand::Note { text, x, y, expires } => {
+                info!("Ratty AI: Note at ({}, {}): '{}'", x, y, text);
+                // Spawn floating text bubble
+                // Auto-remove after expires duration
+            }
+            _ => {}
+        }
+    }
+}
+
+// ─── NEW: SOUND ───
+
+fn handle_sound(
+    mut events: EventReader<RattyAiCommand>,
+) {
+    for event in events.read() {
+        if let RattyAiCommand::Sound { kind, loop_sound } = event {
+            info!("Ratty AI: Sound {} (loop={})", kind, loop_sound);
+            // Dispatch to Bevy audio system
+            // kind = "click" | "error" | "success" | "warning" | "ambient" | "notify"
+        }
+    }
+}
+
+// ─── NEW: AVATAR ───
+
+#[derive(Component)]
+pub struct AiAvatar {
+    pub current_gesture: String,
+}
+
+fn handle_avatar(
+    mut events: EventReader<RattyAiCommand>,
+    mut commands: Commands,
+    mut query: Query<(Entity, &mut AiAvatar, &mut Transform)>,
+) {
+    for event in events.read() {
+        match event {
+            RattyAiCommand::AvatarSet { model, position } => {
+                info!("Ratty AI: Avatar {} at {}", model, position);
+                // Spawn avatar model at position
+                // "top-right", "bottom-left", "center", etc.
+            }
+            RattyAiCommand::AvatarGesture { gesture } => {
+                info!("Ratty AI: Avatar gesture {}", gesture);
+                // Trigger animation: point, think, celebrate, wave, nod, shake
+            }
+            RattyAiCommand::AvatarSpeak { text } => {
+                info!("Ratty AI: Avatar says '{}'", text);
+                // Show speech bubble, lip sync if supported
+            }
+            RattyAiCommand::AvatarHide => {
+                info!("Ratty AI: Avatar hidden");
+                // Despawn or scale to zero
+            }
+            _ => {}
+        }
+    }
+}
+
+// ─── NEW: MACRO ───
+
+#[derive(Resource, Default)]
+pub struct MacroRecorder {
+    pub recording: bool,
+    pub current_name: String,
+    pub buffer: Vec<String>,
+}
+
+fn handle_macro(
+    mut events: EventReader<RattyAiCommand>,
+    mut recorder: ResMut<MacroRecorder>,
+) {
+    for event in events.read() {
+        match event {
+            RattyAiCommand::MacroRecord { name } => {
+                recorder.recording = true;
+                recorder.current_name = name.clone();
+                recorder.buffer.clear();
+                info!("Ratty AI: Recording macro '{}'", name);
+            }
+            RattyAiCommand::MacroStop => {
+                recorder.recording = false;
+                info!("Ratty AI: Stopped recording '{}'", recorder.current_name);
+            }
+            RattyAiCommand::MacroPlay { name } => {
+                info!("Ratty AI: Playing macro '{}'", name);
+                // Replay recorded OSC sequences
+            }
+            RattyAiCommand::MacroExport { name, to } => {
+                info!("Ratty AI: Export macro '{}' to {}", name, to);
+                // Write buffer to .ratty file
+            }
+            RattyAiCommand::MacroRun { path } => {
+                info!("Ratty AI: Running macro {}", path);
+                // Read .ratty file and execute each line
+            }
+            _ => {}
+        }
+    }
+}
+
+// ─── NEW: REACTIVE ───
+
+#[derive(Resource, Default)]
+pub struct ReactiveTriggers {
+    pub cpu_threshold: Option<f32>,
+    pub memory_threshold: Option<f32>,
+    pub battery_threshold: Option<f32>,
+    pub effect: String,
+}
+
+fn handle_reactive(
+    mut events: EventReader<RattyAiCommand>,
+    mut triggers: ResMut<ReactiveTriggers>,
+) {
+    for event in events.read() {
+        if let RattyAiCommand::React { effect, cpu_high, memory_high, battery_low } = event {
+            triggers.effect = effect.clone();
+            triggers.cpu_threshold = *cpu_high;
+            triggers.memory_threshold = *memory_high;
+            triggers.battery_threshold = *battery_low;
+            info!("Ratty AI: Reactive effect '{}' registered", effect);
+        }
+    }
+}
+
+// ─── SYSTEM MONITORING (runs every frame) ───
+
+pub fn check_reactive_triggers(
+    triggers: Res<ReactiveTriggers>,
+    // system info resources...
+) {
+    // Check CPU, memory, battery against thresholds
+    // Trigger effect when crossed
+}

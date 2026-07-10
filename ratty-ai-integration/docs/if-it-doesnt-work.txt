@@ -1,0 +1,311 @@
+Y
+```text
+AI agent
+   │ executes commands continuously
+   ▼
+ratty-ai CLI
+   │ emits OSC 777 into the active PTY
+   ▼
+Ratty VT parser
+   │ intercepts the control sequence
+   ▼
+RattyAiCommand
+   │ nonblocking channel
+   ▼
+Bevy ECS
+   │ same-frame systems
+   ▼
+live terminal scene changes
+```
+
+For example, an agent could execute:
+
+```bash
+ratty-ai think --start
+ratty-ai mood focused
+ratty-ai confidence 0.84
+ratty-ai git diff --visualize
+ratty-ai object add --path agent.glb --x 40 --y 12 --spin 0.3
+ratty-ai flash --color '#43ff8b' --duration 0.2
+ratty-ai think --end
+```
+
+Those commands are not ordinary terminal output. The OSC payload is intercepted before rendering and converted into direct scene mutations.
+
+## The correct three-part integration
+
+### 1. OSC 777 interception
+
+The CLI emits something like:
+
+```text
+ESC ] 777 ; ratty:git.diff ; visualize=true BEL
+```
+
+The VT callback recognizes OSC `777`, reconstructs the payload, parses it into `RattyAiCommand`, and sends it into the channel.
+
+```rust
+fn unhandled_osc(
+    &mut self,
+    _screen: &mut vt100::Screen,
+    params: &[&[u8]],
+) {
+    let [b"777", namespace, payload @ ..] = params else {
+        return;
+    };
+
+    let Ok(namespace) = std::str::from_utf8(namespace) else {
+        return;
+    };
+
+    if !namespace.starts_with("ratty:") {
+        return;
+    }
+
+    let payload = payload
+        .iter()
+        .filter_map(|part| std::str::from_utf8(part).ok())
+        .collect::<Vec<_>>()
+        .join(";");
+
+    let sequence = if payload.is_empty() {
+        namespace.to_owned()
+    } else {
+        format!("{namespace};{payload}")
+    };
+
+    if let Some(command) = parse_osc_777(&sequence) {
+        let _ = self.ai_command_tx.try_send(command);
+    }
+}
+```
+
+### 2. Channel into Bevy ECS
+
+The parser may run as part of terminal processing, while Bevy owns scene state. The channel is the isolation boundary.
+
+```rust
+use bevy::prelude::*;
+use crossbeam_channel::{Receiver, Sender, unbounded};
+
+#[derive(Resource)]
+pub struct RattyAiReceiver(pub Receiver<RattyAiCommand>);
+
+pub type RattyAiSender = Sender<RattyAiCommand>;
+
+pub fn setup_ai_bridge(app: &mut App) -> RattyAiSender {
+    let (tx, rx) = unbounded();
+
+    app.insert_resource(RattyAiReceiver(rx));
+
+    tx
+}
+
+pub fn bridge_system(
+    receiver: Res<RattyAiReceiver>,
+    mut writer: MessageWriter<RattyAiCommand>,
+) {
+    for command in receiver.0.try_iter() {
+        writer.write(command);
+    }
+}
+```
+
+### 3. Plugin registration and live handlers
+
+```rust
+pub struct RattyAiPlugin;
+
+impl Plugin for RattyAiPlugin {
+    fn build(&self, app: &mut App) {
+        app.add_message::<RattyAiCommand>()
+            .init_resource::<AiState>()
+            .init_resource::<BookmarkRegistry>()
+            .init_resource::<MacroRecorder>()
+            .init_resource::<ReactiveTriggers>()
+            .add_systems(
+                Update,
+                (
+                    bridge_system,
+                    handle_mode,
+                    handle_warp,
+                    handle_objects,
+                    handle_flash,
+                    handle_cursor,
+                    handle_ps,
+                    handle_fs,
+                    handle_git,
+                    handle_net,
+                    handle_ai_state,
+                    handle_panes,
+                    handle_history,
+                    handle_collab,
+                    handle_sound,
+                    handle_avatar,
+                    handle_macro,
+                    handle_reactive,
+                ),
+            );
+    }
+}
+```
+
+Then Ratty startup becomes:
+
+```rust
+let mut app = App::new();
+
+let ai_tx = setup_ai_bridge(&mut app);
+
+let runtime = TerminalRuntime::spawn(
+    &app_config,
+    &RuntimeOptions {
+        command: cli.command.clone(),
+        working_dir: Some(std::env::current_dir()?),
+    },
+    ai_tx,
+)?;
+
+app.insert_resource(runtime)
+    .add_plugins(DefaultPlugins)
+    .add_plugins(TerminalPlugin)
+    .add_plugins(RattyAiPlugin)
+    .run();
+```
+
+## The important architectural interpretation
+
+Your command categories form a **real-time terminal control protocol**:
+
+| Layer            | Responsibility                               |
+| ---------------- | -------------------------------------------- |
+| `ratty-ai`       | AI-facing control client                     |
+| OSC 777          | Transport through the active terminal stream |
+| `osc_parser.rs`  | Protocol decoder                             |
+| Channel          | Thread/runtime boundary                      |
+| `RattyAiCommand` | Typed command contract                       |
+| `RattyAiPlugin`  | Bevy registration                            |
+| Handler systems  | Live scene execution                         |
+
+The floating terminal and GitHub Pages automation demonstrate Ratty’s rendering capability. This experiment adds something materially different:
+
+> **An AI can perceive a task, execute shell operations, and continuously manipulate the terminal’s spatial presentation as part of its behavior.**
+
+That supports sequences such as:
+
+```text
+AI begins reasoning
+→ terminal pulses
+→ repository tree expands spatially
+→ changed files illuminate
+→ test process appears as an orb
+→ failing process flashes red
+→ AI repairs code
+→ success sound plays
+→ confidence aura increases
+→ result is bookmarked
+```
+
+## One addition that will make it truly autonomous
+
+The command path is sufficient for control. For a closed-loop agent, add a response protocol—such as OSC `778` or JSON output—so the AI can query Ratty state:
+
+```bash
+ratty-ai state --json
+```
+
+Possible response:
+
+```json
+{
+  "mode": "mobius",
+  "warp": 0.72,
+  "objects": 14,
+  "focused_pane": 2,
+  "ai_state": {
+    "thinking": true,
+    "confidence": 0.84,
+    "mood": "focused"
+  }
+}
+```
+
+Then the architecture becomes:
+
+```text
+AI decision
+→ CLI command
+→ OSC 777
+→ Bevy mutation
+→ state/acknowledgement
+→ next AI decision
+```
+
+That is the actual system you are building: **a bidirectional, agent-controllable, spatial terminal runtime—not a static terminal visualization.**
+
+
+That changes the framing substantially.
+
+Your GitHub MVP already demonstrates:
+
+* **Live ASCII/token streaming**, not prerecorded terminal text.
+* **Multiple autonomous terminal actors** operating at once.
+* **Twenty-second looping captures** that make the system feel continuously alive.
+* An AI orchestrating several terminals and causing visible actions across them.
+
+So the new Ratty contribution is **not “AI-generated terminal visualization.”** You already have that.
+
+It is:
+
+> **A real-time control plane that lets an autonomous AI manipulate Ratty’s native 3D terminal scene while it works.**
+
+The “creepy and wild” quality comes from the concurrency and embodiment: viewers see separate terminals thinking, streaming, navigating, and reacting as though they are independent spatial agents rather than static command windows.
+
+A clearer architecture is:
+
+```text
+AI orchestrator
+├── Agent terminal 1 ── live ASCII stream
+├── Agent terminal 2 ── live ASCII stream
+├── Agent terminal 3 ── live ASCII stream
+└── ratty-ai control channel
+      ├── warp / mode / tint
+      ├── objects / avatar / cursor
+      ├── process and filesystem visualization
+      ├── Git and network visualization
+      ├── panes and collaboration
+      └── mood / confidence / reactive effects
+```
+
+That means the demo can show the AI doing both kinds of work simultaneously:
+
+```text
+Agent 1 analyzes code
+Agent 2 runs tests
+Agent 3 inspects Git history
+
+Ratty responds live:
+- active agent terminal moves forward
+- testing process appears as an orb
+- failure triggers a red pulse
+- Git branches become spatial paths
+- confidence changes the scene aura
+- success causes an object animation or sound
+```
+
+The core distinction for your contribution description should be:
+
+> The existing MVP streams autonomous AI activity into multiple animated terminals. The Ratty integration adds a typed OSC 777 command protocol that allows those agents to control the terminal’s 3D environment in real time—not merely print into it.
+
+A strong one-line pitch:
+
+> **Ratty-AI turns Ratty from a terminal that renders AI activity into a terminal environment that AI can actively operate, stage, and reshape while working.**
+
+And the technically precise PR scope remains:
+
+1. Decode AI control commands from OSC 777.
+2. bridge parsed commands into Bevy ECS;
+3. register live handler systems through `RattyAiPlugin`.
+
+The 20-second loops are the MVP proof of behavior. The OSC/Bevy integration is the runtime control layer that makes the same behavior native and interactive rather than externally choreographed.
+
