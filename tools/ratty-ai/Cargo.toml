@@ -1,0 +1,21 @@
+[package]
+name = "ratty-ai"
+version = "0.2.0"
+edition = "2024"
+description = "Pure-CLI control for the Ratty terminal emulator over OSC 777"
+license = "MIT"
+repository = "https://github.com/orhun/ratty"
+keywords = ["ratty", "terminal", "cli", "osc", "3d"]
+categories = ["command-line-utilities"]
+
+# Standalone crate (not part of the root workspace, like tools/silk). It
+# shares the terminal's own OSC parser verbatim via a path include, so the
+# CLI and the terminal can never disagree about the wire format.
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
