@@ -14,6 +14,7 @@ pub mod keyboard;
 pub mod kitty;
 pub mod model;
 pub mod mouse;
+pub mod osc;
 pub mod paths;
 pub mod plugin;
 pub mod present;
