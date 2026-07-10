@@ -74,6 +74,7 @@ impl Plugin for TerminalPlugin {
                     .after(handle_mouse_input)
                     .after(apply_rgp_stage)
                     .after(animate_stage_tween)
+                    .after(crate::ai::apply_ai_commands)
                     .run_if(
                         |presentation: Res<TerminalPresentation>,
                          plane_view: Res<TerminalPlaneView>,
@@ -158,6 +159,7 @@ impl Plugin for TerminalPlugin {
                     .run_if(|config: Res<AppConfig>| config.cursor.model.visible),
             )
             .add_systems(Last, shutdown_terminal_runtime_on_exit)
+            .add_plugins(crate::ai::RattyAiPlugin)
             .add_plugins(DirectTerminalRenderPlugin)
             .add_plugins(TerminalPresentPlugin);
     }

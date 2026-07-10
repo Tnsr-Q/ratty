@@ -6,6 +6,7 @@
 #![warn(missing_docs)]
 #![warn(clippy::unwrap_used)]
 
+pub mod ai;
 pub mod cli;
 pub mod config;
 mod direct_render;
@@ -14,6 +15,7 @@ pub mod keyboard;
 pub mod kitty;
 pub mod model;
 pub mod mouse;
+pub mod osc;
 pub mod paths;
 pub mod plugin;
 pub mod present;

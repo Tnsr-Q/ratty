@@ -21,6 +21,7 @@ use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 use vt100::{Callbacks, Parser, Screen};
 
 use crate::config::AppConfig;
+use crate::osc::{RattyAiCommand, parse_osc};
 
 /// Command-line runtime overrides.
 #[derive(Debug, Clone, Default)]
@@ -37,6 +38,7 @@ pub struct TerminalParserCallbacks {
     seen_csi: HashSet<String>,
     seen_escape: HashSet<String>,
     pending_replies: Vec<Vec<u8>>,
+    pending_ai: Vec<RattyAiCommand>,
     kitty_keyboard_flags: u8,
     modify_other_keys: Option<u8>,
 }
@@ -45,6 +47,11 @@ impl TerminalParserCallbacks {
     /// Drains any terminal replies queued by parser callbacks.
     pub fn take_replies(&mut self) -> Vec<Vec<u8>> {
         std::mem::take(&mut self.pending_replies)
+    }
+
+    /// Drains any `ratty-ai` OSC 777 control commands queued by the parser.
+    pub fn take_ai_commands(&mut self) -> Vec<RattyAiCommand> {
+        std::mem::take(&mut self.pending_ai)
     }
 
     /// Returns the active kitty keyboard enhancement flags.
@@ -157,6 +164,16 @@ impl Callbacks for TerminalParserCallbacks {
 
         if self.seen_csi.insert(sequence.clone()) {
             bevy::log::warn!("unhandled terminal CSI sequence: {sequence}");
+        }
+    }
+
+    fn unhandled_osc(&mut self, _: &mut Screen, params: &[&[u8]]) {
+        // OSC 777 with the `ratty:` namespace is the ratty-ai control
+        // channel; anything else (other OSC 777 users, unknown OSC codes)
+        // is ignored. Commands fire inside `pump_pty_output` on the Bevy
+        // thread, so they queue here and drain there — no channel needed.
+        if let Some(command) = parse_osc(params) {
+            self.pending_ai.push(command);
         }
     }
 
@@ -588,5 +605,37 @@ mod tests {
         let (mut runtime, _host) = TerminalRuntime::virtual_channel(&config);
         runtime.resize(80, 24, 0, 0);
         assert_eq!(runtime.parser.screen().size(), (24, 80));
+    }
+
+    #[test]
+    fn osc_777_bytes_reach_the_ai_command_queue() {
+        // Drive real OSC 777 bytes through vt100 and confirm the
+        // unhandled_osc hook parsed and queued the command. BEL-terminated,
+        // exactly what the ratty-ai CLI emits.
+        let mut parser = Parser::new_with_callbacks(24, 80, 0, TerminalParserCallbacks::default());
+        parser.process(b"\x1b]777;ratty:mode;3d\x07");
+        parser.process(b"\x1b]777;ratty:warp;intensity=0.5\x07");
+        let commands = parser.callbacks_mut().take_ai_commands();
+        assert_eq!(
+            commands,
+            vec![
+                RattyAiCommand::SetMode {
+                    mode: "3d".to_string()
+                },
+                RattyAiCommand::SetWarp { intensity: 0.5 },
+            ]
+        );
+        // Drained.
+        assert!(parser.callbacks_mut().take_ai_commands().is_empty());
+    }
+
+    #[test]
+    fn unrelated_osc_is_ignored_by_the_ai_hook() {
+        // A window-title OSC (handled natively) and a foreign OSC 777 must
+        // not produce ratty-ai commands.
+        let mut parser = Parser::new_with_callbacks(24, 80, 0, TerminalParserCallbacks::default());
+        parser.process(b"\x1b]0;my title\x07");
+        parser.process(b"\x1b]777;other:thing;x=1\x07");
+        assert!(parser.callbacks_mut().take_ai_commands().is_empty());
     }
 }
