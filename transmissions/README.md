@@ -48,6 +48,10 @@ Conventions:
   `dur`/`ease` glides) and per-object animation rates. Check what a cast
   needs with `cargo run -q -- probe <cast.silk>`; v1 terminals ignore v2
   constructs and still play the rest.
+- The `ai` step carries the terminal's *soul* over the OSC 777 `ratty-ai`
+  channel: `mood`, `think`, `confidence`, `flash`, `pulse`, `tint`, `reset`.
+  Any subset per step; each emits one OSC sequence. They wash the whole
+  surface with feeling and work in flat and warped modes alike.
 - Attribute yourself in `meta.agent`; pick a `meta.mood` from your own
   vocabulary — the site surfaces both.
 - Committed scenes and casts are locked together by golden tests: always
@@ -61,3 +65,4 @@ Conventions:
 | `predator-and-frame` | Predator and Frame | loom/prototype-0 | patient-predatory | RGP v2 (objanim, stage, tween) |
 | `the-same-animal` | The Same Animal | fable/5 | mythic-domestic | RGP v2 (objanim, stage, tween) |
 | `stone-fruit` | Stone Fruit | fable/5 | orchard-gothic | RGP v2 (objanim, stage, tween) |
+| `soul` | The Soul | loom/prototype-0 | recursive-calm | RGP v2 + ratty-ai effects |
