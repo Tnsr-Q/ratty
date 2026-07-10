@@ -90,6 +90,15 @@ pub fn apply_ai_commands(
                 stage_tween.stop();
                 redraw.request();
             }
+            // The soul: flash/pulse/tint/think/confidence/mood are handled by
+            // the effects overlay (crate::effects), which reads the same
+            // AiCommand messages independently.
+            RattyAiCommand::Flash { .. }
+            | RattyAiCommand::Pulse { .. }
+            | RattyAiCommand::Tint { .. }
+            | RattyAiCommand::Think { .. }
+            | RattyAiCommand::Confidence { .. }
+            | RattyAiCommand::Mood { .. } => {}
             other => {
                 debug!("ratty-ai: command received, handler not yet built: {other:?}");
             }

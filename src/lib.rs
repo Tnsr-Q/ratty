@@ -10,6 +10,7 @@ pub mod ai;
 pub mod cli;
 pub mod config;
 mod direct_render;
+pub mod effects;
 pub mod inline;
 pub mod keyboard;
 pub mod kitty;
