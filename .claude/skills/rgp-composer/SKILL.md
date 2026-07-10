@@ -76,6 +76,27 @@ Everything you ship is public curation. The canvas is the point.
   switch; `spin: 0` holds a pose; `phase` breaks lockstep between objects.
   Objects without these fields move exactly like v1 (global config rates).
 
+## The soul: the `ai` step
+
+The `ai` step carries feeling over the OSC 777 `ratty-ai` channel — a
+translucent color washed over the whole surface, in flat and warped modes
+alike. Any subset of fields per step; each emits one command:
+
+- `mood`: `excited` / `cautious` / `confused` / `focused` / `celebratory`
+  — the ambient color and breathing rhythm (`confused` shimmers).
+- `think`: `start` / `end` — a slow breathing glow while the AI reasons.
+- `confidence`: `0.0`–`1.0` — an aura running red (low) → gold → moss (high).
+- `flash` (`#rrggbb`, `flash_duration`): sharp punctuation — green for
+  success, blood for error.
+- `pulse` (`0.0`–`1.0`, `pulse_duration`): a decaying heartbeat, for a beat
+  of realization or alarm.
+- `tint` (`#rrggbb`, `tint_opacity`): a steady status wash (`0` opacity clears).
+- `reset`: clears all effects.
+
+Use it sparingly — the soul is weather, not a disco. See
+`transmissions/soul/scene.json` for a worked emotional arc, and
+`tools/ratty-ai/examples/soul.sh` to summon it live in a native ratty.
+
 ## Deep references
 
 - `references/rgp.md` — the distilled protocol: wire format, verbs, fields,

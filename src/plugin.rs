@@ -160,6 +160,7 @@ impl Plugin for TerminalPlugin {
             )
             .add_systems(Last, shutdown_terminal_runtime_on_exit)
             .add_plugins(crate::ai::RattyAiPlugin)
+            .add_plugins(crate::effects::AiEffectsPlugin)
             .add_plugins(DirectTerminalRenderPlugin)
             .add_plugins(TerminalPresentPlugin);
     }

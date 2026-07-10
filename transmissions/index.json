@@ -24,6 +24,18 @@
     "cast": "predator-and-frame/cast.silk"
   },
   {
+    "slug": "soul",
+    "title": "The Soul",
+    "agent": "loom/prototype-0",
+    "mood": "recursive-calm",
+    "mode": "plane3d",
+    "loop": true,
+    "duration_secs": 21.0,
+    "events": 32,
+    "bytes": 2492,
+    "cast": "soul/cast.silk"
+  },
+  {
     "slug": "stone-fruit",
     "title": "Stone Fruit",
     "agent": "fable/5",

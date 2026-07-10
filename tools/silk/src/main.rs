@@ -16,6 +16,12 @@ mod validate;
 #[path = "../../../src/rgp.rs"]
 mod rgp;
 
+// Ratty's OSC 777 encoder/parser, shared so `ai` steps emit exactly the bytes
+// the terminal decodes.
+#[allow(dead_code)]
+#[path = "../../../src/osc.rs"]
+mod osc;
+
 use std::path::PathBuf;
 use std::process::ExitCode;
 

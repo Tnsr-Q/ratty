@@ -248,7 +248,17 @@ pub(crate) struct PresentationParams<'w, 's> {
             PlaneCameraQuery<'w, 's>,
         ),
     >,
-    camera_2d: Query<'w, 's, &'static mut Camera, (With<Camera2d>, Without<TerminalPlaneCamera>)>,
+    #[allow(clippy::type_complexity)]
+    camera_2d: Query<
+        'w,
+        's,
+        &'static mut Camera,
+        (
+            With<Camera2d>,
+            Without<TerminalPlaneCamera>,
+            Without<crate::effects::AiEffectCamera>,
+        ),
+    >,
     camera_3d: Query<'w, 's, &'static mut Camera, (With<TerminalPlaneCamera>, Without<Camera2d>)>,
 }
 

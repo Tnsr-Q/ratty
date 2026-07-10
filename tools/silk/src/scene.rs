@@ -124,6 +124,9 @@ pub struct Step {
     /// Stage/camera move (RGP v2 `c` verb).
     #[serde(default)]
     pub camera: Option<CameraArgs>,
+    /// AI presence / effect command (OSC 777 `ratty-ai` channel).
+    #[serde(default)]
+    pub ai: Option<AiArgs>,
     /// Delete one object (`{"id": N}`) or all (`"all"`).
     #[serde(default)]
     pub delete: Option<DeleteArg>,
@@ -144,6 +147,7 @@ impl Step {
             + usize::from(self.update.is_some())
             + usize::from(self.tween.is_some())
             + usize::from(self.camera.is_some())
+            + usize::from(self.ai.is_some())
             + usize::from(self.delete.is_some())
             + usize::from(self.marker.is_some())
             + usize::from(self.clear.is_some())
@@ -389,6 +393,44 @@ pub struct CameraArgs {
     /// Easing: `linear`, `in`, `out`, or `in-out` (default `in-out`).
     #[serde(default)]
     pub ease: Option<String>,
+}
+
+/// `ai` verb arguments: AI presence and effect commands carried in-band over
+/// the OSC 777 `ratty-ai` channel. Any subset of fields may be set; each
+/// present field emits one OSC sequence at the step's time.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AiArgs {
+    /// Mood tag (`excited`/`cautious`/`confused`/`focused`/`celebratory`).
+    #[serde(default)]
+    pub mood: Option<String>,
+    /// Thinking state (`start`/`end`/`toggle`).
+    #[serde(default)]
+    pub think: Option<String>,
+    /// Confidence level `0.0..=1.0`.
+    #[serde(default)]
+    pub confidence: Option<f32>,
+    /// Flash color, `#rrggbb`.
+    #[serde(default)]
+    pub flash: Option<String>,
+    /// Flash duration in seconds (default `0.5`).
+    #[serde(default)]
+    pub flash_duration: Option<f32>,
+    /// Pulse intensity `0.0..=1.0`.
+    #[serde(default)]
+    pub pulse: Option<f32>,
+    /// Pulse duration in seconds (default `1.0`).
+    #[serde(default)]
+    pub pulse_duration: Option<f32>,
+    /// Tint color, `#rrggbb`.
+    #[serde(default)]
+    pub tint: Option<String>,
+    /// Tint opacity `0.0..=1.0` (default `0.1`; `0` clears).
+    #[serde(default)]
+    pub tint_opacity: Option<f32>,
+    /// Clear all effects.
+    #[serde(default)]
+    pub reset: Option<bool>,
 }
 
 /// `delete` verb argument.

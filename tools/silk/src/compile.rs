@@ -13,9 +13,10 @@ use anyhow::{Context, Result, anyhow, bail};
 use ratatui_ratty::{ObjectFormat, RattyGraphic, RattyGraphicSettings};
 
 use crate::cast::{Cast, Event, Header, XRatty};
+use crate::osc;
 use crate::scene::{
-    CameraArgs, PlaceArgs, PrintArgs, RegisterArgs, Scene, Step, TWEENABLE_FIELDS, TweenArgs,
-    UpdateArgs,
+    AiArgs, CameraArgs, PlaceArgs, PrintArgs, RegisterArgs, Scene, Step, TWEENABLE_FIELDS,
+    TweenArgs, UpdateArgs,
 };
 
 /// Compilation stats for reporting.
@@ -193,8 +194,8 @@ impl Compiler<'_> {
     fn step(&mut self, step: &Step) -> Result<()> {
         if step.verb_count() != 1 {
             bail!(
-                "each step must have exactly one verb \
-                 (print/register/place/update/tween/camera/delete/marker/clear)"
+                "each step must have exactly one verb (print/register/place/\
+                 update/tween/camera/ai/delete/marker/clear)"
             );
         }
         if let Some(print) = &step.print {
@@ -209,6 +210,8 @@ impl Compiler<'_> {
             self.tween(step.at, tween)?;
         } else if let Some(camera) = &step.camera {
             self.camera(step.at, camera)?;
+        } else if let Some(ai) = &step.ai {
+            self.ai(step.at, ai)?;
         } else if let Some(delete) = &step.delete {
             match delete.id()? {
                 Some(id) => {
@@ -520,6 +523,73 @@ impl Compiler<'_> {
         self.out(at, format!("\x1b_ratty;g;c;{}\x1b\\", fields.join(";")));
         Ok(())
     }
+
+    /// Emits one OSC 777 sequence per present AI field, at the step's time,
+    /// using ratty's own encoder so the bytes match what the terminal parses.
+    fn ai(&mut self, at: f64, ai: &AiArgs) -> Result<()> {
+        let mut emitted = false;
+        let mut emit = |compiler: &mut Self, action: &str, payload: String| {
+            compiler.out(at, osc::osc_sequence(action, &payload));
+            emitted = true;
+        };
+        let enc = osc::percent_encode;
+
+        if let Some(mood) = &ai.mood {
+            if osc::parse_command(&format!("ratty:mood;mood={mood}")).is_none() {
+                bail!("ai.mood produced an unparseable command for \"{mood}\"");
+            }
+            emit(self, "mood", format!("mood={}", enc(mood)));
+        }
+        if let Some(think) = &ai.think {
+            if !matches!(think.as_str(), "start" | "end" | "toggle") {
+                bail!("ai.think must be start, end, or toggle (got \"{think}\")");
+            }
+            emit(self, "think", format!("state={}", enc(think)));
+        }
+        if let Some(level) = ai.confidence {
+            if !(0.0..=1.0).contains(&level) {
+                bail!("ai.confidence {level} out of range 0.0..=1.0");
+            }
+            emit(self, "confidence", format!("level={}", fmt_f32(level)));
+        }
+        if let Some(color) = &ai.flash {
+            parse_hex_color(color)?;
+            let duration = ai.flash_duration.unwrap_or(0.5);
+            emit(
+                self,
+                "flash",
+                format!("color={}&duration={}", enc(color), fmt_f32(duration)),
+            );
+        }
+        if let Some(intensity) = ai.pulse {
+            let duration = ai.pulse_duration.unwrap_or(1.0);
+            emit(
+                self,
+                "pulse",
+                format!(
+                    "intensity={}&duration={}",
+                    fmt_f32(intensity),
+                    fmt_f32(duration)
+                ),
+            );
+        }
+        if let Some(color) = &ai.tint {
+            parse_hex_color(color)?;
+            let opacity = ai.tint_opacity.unwrap_or(0.1);
+            emit(
+                self,
+                "tint",
+                format!("color={}&opacity={}", enc(color), fmt_f32(opacity)),
+            );
+        }
+        if ai.reset.unwrap_or(false) {
+            emit(self, "reset", String::new());
+        }
+        if !emitted {
+            bail!("ai step sets no fields");
+        }
+        Ok(())
+    }
 }
 
 fn parse_ease(name: Option<&str>) -> Result<Ease> {
@@ -746,6 +816,78 @@ mod tests {
     }
 
     #[test]
+    fn ai_step_emits_parseable_osc_777() {
+        let scene: Scene = serde_json::from_str(
+            r#"{
+                "meta": {"title": "t"},
+                "cast": [
+                    {"at": 0.0, "ai": {"mood": "excited", "confidence": 0.9}},
+                    {"at": 1.0, "ai": {"flash": "8a9a7b", "flash_duration": 0.4}}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let cast = compile(&scene, Path::new(".")).unwrap();
+        // Every emitted OSC sequence must parse back through the terminal's
+        // own decoder — the CLI-and-silk-share-osc.rs contract.
+        let commands: Vec<super::osc::RattyAiCommand> = cast
+            .events
+            .iter()
+            .filter(|event| event.data.contains("]777;ratty:"))
+            .map(|event| {
+                let inner = event
+                    .data
+                    .strip_prefix("\x1b]777;")
+                    .and_then(|s| s.strip_suffix('\x07'))
+                    .expect("well-framed osc");
+                super::osc::parse_command(inner).expect("terminal parses silk's osc")
+            })
+            .collect();
+        assert_eq!(
+            commands,
+            vec![
+                super::osc::RattyAiCommand::Mood {
+                    mood: "excited".into()
+                },
+                super::osc::RattyAiCommand::Confidence { level: 0.9 },
+                super::osc::RattyAiCommand::Flash {
+                    color: "8a9a7b".into(),
+                    duration: 0.4,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn ai_step_rejects_bad_values() {
+        for (json, expected) in [
+            (
+                r#"{"meta":{"title":"t"},"cast":[{"at":0.0,"ai":{"confidence":1.5}}]}"#,
+                "out of range",
+            ),
+            (
+                r#"{"meta":{"title":"t"},"cast":[{"at":0.0,"ai":{"think":"maybe"}}]}"#,
+                "start, end, or toggle",
+            ),
+            (
+                r#"{"meta":{"title":"t"},"cast":[{"at":0.0,"ai":{"flash":"notacolor"}}]}"#,
+                "color",
+            ),
+            (
+                r#"{"meta":{"title":"t"},"cast":[{"at":0.0,"ai":{}}]}"#,
+                "sets no fields",
+            ),
+        ] {
+            let scene: Scene = serde_json::from_str(json).unwrap();
+            let error = compile(&scene, Path::new(".")).unwrap_err();
+            assert!(
+                format!("{error:#}").contains(expected),
+                "expected \"{expected}\" in: {error:#}"
+            );
+        }
+    }
+
+    #[test]
     fn print_el_erases_to_end_of_line_inside_sgr() {
         let scene: Scene = serde_json::from_str(
             r#"{
@@ -769,7 +911,7 @@ mod tests {
     #[test]
     fn golden_transmissions_compile_byte_identically() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../transmissions");
-        for slug in ["orchard-upside-down", "predator-and-frame"] {
+        for slug in ["orchard-upside-down", "predator-and-frame", "soul"] {
             let scene_path = root.join(slug).join("scene.json");
             let source = fs::read_to_string(&scene_path).expect("read scene");
             let scene: Scene = serde_json::from_str(&source).expect("parse scene");
