@@ -160,6 +160,7 @@ pub fn pump_pty_output(
     mut runtime: ResMut<TerminalRuntime>,
     mut inline_objects: ResMut<TerminalInlineObjects>,
     mut app_exit: MessageWriter<AppExit>,
+    mut ai_commands: MessageWriter<crate::ai::AiCommand>,
     mut redraw: ResMut<TerminalRedrawState>,
 ) {
     let screen_rows = |screen: &vt100::Screen| {
@@ -182,6 +183,9 @@ pub fn pump_pty_output(
                 replies.extend(runtime.parser.callbacks_mut().take_replies());
                 for reply in replies {
                     runtime.write_input(&reply);
+                }
+                for command in runtime.parser.callbacks_mut().take_ai_commands() {
+                    ai_commands.write(crate::ai::AiCommand(command));
                 }
                 if let Some(prev_rows) = prev_rows {
                     let next_rows = screen_rows(runtime.parser.screen());

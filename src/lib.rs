@@ -6,6 +6,7 @@
 #![warn(missing_docs)]
 #![warn(clippy::unwrap_used)]
 
+pub mod ai;
 pub mod cli;
 pub mod config;
 mod direct_render;

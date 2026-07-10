@@ -840,7 +840,9 @@ mod tests {
                 color: Some("red".to_string()),
             })
         );
-        let RattyAiCommand::Ps { visualize, .. } = parse_command("ratty:ps").unwrap() else {
+        let RattyAiCommand::Ps { visualize, .. } =
+            parse_command("ratty:ps").expect("bare ps parses")
+        else {
             panic!("expected Ps");
         };
         assert!(!visualize);
@@ -851,7 +853,7 @@ mod tests {
         // A note whose text contains the grammar's own delimiters.
         let text = "a=b & c; done";
         let payload = format!("text={}&x=15&y=10&expires=1h", percent_encode(text));
-        let command = parse_command(&format!("ratty:note;{payload}")).unwrap();
+        let command = parse_command(&format!("ratty:note;{payload}")).expect("note parses");
         assert_eq!(
             command,
             RattyAiCommand::Note {
