@@ -167,7 +167,16 @@ pub fn start(canvas_selector: &str, config_toml: Option<String>) -> Result<Ratty
             }),
     )
     .add_plugins(TerminalPlugin)
-    .add_systems(Update, drain_web_controls);
+    // Deterministic stage-writer order: apply_rgp_stage → apply_ai_commands →
+    // drain_web_controls → apply_terminal_presentation. JS controls are the
+    // most explicit user input, so they run last among the writers and are
+    // read the same frame (before, not after, the presentation pass).
+    .add_systems(
+        Update,
+        drain_web_controls
+            .after(crate::ai::apply_ai_commands)
+            .before(crate::scene::apply_terminal_presentation),
+    );
 
     // Bevy's winit runner on wasm spawns onto the browser event loop and
     // returns, so the session handle is live after this call.

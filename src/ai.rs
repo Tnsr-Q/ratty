@@ -34,9 +34,18 @@ pub struct RattyAiPlugin;
 
 impl Plugin for RattyAiPlugin {
     fn build(&self, app: &mut App) {
+        // Ordered after the RGP stage systems (not just pump_pty_output) so
+        // that when an RGP `c` stage sequence and an OSC stage command arrive
+        // in the same PTY chunk, the explicit AI command deterministically
+        // wins the shared stage resources rather than racing an arbitrary
+        // Bevy schedule tiebreak. apply_terminal_presentation is in turn
+        // ordered after this system (see plugin.rs).
         app.add_message::<AiCommand>().add_systems(
             Update,
-            apply_ai_commands.after(crate::systems::pump_pty_output),
+            apply_ai_commands
+                .after(crate::systems::pump_pty_output)
+                .after(crate::systems::apply_rgp_stage)
+                .after(crate::systems::animate_stage_tween),
         );
     }
 }

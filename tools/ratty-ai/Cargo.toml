@@ -7,6 +7,9 @@ license = "MIT"
 repository = "https://github.com/orhun/ratty"
 keywords = ["ratty", "terminal", "cli", "osc", "3d"]
 categories = ["command-line-utilities"]
+# In-repo tool: it shares the terminal's parser via a `#[path]` include that
+# reaches outside the crate directory, so it is not a crates.io package.
+publish = false
 
 # Standalone crate (not part of the root workspace, like tools/silk). It
 # shares the terminal's own OSC parser verbatim via a path include, so the

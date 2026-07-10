@@ -1,6 +1,6 @@
 //! OSC 777 control channel: the `ratty-ai` command protocol.
 //!
-//! Where [`crate::rgp`] (APC) carries the 3D *graphics payload*, OSC 777
+//! Where the RGP module (APC) carries the 3D *graphics payload*, OSC 777
 //! carries *control and telemetry* — mode/warp/effects/presence/operator
 //! commands an external agent drives through the `ratty-ai` CLI. The wire
 //! form is a single OSC sequence:
@@ -11,7 +11,7 @@
 //!
 //! `<payload>` is `k=v&k=v…`, each value percent-encoded, plus an optional
 //! leading bare (`=`-less) positional token. The terminal reaches this
-//! through vt100's [`vt100::Callbacks::unhandled_osc`], which delivers the
+//! through vt100's `Callbacks::unhandled_osc`, which delivers the
 //! `;`-split params with `params[0] == b"777"`.
 //!
 //! This module is dependency-free (std only) so the `ratty-ai` CLI can
