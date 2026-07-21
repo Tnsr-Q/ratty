@@ -23,6 +23,73 @@ struct EmbeddedObjects;
 #[derive(Component)]
 pub struct CursorModel;
 
+/// Which model the cursor renders.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CursorModelChoice {
+    /// The trusted config's model path (filesystem access allowed — config
+    /// is a trusted tier).
+    Config,
+    /// An embedded asset selected over the wire; wire commands resolve
+    /// embedded names only.
+    Embedded(String),
+}
+
+/// Runtime cursor presentation state, seeded from [`AppConfig`] and mutated
+/// by the OSC 777 `cursor` command.
+///
+/// Frame systems read this resource instead of the config so cursor
+/// overrides take effect live. `model` and `brightness` changes rebuild the
+/// cursor entity tree (brightness is baked into cloned materials); the
+/// animation fields and `visible` are read every frame.
+#[derive(Resource)]
+pub struct CursorSettings {
+    /// The model the cursor renders.
+    pub model: CursorModelChoice,
+    /// Model visibility.
+    pub visible: bool,
+    /// Brightness multiplier baked into the cursor materials.
+    pub brightness: f32,
+    /// Spin speed in radians per second.
+    pub spin_speed: f32,
+    /// Bob speed in radians per second.
+    pub bob_speed: f32,
+    /// Bob amplitude as a fraction of the cell height.
+    pub bob_amplitude: f32,
+    /// Set when the model or a baked property changed and the cursor entity
+    /// tree must be despawned and rebuilt.
+    pub needs_respawn: bool,
+}
+
+impl CursorSettings {
+    /// Builds the runtime state from the trusted config.
+    pub fn from_config(config: &AppConfig) -> Self {
+        Self {
+            model: CursorModelChoice::Config,
+            visible: config.cursor.model.visible,
+            brightness: config.cursor.model.brightness,
+            spin_speed: config.cursor.animation.spin_speed,
+            bob_speed: config.cursor.animation.bob_speed,
+            bob_amplitude: config.cursor.animation.bob_amplitude,
+            needs_respawn: false,
+        }
+    }
+
+    /// Restores config defaults (the `reset` command), rebuilding the model
+    /// if the wire had swapped it or changed a baked property.
+    pub fn reset_to_config(&mut self, config: &AppConfig) {
+        let rebuild = self.model != CursorModelChoice::Config
+            || self.brightness != config.cursor.model.brightness;
+        *self = Self::from_config(config);
+        self.needs_respawn = rebuild;
+    }
+}
+
+impl FromWorld for CursorSettings {
+    fn from_world(world: &mut World) -> Self {
+        Self::from_config(world.resource::<AppConfig>())
+    }
+}
+
 /// Loaded object source.
 pub enum ObjectSource {
     /// OBJ mesh parts.
@@ -66,7 +133,7 @@ impl Default for ObjectLoadOptions {
     }
 }
 
-/// Spawns the configured cursor model.
+/// Spawns the cursor model selected by [`CursorSettings`].
 pub fn spawn_cursor_model(
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
@@ -74,6 +141,7 @@ pub fn spawn_cursor_model(
     images: &mut Assets<Image>,
     asset_server: &AssetServer,
     app_config: &AppConfig,
+    settings: &CursorSettings,
 ) {
     let root = commands
         .spawn((
@@ -117,7 +185,11 @@ pub fn spawn_cursor_model(
         ..default()
     });
 
-    match load_object_source(app_config.cursor.model.path.as_path()) {
+    let resolved = match &settings.model {
+        CursorModelChoice::Config => load_object_source(app_config.cursor.model.path.as_path()),
+        CursorModelChoice::Embedded(name) => load_embedded_object_source(name),
+    };
+    match resolved {
         Ok((source, ObjectSource::Obj(loaded_meshes))) if !loaded_meshes.is_empty() => {
             info!(
                 "loaded cursor model from {} ({} mesh parts)",
@@ -198,6 +270,83 @@ fn load_texture_image(path: &Path) -> anyhow::Result<Image> {
 /// Returns an error if the asset cannot be resolved or parsed.
 pub fn load_object_source(path: &Path) -> anyhow::Result<(String, ObjectSource)> {
     load_object_source_with_options(path, ObjectLoadOptions::default())
+}
+
+/// Returns whether `name` resolves to an embedded object asset that this
+/// build can actually load.
+///
+/// The format check matters on wasm, where glTF scenes cannot be staged:
+/// an existence-only check would let a `.glb` cursor swap pass validation
+/// and then degrade to the fallback cube. Callers use this to reject
+/// unsupported wire asset names up front.
+pub fn embedded_object_loadable(name: &str) -> bool {
+    let Some(file_name) = Path::new(name)
+        .file_name()
+        .and_then(|file_name| file_name.to_str())
+    else {
+        return false;
+    };
+    if EmbeddedObjects::get(file_name).is_none() {
+        return false;
+    }
+    let extension = Path::new(file_name)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase())
+        .unwrap_or_default();
+    // glTF scenes cannot be staged on wasm; OBJ/STL load everywhere.
+    let gltf_loadable = cfg!(not(target_arch = "wasm32"));
+    matches!(extension.as_str(), "obj" | "stl")
+        || (gltf_loadable && matches!(extension.as_str(), "glb" | "gltf"))
+}
+
+/// Loads an object source from the embedded asset registry only.
+///
+/// This is the resolution rule for the untrusted wire (OSC 777 `object.add`
+/// and `cursor` model swaps): a name resolves against ratty-embedded assets
+/// and nothing else. The filesystem stays a trusted-config privilege — a
+/// cat'd file can emit escape sequences, so the byte stream must never
+/// reach disk.
+///
+/// # Errors
+///
+/// Returns an error when the name is not embedded, the format is
+/// unsupported (glTF is native-only here — the web build cannot stage scene
+/// assets), or the asset fails to parse.
+pub fn load_embedded_object_source(name: &str) -> anyhow::Result<(String, ObjectSource)> {
+    let file_name = Path::new(name)
+        .file_name()
+        .and_then(|file_name| file_name.to_str())
+        .with_context(|| format!("invalid embedded asset name {name}"))?;
+    let Some(file) = EmbeddedObjects::get(file_name) else {
+        bail!("asset {file_name} is not embedded (wire commands resolve embedded names only)");
+    };
+    let extension = Path::new(file_name)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase())
+        .unwrap_or_default();
+    let source = format!("embedded:{file_name}");
+    match extension.as_str() {
+        "stl" => {
+            load_stl_meshes_from_bytes(&file.data).map(|mesh| (source, ObjectSource::Stl(mesh)))
+        }
+        "obj" => load_obj_meshes_from_bytes(
+            file_name,
+            &file.data,
+            ObjectLoadOptions::default().normalize,
+        )
+        .map(|meshes| (source, ObjectSource::Obj(meshes))),
+        #[cfg(not(target_arch = "wasm32"))]
+        "glb" | "gltf" => {
+            let candidate = format!("objects/{file_name}");
+            let asset_path = ensure_scene_asset_path(&candidate, Some((file_name, &file.data)))?;
+            Ok((source, ObjectSource::Gltf(asset_path)))
+        }
+        #[cfg(target_arch = "wasm32")]
+        "glb" | "gltf" => bail!("format {extension} is not supported in the web build yet"),
+        _ => bail!("unsupported object format for {file_name}"),
+    }
 }
 
 /// Loads an object source from a path with explicit load options.

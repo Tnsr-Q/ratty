@@ -244,16 +244,26 @@ impl TerminalInlineObjects {
     }
 
     fn remove_object(&mut self, object_id: u32) {
+        // The transmission/system surface never removes AI-owned objects;
+        // the AI id partition is theirs alone (see `is_ai_object_id`).
+        if is_ai_object_id(object_id) {
+            return;
+        }
         self.objects.remove(&object_id);
         self.anchors.remove(&object_id);
         self.pending_rgp_payloads.remove(&object_id);
         self.dirty = true;
     }
 
+    /// Clears the transmission/system partition (RGP/Kitty "delete all"),
+    /// leaving AI-owned objects untouched — those are removed only through
+    /// the AI channel's own `object.clear`/`reset`, which emit removal
+    /// events.
     fn clear_objects(&mut self) {
-        self.objects.clear();
-        self.anchors.clear();
-        self.pending_rgp_payloads.clear();
+        self.objects.retain(|id, _| is_ai_object_id(*id));
+        self.anchors.retain(|id, _| is_ai_object_id(*id));
+        self.pending_rgp_payloads
+            .retain(|id, _| is_ai_object_id(*id));
         self.dirty = true;
     }
 
@@ -265,6 +275,178 @@ impl TerminalInlineObjects {
     /// Drains queued stage updates in arrival order.
     pub fn take_stage_updates(&mut self) -> Vec<RgpStageUpdate> {
         std::mem::take(&mut self.pending_stage)
+    }
+
+    // ── AI-channel (OSC 777) mutations ──
+    //
+    // These ride the per-object rebuild path, never the scene-wide `dirty`
+    // flag: an agent placing or removing its own object must not respawn a
+    // transmission's scene.
+
+    /// Returns whether an object payload is registered under `object_id`.
+    pub(crate) fn contains_object(&self, object_id: u32) -> bool {
+        self.objects.contains_key(&object_id)
+    }
+
+    /// Number of live objects whose id lies in the given AI namespace.
+    pub(crate) fn ai_namespace_len(&self, namespace: u8) -> usize {
+        self.objects
+            .keys()
+            .filter(|id| crate::osc::ai_object_namespace(**id) == Some(namespace))
+            .count()
+    }
+
+    /// Inserts (or replaces) an AI-owned object anchored at the centered
+    /// cell `(x, y)` with the default AI footprint, queuing a per-object
+    /// spawn.
+    pub(crate) fn ai_insert_object(
+        &mut self,
+        object_id: u32,
+        object: InlineObject,
+        x: u16,
+        y: u16,
+        style: InlineStyle,
+    ) {
+        let anchor = InlineAnchor {
+            row: ai_anchor_component(y, AI_OBJECT_ROWS),
+            col: ai_anchor_component(x, AI_OBJECT_COLUMNS),
+            columns: AI_OBJECT_COLUMNS,
+            rows: AI_OBJECT_ROWS,
+            style,
+        };
+        self.objects.insert(object_id, object);
+        self.anchors.insert(object_id, anchor);
+        self.restyle_objects.remove(&object_id);
+        self.rebuild_objects.insert(object_id);
+    }
+
+    /// Applies an `object.update`: x/y re-anchor the object (a discrete
+    /// relocation — scrolling and hit-testing follow the new cell), while
+    /// scale/spin mutate the live style fields and brightness routes through
+    /// the same restyle/rebuild triage as RGP updates.
+    pub(crate) fn ai_update_object(
+        &mut self,
+        object_id: u32,
+        x: Option<u16>,
+        y: Option<u16>,
+        scale: Option<f32>,
+        spin: Option<f32>,
+        brightness: Option<f32>,
+    ) -> AiUpdateOutcome {
+        if !self.objects.contains_key(&object_id) {
+            return AiUpdateOutcome::UnknownId;
+        }
+        let reanchored = x.is_some() || y.is_some();
+        let Some(anchor) = self.anchors.get_mut(&object_id) else {
+            // The object scrolled off the top and lost its anchor. A full
+            // re-anchor (both coordinates) relocates it into the scene; its
+            // style resets because the scroll discarded the old anchor.
+            let (Some(col), Some(row)) = (x, y) else {
+                return AiUpdateOutcome::NoAnchor;
+            };
+            let mut style = InlineStyle::default();
+            if let Some(scale) = scale {
+                style.scale = scale;
+            }
+            if let Some(spin) = spin {
+                style.spin = Some(spin);
+                style.animate = spin != 0.0;
+            }
+            if let Some(brightness) = brightness {
+                style.brightness = brightness;
+            }
+            self.anchors.insert(
+                object_id,
+                InlineAnchor {
+                    row: ai_anchor_component(row, AI_OBJECT_ROWS),
+                    col: ai_anchor_component(col, AI_OBJECT_COLUMNS),
+                    columns: AI_OBJECT_COLUMNS,
+                    rows: AI_OBJECT_ROWS,
+                    style,
+                },
+            );
+            self.restyle_objects.remove(&object_id);
+            self.rebuild_objects.insert(object_id);
+            return AiUpdateOutcome::Applied;
+        };
+        if let Some(col) = x {
+            anchor.col = ai_anchor_component(col, anchor.columns);
+        }
+        if let Some(row) = y {
+            anchor.row = ai_anchor_component(row, anchor.rows);
+        }
+        if let Some(scale) = scale {
+            anchor.style.scale = scale;
+        }
+        if let Some(spin) = spin {
+            anchor.style.spin = Some(spin);
+            anchor.style.animate = spin != 0.0 || anchor.style.bob.is_some();
+        }
+        let restyled = brightness.is_some();
+        if let Some(brightness) = brightness {
+            anchor.style.brightness = brightness;
+        }
+        // A re-anchor is a discrete relocation, so respawn the entity: an
+        // object that was off-screen (never spawned) becomes visible, and
+        // one moved off-screen is despawned by the granular pass.
+        // scale/spin remain live per-frame fields (zero-cost).
+        if reanchored {
+            self.restyle_objects.remove(&object_id);
+            self.rebuild_objects.insert(object_id);
+        } else if restyled {
+            if self.supports_restyle(object_id) {
+                self.restyle_objects.insert(object_id);
+            } else {
+                self.rebuild_objects.insert(object_id);
+                self.restyle_objects.remove(&object_id);
+            }
+        }
+        AiUpdateOutcome::Applied
+    }
+
+    /// Removes an AI-owned object, queuing a per-object despawn. Returns
+    /// whether the object existed.
+    pub(crate) fn ai_remove_object(&mut self, object_id: u32) -> bool {
+        let existed = self.objects.remove(&object_id).is_some();
+        self.anchors.remove(&object_id);
+        self.pending_rgp_payloads.remove(&object_id);
+        if existed {
+            self.restyle_objects.remove(&object_id);
+            // The id is no longer renderable, so the granular sync pass
+            // despawns its entity without respawning anything.
+            self.rebuild_objects.insert(object_id);
+        }
+        existed
+    }
+
+    /// Removes every live object in the given AI namespace, returning the
+    /// removed ids. Idempotent: an empty namespace removes nothing.
+    pub(crate) fn ai_clear_namespace(&mut self, namespace: u8) -> Vec<u32> {
+        let ids = self
+            .objects
+            .keys()
+            .copied()
+            .filter(|id| crate::osc::ai_object_namespace(*id) == Some(namespace))
+            .collect::<Vec<_>>();
+        for id in &ids {
+            self.ai_remove_object(*id);
+        }
+        ids
+    }
+
+    /// Removes every AI-range object across all namespaces (the `reset`
+    /// command), returning the removed ids.
+    pub(crate) fn ai_clear_all(&mut self) -> Vec<u32> {
+        let ids = self
+            .objects
+            .keys()
+            .copied()
+            .filter(|id| crate::osc::ai_object_namespace(*id).is_some())
+            .collect::<Vec<_>>();
+        for id in &ids {
+            self.ai_remove_object(*id);
+        }
+        ids
     }
 
     fn handle_apc_sequence(
@@ -282,6 +464,16 @@ impl TerminalInlineObjects {
 
         match operation {
             KittyOperation::Pending | KittyOperation::Ignored => (true, None),
+            // The AI id partition is off-limits to the Kitty surface: a
+            // cat'd file cannot squat, mutate, or evict an AI object.
+            KittyOperation::TransmitOnly { object_id, .. }
+            | KittyOperation::TransmitAndPlace { object_id, .. }
+            | KittyOperation::PlaceExisting { object_id, .. }
+                if is_ai_object_id(object_id) =>
+            {
+                warn!("Kitty object id {object_id} is in the AI-owned range; ignoring");
+                (true, None)
+            }
             KittyOperation::TransmitOnly { object_id, image } => {
                 self.objects
                     .insert(object_id, InlineObject::KittyImage(image.rasterize()));
@@ -344,6 +536,16 @@ impl TerminalInlineObjects {
         let operation = consume_rgp_sequence(sequence)?;
         Some(match operation {
             RgpOperation::SupportQuery => Some(support_reply()),
+            // The AI id partition is off-limits to the RGP surface: a
+            // transmission cannot register, place, or restyle an AI object.
+            RgpOperation::Register { object_id, .. }
+            | RgpOperation::Place { object_id, .. }
+            | RgpOperation::Update { object_id, .. }
+                if is_ai_object_id(object_id) =>
+            {
+                warn!("RGP object id {object_id} is in the AI-owned range; ignoring");
+                None
+            }
             RgpOperation::Register {
                 object_id,
                 format,
@@ -457,6 +659,10 @@ impl TerminalInlineObjects {
             .anchors
             .iter()
             .filter_map(|(object_id, anchor)| {
+                // Kitty placement never evicts AI-owned objects.
+                if is_ai_object_id(*object_id) {
+                    return None;
+                }
                 let anchor_row_start = anchor.row as i32;
                 let anchor_row_end = anchor_row_start + anchor.rows as i32;
                 let anchor_col_start = anchor.col as i32;
@@ -677,6 +883,42 @@ impl InlineObject {
     }
 }
 
+/// Default anchor footprint (in cells) for AI-spawned objects. `object.add`
+/// carries no extent parameters, so every AI object uses this footprint and
+/// `scale` sizes it from there.
+const AI_OBJECT_COLUMNS: u32 = 12;
+const AI_OBJECT_ROWS: u32 = 6;
+
+/// Whether an object id belongs to the AI-owned partition.
+///
+/// The id space is split: the AI channel owns ids at or above
+/// [`crate::osc::AI_OBJECT_ID_MIN`], and the transmission/system surfaces
+/// (RGP registrations, Kitty images) own the rest. Each surface refuses to
+/// create, mutate, or remove ids in the other's partition, so ownership is
+/// enforced mechanically at every wire ingress — not just in the AI
+/// lowering layer.
+fn is_ai_object_id(id: u32) -> bool {
+    crate::osc::ai_object_namespace(id).is_some()
+}
+
+/// Result of an AI-channel object update.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AiUpdateOutcome {
+    /// The update was applied.
+    Applied,
+    /// No object is registered under the id.
+    UnknownId,
+    /// The object exists but its anchor scrolled away; `object.add` with
+    /// `replace=true` re-anchors it.
+    NoAnchor,
+}
+
+/// Converts a centered anchor coordinate to the stored top-left component,
+/// mirroring the RGP `p` placement rule.
+fn ai_anchor_component(center: u16, extent: u32) -> u16 {
+    center.saturating_sub(extent.saturating_sub(1).div_ceil(2) as u16)
+}
+
 /// Inline object anchor.
 pub struct InlineAnchor {
     /// Anchor row.
@@ -793,6 +1035,194 @@ mod tests {
 
     fn rgp_sequence(content: &str) -> Vec<u8> {
         format!("\x1b_ratty;g;{content}\x1b\\").into_bytes()
+    }
+
+    fn stl_object() -> InlineObject {
+        InlineObject::RgpObject(RgpInlineObject::Stl {
+            mesh: Mesh::new(
+                bevy::mesh::PrimitiveTopology::TriangleList,
+                bevy::asset::RenderAssetUsages::default(),
+            ),
+            handle: None,
+        })
+    }
+
+    fn gltf_object() -> InlineObject {
+        InlineObject::RgpObject(RgpInlineObject::Gltf {
+            asset_path: "objects/x.glb".into(),
+            handle: None,
+        })
+    }
+
+    const AI_ID: u32 = 0x8000_0005;
+
+    #[test]
+    fn ai_insert_and_remove_stay_per_object() {
+        let mut inline = TerminalInlineObjects::default();
+        inline.ai_insert_object(AI_ID, stl_object(), 20, 10, InlineStyle::default());
+        assert!(
+            !inline.dirty,
+            "AI mutations must never trigger the scene-wide respawn"
+        );
+        assert!(inline.rebuild_objects.contains(&AI_ID));
+        assert!(inline.contains_object(AI_ID));
+
+        assert!(inline.ai_remove_object(AI_ID));
+        assert!(!inline.dirty);
+        assert!(!inline.contains_object(AI_ID));
+        assert!(
+            inline.rebuild_objects.contains(&AI_ID),
+            "removal queues a granular despawn"
+        );
+        assert!(
+            !inline.ai_remove_object(AI_ID),
+            "second removal reports absence"
+        );
+    }
+
+    #[test]
+    fn ai_update_routes_brightness_by_object_kind() {
+        let mut inline = TerminalInlineObjects::default();
+        inline.ai_insert_object(AI_ID, stl_object(), 0, 0, InlineStyle::default());
+        inline.rebuild_objects.clear();
+        assert_eq!(
+            inline.ai_update_object(AI_ID, None, None, None, None, Some(2.0)),
+            AiUpdateOutcome::Applied
+        );
+        assert!(
+            inline.restyle_objects.contains(&AI_ID),
+            "STL brightness restyles in place"
+        );
+        assert!(!inline.rebuild_objects.contains(&AI_ID));
+
+        let gltf_id = 0x8000_0006;
+        inline.ai_insert_object(gltf_id, gltf_object(), 0, 0, InlineStyle::default());
+        inline.rebuild_objects.clear();
+        assert_eq!(
+            inline.ai_update_object(gltf_id, None, None, None, None, Some(2.0)),
+            AiUpdateOutcome::Applied
+        );
+        assert!(
+            inline.rebuild_objects.contains(&gltf_id),
+            "glTF brightness needs a per-object rebuild"
+        );
+
+        assert_eq!(
+            inline.ai_update_object(0x8000_0099, None, None, None, None, None),
+            AiUpdateOutcome::UnknownId
+        );
+    }
+
+    #[test]
+    fn ai_update_reanchor_respawns_but_live_fields_do_not() {
+        let mut inline = TerminalInlineObjects::default();
+        inline.ai_insert_object(AI_ID, stl_object(), 20, 10, InlineStyle::default());
+
+        // A scale/spin-only update keeps the object live — no respawn.
+        inline.rebuild_objects.clear();
+        assert_eq!(
+            inline.ai_update_object(AI_ID, None, None, Some(2.5), Some(3.0), None),
+            AiUpdateOutcome::Applied
+        );
+        assert!(
+            inline.rebuild_objects.is_empty() && !inline.dirty,
+            "scale/spin are live per-frame fields"
+        );
+        let anchor = inline.anchors.get(&AI_ID).expect("anchor exists");
+        assert_eq!(anchor.style.scale, 2.5);
+        assert_eq!(anchor.style.spin, Some(3.0));
+        assert!(anchor.style.animate);
+
+        // A re-anchor is a discrete relocation: it respawns so an off-screen
+        // object can appear (or an on-screen one move off and despawn).
+        inline.rebuild_objects.clear();
+        assert_eq!(
+            inline.ai_update_object(AI_ID, Some(40), Some(4), None, None, None),
+            AiUpdateOutcome::Applied
+        );
+        let anchor = inline.anchors.get(&AI_ID).expect("anchor exists");
+        // Centered on (40, 4) with the default 12x6 footprint.
+        assert_eq!(anchor.col, 34);
+        assert_eq!(anchor.row, 1);
+        assert!(
+            inline.rebuild_objects.contains(&AI_ID) && !inline.dirty,
+            "re-anchor queues a per-object respawn, never a scene rebuild"
+        );
+    }
+
+    #[test]
+    fn ai_update_recovers_a_scrolled_away_object() {
+        let mut inline = TerminalInlineObjects::default();
+        inline.ai_insert_object(AI_ID, stl_object(), 10, 2, InlineStyle::default());
+        // Scroll it off the top: apply_scroll drops the anchor, keeps the
+        // payload.
+        inline.apply_scroll(50);
+        assert!(inline.contains_object(AI_ID));
+        assert!(!inline.anchors.contains_key(&AI_ID), "anchor scrolled away");
+
+        // A single coordinate cannot fully re-place it.
+        assert_eq!(
+            inline.ai_update_object(AI_ID, Some(30), None, None, None, None),
+            AiUpdateOutcome::NoAnchor
+        );
+        // Both coordinates rebuild the anchor and requeue a spawn.
+        inline.rebuild_objects.clear();
+        assert_eq!(
+            inline.ai_update_object(AI_ID, Some(30), Some(6), None, None, None),
+            AiUpdateOutcome::Applied
+        );
+        assert!(inline.anchors.contains_key(&AI_ID), "anchor recreated");
+        assert!(inline.rebuild_objects.contains(&AI_ID));
+    }
+
+    #[test]
+    fn wire_surfaces_cannot_touch_the_ai_partition() {
+        let mut inline = TerminalInlineObjects::default();
+        inline.ai_insert_object(AI_ID, stl_object(), 5, 5, InlineStyle::default());
+
+        // RGP register on an AI-range id is refused.
+        inline.handle_rgp_sequence(&rgp_sequence(&format!("r;id={AI_ID};fmt=obj;path=x.obj")));
+        // The AI object is untouched (still the STL we inserted).
+        assert!(matches!(
+            inline.objects.get(&AI_ID),
+            Some(InlineObject::RgpObject(RgpInlineObject::Stl { .. }))
+        ));
+
+        // RGP delete-all clears only the transmission partition.
+        inline.objects.insert(3, gltf_object());
+        inline.handle_rgp_sequence(&rgp_sequence("d"));
+        assert!(
+            inline.contains_object(AI_ID),
+            "transmission clear-all spares AI objects"
+        );
+        assert!(
+            !inline.contains_object(3),
+            "it still clears its own objects"
+        );
+    }
+
+    #[test]
+    fn ai_clear_scopes_to_namespace_and_spares_low_ids() {
+        let mut inline = TerminalInlineObjects::default();
+        // A transmission-owned object (below the AI range).
+        inline.objects.insert(7, stl_object());
+        inline.ai_insert_object(0x8000_0001, stl_object(), 0, 0, InlineStyle::default());
+        // A different agent namespace.
+        inline.ai_insert_object(0x8100_0001, gltf_object(), 0, 0, InlineStyle::default());
+
+        assert_eq!(inline.ai_clear_namespace(0), vec![0x8000_0001]);
+        assert!(inline.contains_object(7));
+        assert!(inline.contains_object(0x8100_0001));
+        assert!(
+            inline.ai_clear_namespace(0).is_empty(),
+            "clear is idempotent"
+        );
+
+        assert_eq!(inline.ai_clear_all(), vec![0x8100_0001]);
+        assert!(
+            inline.contains_object(7),
+            "reset spares transmission objects"
+        );
     }
 
     #[test]

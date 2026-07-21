@@ -31,8 +31,7 @@ use crate::inline::{
     TerminalInlineObjectPlane, TerminalInlineObjectSprite, TerminalInlineObjects,
     TerminalRgpObject,
 };
-use crate::model::CursorModel;
-use crate::model::spawn_cursor_model;
+use crate::model::{CursorModel, CursorSettings, spawn_cursor_model};
 use crate::mouse::TerminalSelection;
 use crate::present::TerminalPresentMaterial;
 use crate::rendering::{sync_plane_texture, sync_terminal_debug_image};
@@ -184,8 +183,8 @@ pub fn pump_pty_output(
                 for reply in replies {
                     runtime.write_input(&reply);
                 }
-                for command in runtime.parser.callbacks_mut().take_ai_commands() {
-                    ai_commands.write(crate::ai::AiCommand(command));
+                for (source, command) in runtime.parser.callbacks_mut().take_ai_commands() {
+                    ai_commands.write(crate::ai::AiCommand { source, command });
                 }
                 if let Some(prev_rows) = prev_rows {
                     let next_rows = screen_rows(runtime.parser.screen());
@@ -348,6 +347,7 @@ const BLINK_TICK_SECS: f32 = 0.25;
 #[derive(SystemParam)]
 pub(crate) struct RenderWidgetParams<'w, 's> {
     app_config: Res<'w, AppConfig>,
+    cursor_settings: Res<'w, CursorSettings>,
     runtime: Res<'w, TerminalRuntime>,
     terminal: ResMut<'w, TerminalSurface>,
     selection: Res<'w, TerminalSelection>,
@@ -368,6 +368,7 @@ pub(crate) struct RenderWidgetParams<'w, 's> {
 pub(crate) fn render_terminal_widget(mut params: RenderWidgetParams) {
     let RenderWidgetParams {
         app_config,
+        cursor_settings,
         runtime,
         terminal,
         selection,
@@ -403,7 +404,10 @@ pub(crate) fn render_terminal_widget(mut params: RenderWidgetParams) {
             frame.area(),
         );
 
-        if !app_config.cursor.model.visible && !screen.hide_cursor() {
+        // Draw the block cursor only when the 3D model is not showing it, so
+        // the two never both appear (or both vanish). This reads the live
+        // cursor state, which the `cursor` command can toggle at runtime.
+        if !cursor_settings.visible && !screen.hide_cursor() {
             let (cursor_row, cursor_col) = screen.cursor_position();
             frame.set_cursor_position((cursor_col, cursor_row));
         }
@@ -480,6 +484,7 @@ pub(crate) fn sync_terminal_materials(mut params: SyncMaterialsParams) {
 #[derive(SystemParam)]
 pub(crate) struct ModelLoadParams<'w, 's> {
     app_config: Res<'w, AppConfig>,
+    cursor_settings: ResMut<'w, CursorSettings>,
     model_load_state: ResMut<'w, ModelLoadState>,
     redraw: ResMut<'w, TerminalRedrawState>,
     commands: Commands<'w, 's>,
@@ -497,6 +502,7 @@ pub(crate) struct ModelLoadParams<'w, 's> {
 pub(crate) fn finish_terminal_model_load(mut params: ModelLoadParams) {
     let ModelLoadParams {
         app_config,
+        cursor_settings,
         model_load_state,
         redraw,
         commands,
@@ -517,18 +523,69 @@ pub(crate) fn finish_terminal_model_load(mut params: ModelLoadParams) {
     }
 
     if !model_load_state.loaded {
-        if app_config.cursor.model.visible {
-            spawn_cursor_model(
-                commands,
-                meshes,
-                materials,
-                images,
-                asset_server,
-                app_config,
-            );
-        }
+        // Spawn even when the model starts invisible: the `cursor` command
+        // can toggle visibility at runtime, and visibility is applied per
+        // frame by `sync_asset_to_terminal_cursor`.
+        spawn_cursor_model(
+            commands,
+            meshes,
+            materials,
+            images,
+            asset_server,
+            app_config,
+            cursor_settings,
+        );
+        cursor_settings.needs_respawn = false;
         model_load_state.loaded = true;
     }
+}
+
+/// Cursor-model respawn parameters.
+#[derive(SystemParam)]
+pub(crate) struct RespawnCursorParams<'w, 's> {
+    commands: Commands<'w, 's>,
+    cursor_settings: ResMut<'w, CursorSettings>,
+    model_load_state: Res<'w, ModelLoadState>,
+    roots: Query<'w, 's, Entity, With<CursorModel>>,
+    meshes: ResMut<'w, Assets<Mesh>>,
+    materials: ResMut<'w, Assets<StandardMaterial>>,
+    images: ResMut<'w, Assets<Image>>,
+    asset_server: Res<'w, AssetServer>,
+    app_config: Res<'w, AppConfig>,
+}
+
+/// Rebuilds the cursor model when the `cursor` command swapped the model or
+/// changed a baked property (brightness is baked into cloned materials).
+pub(crate) fn respawn_cursor_model(mut params: RespawnCursorParams) {
+    let RespawnCursorParams {
+        commands,
+        cursor_settings,
+        model_load_state,
+        roots,
+        meshes,
+        materials,
+        images,
+        asset_server,
+        app_config,
+    } = &mut params;
+    // Before the deferred initial spawn, `finish_terminal_model_load` picks
+    // up the latest settings on its own.
+    if !cursor_settings.needs_respawn || !model_load_state.loaded {
+        return;
+    }
+    for entity in roots.iter() {
+        commands.entity(entity).despawn();
+    }
+    spawn_cursor_model(
+        commands,
+        meshes,
+        materials,
+        images,
+        asset_server,
+        app_config,
+        cursor_settings,
+    );
+    cursor_settings.needs_respawn = false;
 }
 
 /// Synchronizes Kitty inline objects.
@@ -1452,7 +1509,7 @@ pub(crate) fn apply_rgp_restyle(mut params: RgpRestyleParams) {
 /// Brightness application parameters.
 #[derive(SystemParam)]
 pub(crate) struct BrightnessParams<'w, 's> {
-    app_config: Res<'w, AppConfig>,
+    cursor_settings: Res<'w, CursorSettings>,
     inline_objects: Res<'w, TerminalInlineObjects>,
     rgp_roots: Query<'w, 's, (Entity, &'static TerminalRgpObject)>,
     cursor_roots: Query<'w, 's, Entity, With<CursorModel>>,
@@ -1482,7 +1539,7 @@ pub(crate) struct BrightnessParams<'w, 's> {
 /// again every frame.
 pub(crate) fn apply_instance_brightness(mut params: BrightnessParams) {
     let BrightnessParams {
-        app_config,
+        cursor_settings,
         inline_objects,
         rgp_roots,
         cursor_roots,
@@ -1517,7 +1574,7 @@ pub(crate) fn apply_instance_brightness(mut params: BrightnessParams) {
                 break;
             }
             if cursor_roots.contains(&current) {
-                brightness = Some(app_config.cursor.model.brightness);
+                brightness = Some(cursor_settings.brightness);
                 break;
             }
             let Ok(next) = parent_query.get(current) else {
@@ -1920,6 +1977,7 @@ fn apply_plane_warp(
 #[derive(SystemParam)]
 pub(crate) struct CursorSyncParams<'w, 's> {
     app_config: Res<'w, AppConfig>,
+    cursor_settings: Res<'w, CursorSettings>,
     runtime: Res<'w, TerminalRuntime>,
     terminal: Res<'w, TerminalSurface>,
     viewport: Res<'w, TerminalViewport>,
@@ -1942,6 +2000,7 @@ pub(crate) struct CursorSyncParams<'w, 's> {
 pub(crate) fn sync_asset_to_terminal_cursor(mut params: CursorSyncParams) {
     let CursorSyncParams {
         app_config,
+        cursor_settings,
         runtime,
         terminal,
         viewport,
@@ -1966,7 +2025,8 @@ pub(crate) fn sync_asset_to_terminal_cursor(mut params: CursorSyncParams) {
         elapsed_secs: time.elapsed_secs(),
         plane_query,
     };
-    let (translation, rotation, scale, cursor_visibility) = cursor_pose(app_config, &pose_ctx);
+    let (translation, rotation, scale, cursor_visibility) =
+        cursor_pose(app_config, cursor_settings, &pose_ctx);
     for (mut transform, mut visibility) in query.iter_mut() {
         transform.translation = translation;
         transform.rotation = rotation;
@@ -1977,6 +2037,7 @@ pub(crate) fn sync_asset_to_terminal_cursor(mut params: CursorSyncParams) {
 
 fn cursor_pose(
     app_config: &AppConfig,
+    settings: &CursorSettings,
     ctx: &CursorPoseContext<'_, '_, '_>,
 ) -> (Vec3, Quat, f32, Visibility) {
     let cols = ctx.terminal.cols.max(1) as f32;
@@ -1994,10 +2055,8 @@ fn cursor_pose(
     let local_x = ctx.viewport.center.x - ctx.viewport.size.x * 0.5 + cursor_x * cell_width;
     let local_y =
         ctx.viewport.center.y + ctx.viewport.size.y * 0.5 - (cursor_row + 0.5) * cell_height;
-    let spin = ctx.elapsed_secs * app_config.cursor.animation.spin_speed;
-    let bob = (ctx.elapsed_secs * app_config.cursor.animation.bob_speed).sin()
-        * cell_height
-        * app_config.cursor.animation.bob_amplitude;
+    let spin = ctx.elapsed_secs * settings.spin_speed;
+    let bob = (ctx.elapsed_secs * settings.bob_speed).sin() * cell_height * settings.bob_amplitude;
     let plane_bob = if ctx.viewport.size.y > 0.0 {
         bob / ctx.viewport.size.y
     } else {
@@ -2008,7 +2067,7 @@ fn cursor_pose(
         TerminalPresentationMode::Flat2d => (
             Vec3::new(local_x, local_y + bob, CURSOR_DEPTH),
             Quat::from_rotation_y(spin) * Quat::from_rotation_x(-0.25),
-            if !app_config.cursor.model.visible || screen.hide_cursor() {
+            if !settings.visible || screen.hide_cursor() {
                 Visibility::Hidden
             } else {
                 Visibility::Visible
@@ -2033,7 +2092,7 @@ fn cursor_pose(
                 plane_transform.transform_point(local_position),
                 plane_transform.rotation
                     * (Quat::from_rotation_y(spin) * Quat::from_rotation_x(-0.25)),
-                if app_config.cursor.model.visible {
+                if settings.visible {
                     Visibility::Visible
                 } else {
                     Visibility::Hidden

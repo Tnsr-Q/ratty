@@ -32,15 +32,45 @@ pub struct RuntimeOptions {
     pub working_dir: Option<PathBuf>,
 }
 
+/// The trusted ingress context a terminal byte stream arrives through.
+///
+/// Ratty derives command authority from *where bytes physically entered*,
+/// never from anything inside the byte stream itself — a stream cannot
+/// claim an identity. A plain PTY (and the wasm virtual channel) is one
+/// effective principal: ratty cannot tell which process wrote individual
+/// bytes. Future transports (relays, bridges) authenticate writers before
+/// ingress and are assigned their own variants here, out-of-band.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IngressSource {
+    /// The local session transport: the spawned PTY on native builds, the
+    /// virtual byte channel on wasm.
+    #[default]
+    Local,
+}
+
+impl IngressSource {
+    /// The agent namespace this ingress context owns within the AI object
+    /// id range (see [`crate::osc::ai_object_namespace`]).
+    pub fn namespace(self) -> u8 {
+        match self {
+            IngressSource::Local => 0,
+        }
+    }
+}
+
 /// Callback state for unhandled parser sequences.
 #[derive(Default)]
 pub struct TerminalParserCallbacks {
     seen_csi: HashSet<String>,
     seen_escape: HashSet<String>,
     pending_replies: Vec<Vec<u8>>,
-    pending_ai: Vec<RattyAiCommand>,
+    pending_ai: Vec<(IngressSource, RattyAiCommand)>,
     kitty_keyboard_flags: u8,
     modify_other_keys: Option<u8>,
+    // The ingress context stamped onto every parsed AI command. Survives
+    // `resize` because the whole callbacks value is moved into the new
+    // parser (`std::mem::take`).
+    source: IngressSource,
 }
 
 impl TerminalParserCallbacks {
@@ -49,8 +79,9 @@ impl TerminalParserCallbacks {
         std::mem::take(&mut self.pending_replies)
     }
 
-    /// Drains any `ratty-ai` OSC 777 control commands queued by the parser.
-    pub fn take_ai_commands(&mut self) -> Vec<RattyAiCommand> {
+    /// Drains any `ratty-ai` OSC 777 control commands queued by the parser,
+    /// each stamped with the ingress context that delivered it.
+    pub fn take_ai_commands(&mut self) -> Vec<(IngressSource, RattyAiCommand)> {
         std::mem::take(&mut self.pending_ai)
     }
 
@@ -173,7 +204,7 @@ impl Callbacks for TerminalParserCallbacks {
         // is ignored. Commands fire inside `pump_pty_output` on the Bevy
         // thread, so they queue here and drain there — no channel needed.
         if let Some(command) = parse_osc(params) {
-            self.pending_ai.push(command);
+            self.pending_ai.push((self.source, command));
         }
     }
 
@@ -619,10 +650,16 @@ mod tests {
         assert_eq!(
             commands,
             vec![
-                RattyAiCommand::SetMode {
-                    mode: "3d".to_string()
-                },
-                RattyAiCommand::SetWarp { intensity: 0.5 },
+                (
+                    IngressSource::Local,
+                    RattyAiCommand::SetMode {
+                        mode: "3d".to_string()
+                    }
+                ),
+                (
+                    IngressSource::Local,
+                    RattyAiCommand::SetWarp { intensity: 0.5 }
+                ),
             ]
         );
         // Drained.
