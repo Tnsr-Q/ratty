@@ -1450,7 +1450,16 @@ mod tests {
         // NOT read it — a program printing to the terminal cannot make ratty
         // load an arbitrary file. (On the pre-fix disk-first loader this file
         // would register, so this assertion is the regression guard.)
-        let dir = std::env::temp_dir().join("ratty_rgp_path_register_test");
+        // Unique per process *and* per run: concurrent `cargo test` invocations
+        // (two worktrees sharing $TMPDIR, a background run plus a foreground
+        // one) must not have one run's cleanup delete another run's directory
+        // between create_dir_all and write.
+        static NEXT_DIR: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let unique = NEXT_DIR.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "ratty_rgp_path_register_test_{}_{unique}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&dir).expect("create temp dir");
         let disk_asset = dir.join("disk_only.obj");
         std::fs::write(&disk_asset, "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n")
