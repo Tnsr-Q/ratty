@@ -160,6 +160,7 @@ pub fn pump_pty_output(
     mut inline_objects: ResMut<TerminalInlineObjects>,
     mut app_exit: MessageWriter<AppExit>,
     mut ai_commands: MessageWriter<crate::ai::AiCommand>,
+    mut queries: MessageWriter<crate::query_channel::QueryRequest>,
     mut redraw: ResMut<TerminalRedrawState>,
 ) {
     let screen_rows = |screen: &vt100::Screen| {
@@ -183,8 +184,26 @@ pub fn pump_pty_output(
                 for reply in replies {
                     runtime.write_input(&reply);
                 }
-                for (source, command) in runtime.parser.callbacks_mut().take_ai_commands() {
-                    ai_commands.write(crate::ai::AiCommand { source, command });
+                for (source, ack_token, command) in
+                    runtime.parser.callbacks_mut().take_ai_commands()
+                {
+                    ai_commands.write(crate::ai::AiCommand {
+                        source,
+                        ack_token,
+                        command,
+                    });
+                }
+                for (source, envelope) in runtime.parser.callbacks_mut().take_queries() {
+                    queries.write(crate::query_channel::QueryRequest {
+                        source,
+                        item: crate::query_channel::QueryItem::Query(envelope),
+                    });
+                }
+                for (source, error) in runtime.parser.callbacks_mut().take_wire_errors() {
+                    queries.write(crate::query_channel::QueryRequest {
+                        source,
+                        item: crate::query_channel::QueryItem::Error(error),
+                    });
                 }
                 if let Some(prev_rows) = prev_rows {
                     let next_rows = screen_rows(runtime.parser.screen());
@@ -211,6 +230,13 @@ pub fn pump_pty_output(
 }
 
 fn infer_upward_scroll(prev_rows: &[String], next_rows: &[String]) -> u16 {
+    // Identical screens are no scroll. Without this, a fully blank screen
+    // matches itself at every shift and the loop below infers a huge
+    // spurious scroll, evicting every scroll-tracked anchor the moment any
+    // output chunk arrives.
+    if prev_rows == next_rows {
+        return 0;
+    }
     let max_shift = prev_rows.len().min(next_rows.len());
     for shift in (1..max_shift).rev() {
         if prev_rows

@@ -61,6 +61,17 @@ impl Mood {
         }
     }
 
+    /// The wire tag this mood parses from (the inverse of [`Mood::parse`]).
+    pub fn tag(self) -> &'static str {
+        match self {
+            Self::Excited => "excited",
+            Self::Cautious => "cautious",
+            Self::Confused => "confused",
+            Self::Focused => "focused",
+            Self::Celebratory => "celebratory",
+        }
+    }
+
     /// Ambient color at time `clock` (Confused shimmers; the rest are steady).
     fn color(self, clock: f32) -> [f32; 3] {
         match self {
@@ -116,7 +127,39 @@ pub struct AiEffects {
     mood: Option<Mood>,
 }
 
+/// The publicly observable slice of [`AiEffects`]: what any agent can see
+/// on screen, projected for the query channel's `state.scene` op. Internal
+/// timers and clock state stay private.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AiEffectsPublic {
+    /// Whether the thinking indicator is on.
+    pub thinking: bool,
+    /// The confidence aura level, when set.
+    pub confidence: Option<f32>,
+    /// The active mood tag, when set.
+    pub mood: Option<&'static str>,
+    /// Whether a flash is currently decaying.
+    pub flash: bool,
+    /// Whether a pulse is currently decaying.
+    pub pulse: bool,
+    /// Whether a steady tint is applied.
+    pub tint: bool,
+}
+
 impl AiEffects {
+    /// The publicly visible effect state (everything here is already
+    /// observable on screen; timers and internals are not exposed).
+    pub fn public_state(&self) -> AiEffectsPublic {
+        AiEffectsPublic {
+            thinking: self.thinking,
+            confidence: self.confidence,
+            mood: self.mood.map(Mood::tag),
+            flash: self.flash.is_some(),
+            pulse: self.pulse.is_some(),
+            tint: self.tint.is_some(),
+        }
+    }
+
     fn set_flash(&mut self, color: [f32; 3], duration: f32) {
         let total = duration.max(0.05);
         self.flash = Some(Flash {
@@ -315,13 +358,23 @@ fn setup_ai_effects(mut commands: Commands) {
 
 /// Applies `flash`/`pulse`/`tint`/`think`/`confidence`/`mood`/`reset`
 /// commands to the effect state.
-fn apply_ai_effect_commands(
+///
+/// This system owns the ack for the six effect commands (they always
+/// commit). `reset` is acked by `apply_ai_commands`, which owns that
+/// command's single ack.
+pub(crate) fn apply_ai_effect_commands(
     mut commands: MessageReader<AiCommand>,
     mut effects: ResMut<AiEffects>,
+    mut acks: MessageWriter<crate::query_channel::AckOutcome>,
     mut redraw: ResMut<TerminalRedrawState>,
 ) {
     let mut changed = false;
-    for AiCommand { command, .. } in commands.read() {
+    for AiCommand {
+        source,
+        ack_token,
+        command,
+    } in commands.read()
+    {
         match command {
             RattyAiCommand::Flash { color, duration } => {
                 effects.set_flash(parse_color(color), *duration);
@@ -357,9 +410,11 @@ fn apply_ai_effect_commands(
             RattyAiCommand::Reset => {
                 effects.clear();
                 changed = true;
+                continue;
             }
-            _ => {}
+            _ => continue,
         }
+        crate::query_channel::ack_commit(&mut acks, *source, ack_token);
     }
     if changed {
         redraw.request();

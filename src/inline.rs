@@ -92,6 +92,8 @@ pub struct TerminalInlineObjects {
     last_rows: u16,
     pub(crate) objects: HashMap<u32, InlineObject>,
     pub(crate) anchors: HashMap<u32, InlineAnchor>,
+    revisions: HashMap<u32, u64>,
+    mutation_seq: u64,
 }
 
 impl TerminalInlineObjects {
@@ -240,6 +242,22 @@ impl TerminalInlineObjects {
     fn set_anchor(&mut self, object_id: u32, anchor: InlineAnchor) {
         self.anchors.insert(object_id, anchor);
         self.dirty = true;
+        self.bump_revision(object_id);
+    }
+
+    /// Stamps a fresh revision on an object record. Revisions are drawn
+    /// from one monotonic per-session counter, so they also order mutations
+    /// across objects. Only explicit record mutations (spawn, restyle,
+    /// re-anchor, replace) bump revisions; derived visibility changes
+    /// (scrolling) do not.
+    fn bump_revision(&mut self, object_id: u32) {
+        self.mutation_seq += 1;
+        self.revisions.insert(object_id, self.mutation_seq);
+    }
+
+    /// The object's current revision, or 0 when the id has no live record.
+    pub(crate) fn revision(&self, object_id: u32) -> u64 {
+        self.revisions.get(&object_id).copied().unwrap_or(0)
     }
 
     fn remove_object(&mut self, object_id: u32) {
@@ -251,6 +269,7 @@ impl TerminalInlineObjects {
         self.objects.remove(&object_id);
         self.anchors.remove(&object_id);
         self.pending_rgp_payloads.remove(&object_id);
+        self.revisions.remove(&object_id);
         self.dirty = true;
     }
 
@@ -263,6 +282,7 @@ impl TerminalInlineObjects {
         self.anchors.retain(|id, _| is_ai_object_id(*id));
         self.pending_rgp_payloads
             .retain(|id, _| is_ai_object_id(*id));
+        self.revisions.retain(|id, _| is_ai_object_id(*id));
         self.dirty = true;
     }
 
@@ -317,6 +337,7 @@ impl TerminalInlineObjects {
         self.anchors.insert(object_id, anchor);
         self.restyle_objects.remove(&object_id);
         self.rebuild_objects.insert(object_id);
+        self.bump_revision(object_id);
     }
 
     /// Applies an `object.update`: x/y re-anchor the object (a discrete
@@ -366,6 +387,7 @@ impl TerminalInlineObjects {
             );
             self.restyle_objects.remove(&object_id);
             self.rebuild_objects.insert(object_id);
+            self.bump_revision(object_id);
             return AiUpdateOutcome::Applied;
         };
         if let Some(col) = x {
@@ -400,6 +422,7 @@ impl TerminalInlineObjects {
                 self.restyle_objects.remove(&object_id);
             }
         }
+        self.bump_revision(object_id);
         AiUpdateOutcome::Applied
     }
 
@@ -409,6 +432,7 @@ impl TerminalInlineObjects {
         let existed = self.objects.remove(&object_id).is_some();
         self.anchors.remove(&object_id);
         self.pending_rgp_payloads.remove(&object_id);
+        self.revisions.remove(&object_id);
         if existed {
             self.restyle_objects.remove(&object_id);
             // The id is no longer renderable, so the granular sync pass
@@ -477,6 +501,7 @@ impl TerminalInlineObjects {
                 self.objects
                     .insert(object_id, InlineObject::KittyImage(image.rasterize()));
                 self.dirty = true;
+                self.bump_revision(object_id);
                 (true, None)
             }
             KittyOperation::TransmitAndPlace {
@@ -570,6 +595,7 @@ impl TerminalInlineObjects {
                                     info!("registered RGP object {} from {}", object_id, source);
                                     self.objects.insert(object_id, source_data.into());
                                     self.dirty = true;
+                                    self.bump_revision(object_id);
                                     None
                                 }
                                 Err(error) => {
@@ -612,10 +638,12 @@ impl TerminalInlineObjects {
                 None
             }
             RgpOperation::Update { object_id, update } => {
+                let mut mutated = false;
                 if let Some(anchor) = self.anchors.get_mut(&object_id) {
                     let needs_rebuild = update.depth.is_some();
                     let needs_restyle = update.color.is_some() || update.brightness.is_some();
                     apply_rgp_update(&mut anchor.style, update);
+                    mutated = true;
                     if needs_rebuild || needs_restyle {
                         if !matches!(
                             self.objects.get(&object_id),
@@ -631,6 +659,9 @@ impl TerminalInlineObjects {
                             self.restyle_objects.remove(&object_id);
                         }
                     }
+                }
+                if mutated {
+                    self.bump_revision(object_id);
                 }
                 None
             }
@@ -682,6 +713,7 @@ impl TerminalInlineObjects {
         for object_id in overlapping_ids {
             self.objects.remove(&object_id);
             self.anchors.remove(&object_id);
+            self.revisions.remove(&object_id);
         }
     }
 
@@ -743,6 +775,7 @@ impl TerminalInlineObjects {
                 info!("registered RGP object {} from {}", object_id, source);
                 self.objects.insert(object_id, source_data.into());
                 self.dirty = true;
+                self.bump_revision(object_id);
                 None
             }
             Err(error) => {

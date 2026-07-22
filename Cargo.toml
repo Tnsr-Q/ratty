@@ -56,6 +56,7 @@ parley_ratatui = "0.3.4"
 ratatui = { version = "0.30", default-features = false }
 rust-embed = "8.5"
 serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 stl_io = "0.11.0"
 tobj = "4.0"
 toml = "0.8"
@@ -64,6 +65,9 @@ winit = { version = "0.30", default-features = false }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 arboard = { version = "3.6", features = ["wayland-data-control"] }
+# Session nonce entropy; same alias as the wasm entry below because cargo
+# rejects one crate under two names.
+getrandom03 = { package = "getrandom", version = "0.3" }
 bevy = { version = "0.19.0", default-features = false, features = [
     "multi_threaded",
     "wayland",
@@ -79,6 +83,9 @@ bevy = { version = "0.19.0", default-features = false, features = [
     "webgpu",
 ] }
 console_error_panic_hook = "0.1"
+# Promise/JSON/Reflect bindings for RattySession.query; already in the
+# tree transitively via Bevy's web stack, lockstep with wasm-bindgen.
+js-sys = "0.3"
 # Must match the wasm-bindgen-cli version used by site/build-wasm.sh.
 wasm-bindgen = "=0.2.118"
 # Web entropy backends for every getrandom major in the tree; 0.3+ also
