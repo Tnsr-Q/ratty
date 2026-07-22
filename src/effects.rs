@@ -321,7 +321,7 @@ fn apply_ai_effect_commands(
     mut redraw: ResMut<TerminalRedrawState>,
 ) {
     let mut changed = false;
-    for AiCommand(command) in commands.read() {
+    for AiCommand { command, .. } in commands.read() {
         match command {
             RattyAiCommand::Flash { color, duration } => {
                 effects.set_flash(parse_color(color), *duration);

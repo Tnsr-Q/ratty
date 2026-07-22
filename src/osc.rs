@@ -23,6 +23,24 @@ pub const RATTY_AI_OSC: &[u8] = b"777";
 /// Namespace prefix distinguishing ratty commands from other OSC 777 users.
 pub const RATTY_AI_PREFIX: &str = "ratty:";
 
+/// First id in the AI-owned object range (high bit set).
+///
+/// The object id space is partitioned: ids below this value belong to
+/// transmissions and system surfaces (RGP registrations, Kitty images); ids
+/// at or above it are owned by the AI channel and may only be created,
+/// updated, or removed through `object.*` commands.
+pub const AI_OBJECT_ID_MIN: u32 = 0x8000_0000;
+
+/// Bits of an AI-range id carrying the per-namespace object index. The seven
+/// bits between the high bit and the index hold the agent namespace.
+pub const AI_OBJECT_INDEX_BITS: u32 = 24;
+
+/// Extracts the agent namespace from an object id, or `None` when the id is
+/// outside the AI-owned range.
+pub fn ai_object_namespace(id: u32) -> Option<u8> {
+    (id >= AI_OBJECT_ID_MIN).then_some(((id >> AI_OBJECT_INDEX_BITS) & 0x7F) as u8)
+}
+
 /// A command parsed from an OSC 777 control sequence.
 ///
 /// Variants are grouped by subsystem. The first block is reachable today
@@ -41,9 +59,13 @@ pub enum RattyAiCommand {
         /// Warp intensity `0..=1`.
         intensity: f32,
     },
-    /// Spawn a 3D object from an asset path.
+    /// Spawn a 3D object from an embedded asset name.
     SpawnObject {
-        /// Asset path known to the terminal (or embedded name).
+        /// Caller-chosen object id; must lie in the AI-owned range
+        /// (see [`AI_OBJECT_ID_MIN`]) and the caller's namespace.
+        id: u32,
+        /// Embedded asset name (never a filesystem path; the wire is
+        /// untrusted).
         path: String,
         /// Anchor column.
         x: u16,
@@ -55,6 +77,9 @@ pub enum RattyAiCommand {
         spin: f32,
         /// Brightness multiplier.
         brightness: f32,
+        /// Replace an existing live object under the same id instead of
+        /// failing the spawn (ids are otherwise never reused in a session).
+        replace: bool,
     },
     /// Remove one placed object by id.
     RemoveObject {
@@ -428,12 +453,14 @@ pub fn parse_command(data: &str) -> Option<RattyAiCommand> {
             intensity: p.f32("intensity", 0.0),
         },
         "object.add" => RattyAiCommand::SpawnObject {
+            id: p.parse_req("id")?,
             path: p.string("path")?,
             x: p.u16("x", 0),
             y: p.u16("y", 0),
             scale: p.f32("scale", 1.0),
             spin: p.f32("spin", 0.0),
             brightness: p.f32("brightness", 1.0),
+            replace: p.flag("replace"),
         },
         "object.remove" => RattyAiCommand::RemoveObject {
             id: p.parse_req("id")?,
@@ -800,19 +827,33 @@ mod tests {
     }
 
     #[test]
-    fn object_add_fills_defaults_and_requires_path() {
+    fn object_add_fills_defaults_and_requires_id_and_path() {
         assert_eq!(
-            parse_command("ratty:object.add;path=rat.obj&x=10&y=5&spin=2.0"),
+            parse_command("ratty:object.add;id=2147483648&path=rat.obj&x=10&y=5&spin=2.0"),
             Some(RattyAiCommand::SpawnObject {
+                id: 0x8000_0000,
                 path: "rat.obj".to_string(),
                 x: 10,
                 y: 5,
                 scale: 1.0,
                 spin: 2.0,
                 brightness: 1.0,
+                replace: false,
             })
         );
-        assert!(parse_command("ratty:object.add;x=1").is_none());
+        // Missing path, then missing id: both required.
+        assert!(parse_command("ratty:object.add;id=2147483648&x=1").is_none());
+        assert!(parse_command("ratty:object.add;path=rat.obj").is_none());
+    }
+
+    #[test]
+    fn ai_object_ids_partition_by_namespace() {
+        assert_eq!(ai_object_namespace(0x8000_0001), Some(0));
+        assert_eq!(ai_object_namespace(0x8100_0000), Some(1));
+        assert_eq!(ai_object_namespace(0xFF00_0000), Some(0x7F));
+        // Below the AI range: transmission/system ids have no namespace.
+        assert_eq!(ai_object_namespace(0x7FFF_FFFF), None);
+        assert_eq!(ai_object_namespace(7), None);
     }
 
     #[test]
@@ -882,7 +923,7 @@ mod tests {
         let cases = [
             "ratty:mode;3d",
             "ratty:warp;intensity=0.3",
-            "ratty:object.add;path=a.obj",
+            "ratty:object.add;id=2147483648&path=a.obj",
             "ratty:object.remove;id=1",
             "ratty:object.clear",
             "ratty:object.update;id=1",
