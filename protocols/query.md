@@ -142,7 +142,10 @@ renderer's own rule: an anchored object whose rows intersect the grid.
 Distance is Euclidean between anchor centers, in cells; each item
 carries `distance`. Items stay id-sorted for stable pagination — sort by
 `distance` client-side for rank order. The center object itself is
-excluded.
+excluded. An object center must be caller-owned or currently visible:
+a hidden foreign id answers a flat `unknown-id` (its existence is not
+readable), while the caller's own scrolled-away object answers
+`no-anchor`.
 
 ### 6. `state.namespaces` — aggregate presence
 

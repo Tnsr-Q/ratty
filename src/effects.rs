@@ -324,7 +324,15 @@ impl Plugin for AiEffectsPlugin {
             .add_systems(Startup, setup_ai_effects)
             .add_systems(
                 Update,
-                (apply_ai_effect_commands, animate_ai_effects).chain(),
+                // Ordered after the pump like the other two AiCommand
+                // appliers, so a same-chunk effect-command-then-query
+                // observes the applied effect and its ack precedes the
+                // query reply (answer_queries orders after this system).
+                (
+                    apply_ai_effect_commands.after(crate::systems::pump_pty_output),
+                    animate_ai_effects,
+                )
+                    .chain(),
             );
     }
 }

@@ -40,6 +40,9 @@ use crate::scene::{StageTween, TerminalPlaneView, TerminalPlaneWarp, TerminalPre
 /// are dropped, mirroring the bounded-resource posture of the object caps).
 pub const MAX_DIAGNOSTICS_PER_NAMESPACE: usize = 32;
 
+/// Byte cap on one stored diagnostic message (see [`AiDiagnostics::record`]).
+pub const MAX_DIAGNOSTIC_MESSAGE_BYTES: usize = 256;
+
 /// JSON payload budget per reply, chosen so the framed, base64url-expanded
 /// sequence stays under [`query::MAX_REPLY_SEQUENCE_BYTES`].
 const REPLY_PAYLOAD_BUDGET: usize = 2700;
@@ -152,8 +155,21 @@ impl AiDiagnostics {
         namespace: u8,
         action: &'static str,
         code: &'static str,
-        message: String,
+        mut message: String,
     ) {
+        // Messages can embed wire-controlled strings (a bad mode tag, a
+        // bad asset name) that arrive with no length cap of their own.
+        // Truncating at the storage boundary bounds ring memory and
+        // guarantees every `state.errors` record fits a size-bounded
+        // reply page — an oversized record would otherwise poison the op.
+        if message.len() > MAX_DIAGNOSTIC_MESSAGE_BYTES {
+            let mut end = MAX_DIAGNOSTIC_MESSAGE_BYTES;
+            while !message.is_char_boundary(end) {
+                end -= 1;
+            }
+            message.truncate(end);
+            message.push('…');
+        }
         self.seq += 1;
         let ring = self.rings.entry(namespace).or_default();
         if ring.len() >= MAX_DIAGNOSTICS_PER_NAMESPACE {
@@ -367,7 +383,7 @@ fn answer(
         "state.scene" => Ok(scene_state(ctx)),
         "state.objects" => own_objects(ctx, source, &data),
         "state.visible_objects" => visible_objects(ctx, &data),
-        "state.neighbors" => neighbors(ctx, &data),
+        "state.neighbors" => neighbors(ctx, source, &data),
         "state.namespaces" => Ok(namespaces(ctx)),
         // The macro subsystem is M3.7; until it lands there are honestly
         // no macros and no executions. Never fabricate.
@@ -556,12 +572,17 @@ fn visible_objects(ctx: &QueryCtx<'_>, data: &Value) -> Result<Value, &'static s
 /// or object. Distance is Euclidean between anchor centers, in cells.
 /// Items are sorted by id (stable under pagination) and each carries its
 /// `distance`; clients sort by distance if they need rank order.
-fn neighbors(ctx: &QueryCtx<'_>, data: &Value) -> Result<Value, &'static str> {
+fn neighbors(
+    ctx: &QueryCtx<'_>,
+    source: IngressSource,
+    data: &Value,
+) -> Result<Value, &'static str> {
     let radius = data
         .get("radius")
         .and_then(Value::as_f64)
         .filter(|r| r.is_finite() && *r > 0.0 && *r <= 65_535.0)
         .ok_or(codes::BAD_PAYLOAD)?;
+    let (rows, _) = ctx.grid;
 
     let center = if let Some(center) = data.get("center") {
         let row = center
@@ -580,14 +601,25 @@ fn neighbors(ctx: &QueryCtx<'_>, data: &Value) -> Result<Value, &'static str> {
             .as_u64()
             .filter(|v| *v <= u64::from(u32::MAX))
             .ok_or(codes::BAD_PAYLOAD)? as u32;
-        if !ctx.inline_objects.objects.contains_key(&id) {
-            return Err(codes::UNKNOWN_ID);
+        // Read scope: the caller may center on its own objects in any
+        // state, but a foreign object's position is public only while it
+        // is visible — and a hidden foreign object's very existence is
+        // not readable, so anything else answers a flat unknown-id (never
+        // a distinguishable exists-but-hidden state).
+        let owned = ai_object_namespace(id) == Some(source.namespace());
+        let anchor = ctx.inline_objects.anchors.get(&id);
+        if owned {
+            if !ctx.inline_objects.objects.contains_key(&id) {
+                return Err(codes::UNKNOWN_ID);
+            }
+        } else {
+            let visible = ctx.inline_objects.objects.contains_key(&id)
+                && anchor.is_some_and(|anchor| anchor_visible(anchor, rows));
+            if !visible {
+                return Err(codes::UNKNOWN_ID);
+            }
         }
-        let anchor = ctx
-            .inline_objects
-            .anchors
-            .get(&id)
-            .ok_or(codes::NO_ANCHOR)?;
+        let anchor = anchor.ok_or(codes::NO_ANCHOR)?;
         (
             f64::from(anchor.row) + f64::from(anchor.rows) / 2.0,
             f64::from(anchor.col) + f64::from(anchor.columns) / 2.0,
@@ -598,7 +630,6 @@ fn neighbors(ctx: &QueryCtx<'_>, data: &Value) -> Result<Value, &'static str> {
     };
     let (center_row, center_col, center_id) = center;
 
-    let (rows, _) = ctx.grid;
     let mut items: Vec<(u64, Value)> = ctx
         .inline_objects
         .anchors
@@ -1092,6 +1123,71 @@ mod tests {
         let aggregate = payload(&reply);
         assert_eq!(aggregate["transmission"], json!(1));
         assert_eq!(aggregate["namespaces"], json!([{ "ns": 0, "objects": 2 }]));
+    }
+
+    #[test]
+    fn oversized_wire_strings_cannot_poison_the_error_ring() {
+        let (mut app, host) = test_app();
+        // A mode command whose positional is wire-controlled junk far over
+        // the diagnostic cap — the stored message must truncate so
+        // state.errors stays answerable. (SetMode is handled by
+        // apply_ai_commands, which this test app does not register, so
+        // record the rejection directly at the storage boundary.)
+        let junk = "x".repeat(4096);
+        app.world_mut().resource_mut::<AiDiagnostics>().record(
+            0,
+            "mode",
+            codes::BAD_MODE,
+            format!("unknown mode '{junk}'"),
+        );
+        let reply = run_query(&mut app, &host, "q1", "state.errors", None);
+        assert!(reply.ok, "the errors op survives an oversized message");
+        let page = payload(&reply);
+        let items = page["items"].as_array().expect("items");
+        assert_eq!(items.len(), 1);
+        let message = items[0]["message"].as_str().expect("message");
+        assert!(message.len() <= MAX_DIAGNOSTIC_MESSAGE_BYTES + '…'.len_utf8());
+        assert!(message.ends_with('…'));
+    }
+
+    #[test]
+    fn neighbors_center_scope_hides_foreign_hidden_objects() {
+        let (mut app, host) = test_app();
+        let foreign_id = 0x8100_0001; // namespace 1; the caller is namespace 0.
+        {
+            let mut inline = app.world_mut().resource_mut::<TerminalInlineObjects>();
+            let object = || {
+                InlineObject::RgpObject(RgpInlineObject::Gltf {
+                    asset_path: "objects/x.glb".into(),
+                    handle: None,
+                })
+            };
+            // A foreign object anchored far off-grid: exists, not visible.
+            inline.ai_insert_object(foreign_id, object(), 10, 500, InlineStyle::default());
+            // The caller's own off-grid object.
+            inline.ai_insert_object(ID, object(), 10, 500, InlineStyle::default());
+        }
+        // Foreign + hidden and foreign + never-existed are indistinguishable.
+        for (token, id) in [("q1", u64::from(foreign_id)), ("q2", 0x8100_0002_u64)] {
+            let reply = run_query(
+                &mut app,
+                &host,
+                token,
+                "state.neighbors",
+                Some(json!({ "object": id, "radius": 5 })),
+            );
+            assert!(!reply.ok);
+            assert_eq!(reply.code.as_deref(), Some(codes::UNKNOWN_ID));
+        }
+        // The caller's own hidden-but-anchored object is a usable center.
+        let reply = run_query(
+            &mut app,
+            &host,
+            "q3",
+            "state.neighbors",
+            Some(json!({ "object": ID, "radius": 5 })),
+        );
+        assert!(reply.ok, "own objects may center a neighbors query");
     }
 
     #[test]

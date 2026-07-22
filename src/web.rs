@@ -188,6 +188,14 @@ impl RattySession {
     /// `query()` adds no authority: session identity, namespace scope,
     /// projection rules, and size limits apply exactly as on the wire.
     pub fn query(&self, op: &str, data: JsValue, timeout_ms: f64) -> Promise {
+        // Bad arguments never reach the wire: a `;` would inject envelope
+        // fields into the strict-ASCII envelope.
+        if !crate::query::valid_op(op) {
+            return Promise::reject(&query_error(
+                crate::query::codes::BAD_PAYLOAD,
+                "op must be non-empty printable ASCII without ';'",
+            ));
+        }
         let data_json = if data.is_undefined() || data.is_null() {
             None
         } else {

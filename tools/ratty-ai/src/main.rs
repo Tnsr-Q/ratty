@@ -1028,6 +1028,16 @@ fn run_query(
     data_file: Option<&str>,
     pretty: bool,
 ) -> ExitCode {
+    // Bad arguments never reach the wire: a `;` would inject envelope
+    // fields, non-printable bytes would break the strict-ASCII envelope.
+    if !query::valid_op(op) {
+        emit_failure(
+            cli.json,
+            "bad-input",
+            "op must be non-empty printable ASCII without ';'",
+        );
+        return exit_codes::bad_input();
+    }
     let data_text = match (data, data_file) {
         (Some(inline), _) => Some(inline.to_string()),
         (None, Some("-")) => {

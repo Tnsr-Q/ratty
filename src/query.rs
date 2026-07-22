@@ -26,8 +26,14 @@ pub const RATTY_QUERY_OSC: &[u8] = b"778";
 /// Envelope protocol version emitted and accepted by this build.
 pub const QUERY_VERSION: &str = "1";
 
-/// Upper bound on a whole inbound OSC 778 sequence. vt100's parser buffers
-/// OSC strings without a size cap, so the bound is enforced here, at parse.
+/// Upper bound on a *terminated* inbound OSC 778 sequence that the
+/// terminal will accept and decode; anything larger answers `too-large`.
+///
+/// This is an acceptance bound, not a memory bound: vt100/vte (with the
+/// default `std` feature) buffers OSC bytes without a size cap *before*
+/// dispatching them, so a hostile never-terminated OSC still accumulates
+/// upstream of this check. A stream-level OSC watchdog is a separate,
+/// protocol-wide concern.
 pub const MAX_QUERY_SEQUENCE_BYTES: usize = 8 * 1024;
 
 /// Upper bound on a decoded query `data=` payload.
@@ -93,6 +99,18 @@ pub mod codes {
 /// [`MAX_TOKEN_BYTES`] characters of the base64url alphabet.
 pub fn valid_token(token: &str) -> bool {
     !token.is_empty() && token.len() <= MAX_TOKEN_BYTES && token.bytes().all(is_b64url_byte)
+}
+
+/// Returns whether `op` may be spliced into a query envelope: non-empty
+/// printable ASCII with no `;` (which would inject envelope fields) and
+/// no `=` ambiguity in the leading position. Clients check this before
+/// emitting so garbage never reaches the wire.
+pub fn valid_op(op: &str) -> bool {
+    !op.is_empty()
+        && !op.starts_with('=')
+        && op
+            .bytes()
+            .all(|byte| byte.is_ascii_graphic() && byte != b';')
 }
 
 fn is_b64url_byte(byte: u8) -> bool {
@@ -499,6 +517,17 @@ mod tests {
         assert_eq!(b64url_decode("Zg=", 64), Err(B64DecodeError::BadChar));
         assert_eq!(b64url_decode("Zm9v", 2), Err(B64DecodeError::TooLarge));
         assert_eq!(b64url_decode("Zm;v", 64), Err(B64DecodeError::BadChar));
+    }
+
+    #[test]
+    fn ops_are_printable_ascii_without_field_injection() {
+        assert!(valid_op("state.visible_objects"));
+        assert!(valid_op("caps"));
+        assert!(!valid_op(""));
+        assert!(!valid_op("state.scene;t=r"));
+        assert!(!valid_op("state scene"));
+        assert!(!valid_op("=oops"));
+        assert!(!valid_op("op\x07"));
     }
 
     #[test]
