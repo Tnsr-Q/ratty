@@ -308,9 +308,14 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum ObjectAction {
-    /// Place an object from an asset path.
+    /// Place an object from an embedded asset name.
     Add {
-        /// Asset path.
+        /// Object id (decimal). Must lie in the AI-owned range — ids from
+        /// 2147483648 (the high bit) upward — within the caller's namespace.
+        #[arg(long)]
+        id: u32,
+        /// Embedded asset name (wire commands never resolve filesystem
+        /// paths).
         #[arg(short, long)]
         path: String,
         /// Anchor column.
@@ -328,6 +333,10 @@ enum ObjectAction {
         /// Brightness.
         #[arg(long, default_value = "1.0")]
         brightness: f32,
+        /// Replace a live object under the same id (ids are otherwise never
+        /// reused within a session).
+        #[arg(long)]
+        replace: bool,
     },
     /// Remove an object by id.
     Remove {
@@ -535,20 +544,24 @@ fn command_to_osc(command: &Commands, stdin: &str) -> (String, String) {
     match command {
         Commands::Object(action) => match action {
             ObjectAction::Add {
+                id,
                 path,
                 x,
                 y,
                 scale,
                 spin,
                 brightness,
+                replace,
             } => (
                 "object.add".into(),
-                p().field("path", path)
+                p().field("id", id)
+                    .field("path", path)
                     .field("x", x)
                     .field("y", y)
                     .field("scale", scale)
                     .field("spin", spin)
                     .field("brightness", brightness)
+                    .opt("replace", replace.then_some("true"))
                     .build(),
             ),
             ObjectAction::Remove { id } => ("object.remove".into(), p().field("id", id).build()),
@@ -903,24 +916,47 @@ mod tests {
     #[test]
     fn object_add_round_trips_with_defaults() {
         let command = Commands::Object(ObjectAction::Add {
+            id: 0x8000_0001,
             path: "rat.obj".into(),
             x: 10,
             y: 5,
             scale: 1.5,
             spin: 2.0,
             brightness: 1.0,
+            replace: false,
         });
         assert_eq!(
             round_trip(&command, ""),
             RattyAiCommand::SpawnObject {
+                id: 0x8000_0001,
                 path: "rat.obj".into(),
                 x: 10,
                 y: 5,
                 scale: 1.5,
                 spin: 2.0,
                 brightness: 1.0,
+                replace: false,
             }
         );
+    }
+
+    #[test]
+    fn object_add_replace_flag_round_trips() {
+        let command = Commands::Object(ObjectAction::Add {
+            id: 0x8000_0002,
+            path: "rat.obj".into(),
+            x: 0,
+            y: 0,
+            scale: 1.0,
+            spin: 0.0,
+            brightness: 1.0,
+            replace: true,
+        });
+        let RattyAiCommand::SpawnObject { id, replace, .. } = round_trip(&command, "") else {
+            panic!("expected SpawnObject");
+        };
+        assert_eq!(id, 0x8000_0002);
+        assert!(replace);
     }
 
     #[test]

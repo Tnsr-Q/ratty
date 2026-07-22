@@ -2,7 +2,6 @@
 
 use bevy::prelude::*;
 
-use crate::config::AppConfig;
 use crate::direct_render::DirectTerminalRenderPlugin;
 use crate::inline::{
     TerminalInlineObjectPlane, TerminalInlineObjectSprite, TerminalInlineObjects, TerminalRgpObject,
@@ -41,6 +40,7 @@ pub struct TerminalPlugin;
 impl Plugin for TerminalPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<TerminalSelection>()
+            .init_resource::<crate::model::CursorSettings>()
             .init_resource::<TerminalInlineObjects>()
             .init_resource::<TerminalRedrawState>()
             .init_resource::<TerminalKeyBindings>()
@@ -154,9 +154,19 @@ impl Plugin for TerminalPlugin {
             )
             .add_systems(
                 Update,
-                sync_asset_to_terminal_cursor
-                    .after(TerminalRedrawSet)
-                    .run_if(|config: Res<AppConfig>| config.cursor.model.visible),
+                sync_asset_to_terminal_cursor.after(TerminalRedrawSet),
+            )
+            .add_systems(
+                Update,
+                // After the AI lowering so a `cursor` command's model swap
+                // rebuilds the same frame; after the initial deferred spawn
+                // so its commands are flushed before this system's query
+                // runs (else a same-frame swap spawns a second cursor tree);
+                // before the pose sync so the new tree is positioned at once.
+                crate::systems::respawn_cursor_model
+                    .after(crate::ai::apply_ai_object_commands)
+                    .after(finish_terminal_model_load)
+                    .before(sync_asset_to_terminal_cursor),
             )
             .add_systems(Last, shutdown_terminal_runtime_on_exit)
             .add_plugins(crate::ai::RattyAiPlugin)
