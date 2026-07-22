@@ -34,8 +34,9 @@ pub const QUERY_VERSION: &str = "1";
 /// `crate::inline`, which caps how many bytes of any single OSC sequence
 /// reach vte's unbounded `std` buffer; that cap sits above this one so a
 /// valid-but-oversized query still reaches this check and is answered
-/// `too-large` rather than truncated. (The APC channel accumulates through
-/// a different path and is bounded — or not — independently.)
+/// `too-large` rather than truncated. The APC channel accumulates through
+/// a different path and is bounded independently, by
+/// `inline::MAX_APC_SEQUENCE_BYTES`.
 pub const MAX_QUERY_SEQUENCE_BYTES: usize = 8 * 1024;
 
 /// Upper bound on a decoded query `data=` payload.

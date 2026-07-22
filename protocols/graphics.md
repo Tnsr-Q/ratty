@@ -161,6 +161,17 @@ The terminal accumulates chunks for the same `id` until it receives the final
 `more=0` chunk. At that point, the object becomes registered and can be placed
 normally.
 
+Limits (terminal output is untrusted, so both the sequences and the
+accumulator behind them are bounded):
+
+- A single APC sequence must terminate within 8 MiB. One that does not is
+  treated as malformed: it is discarded and parsing resumes at its `ESC \`.
+  Chunked registration is what keeps real payloads far below this — ratty's
+  own encoder splits at 3072 base64 characters per sequence (~3.2 KiB).
+- In-flight chunk runs are capped at 64 MiB combined (decoded) across at
+  most 256 concurrent `id`s. A run that would exceed either cap is dropped
+  and never finalizes, so it must be resent.
+
 Path-based and payload-based registration are additive modes of the same `r` verb.
 Clients may continue using `path=...` exactly as before.
 
