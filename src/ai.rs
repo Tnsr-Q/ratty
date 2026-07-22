@@ -27,7 +27,8 @@ use bevy::prelude::*;
 use crate::config::AppConfig;
 use crate::inline::{AiUpdateOutcome, InlineStyle, TerminalInlineObjects};
 use crate::model::{
-    CursorModelChoice, CursorSettings, embedded_object_loadable, load_embedded_object_source,
+    CursorModelChoice, CursorSettings, ObjectLoadOptions, embedded_object_loadable,
+    load_embedded_object_source,
 };
 use crate::osc::{RattyAiCommand, ai_object_namespace};
 use crate::runtime::IngressSource;
@@ -242,7 +243,7 @@ pub fn apply_ai_object_commands(
                         continue;
                     }
                 }
-                let object = match load_embedded_object_source(path) {
+                let object = match load_embedded_object_source(path, ObjectLoadOptions::default()) {
                     Ok((source_name, object_source)) => {
                         info!("ratty-ai: object.add {id:#010x} loaded {source_name}");
                         object_source.into()
