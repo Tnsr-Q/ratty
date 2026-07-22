@@ -340,6 +340,62 @@ pub fn load_object_source_with_options(
     }
 }
 
+/// Loads an object source from the embedded asset registry only.
+///
+/// This is the resolution rule for untrusted wire input — specifically the
+/// RGP `path=` register source. A name resolves against ratty-embedded
+/// assets and nothing else; the filesystem is never consulted. Any program
+/// printing to the terminal can emit escape sequences, so it must not be
+/// able to make ratty read an arbitrary file from disk. Content-addressed
+/// runtime assets travel through the RGP *payload* register instead.
+///
+/// Only the bare file name is honored, so path components (`..`, absolute
+/// roots) cannot escape the registry: a name that is not an embedded asset
+/// fails explicitly rather than falling back to disk.
+///
+/// # Errors
+///
+/// Returns an error when the name does not resolve to an embedded asset,
+/// the format is unsupported on this target, or the asset fails to parse.
+pub fn load_embedded_object_source(
+    name: &str,
+    options: ObjectLoadOptions,
+) -> anyhow::Result<(String, ObjectSource)> {
+    let file_name = Path::new(name)
+        .file_name()
+        .and_then(|file_name| file_name.to_str())
+        .with_context(|| format!("invalid embedded asset name {name}"))?;
+    let Some(file) = EmbeddedObjects::get(file_name) else {
+        bail!(
+            "asset {file_name} is not an embedded ratty asset (wire registers resolve embedded names only)"
+        );
+    };
+    let extension = Path::new(file_name)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase())
+        .unwrap_or_default();
+    let source = format!("embedded:{file_name}");
+    match extension.as_str() {
+        "stl" => {
+            load_stl_meshes_from_bytes(&file.data).map(|mesh| (source, ObjectSource::Stl(mesh)))
+        }
+        "obj" => load_obj_meshes_from_bytes(file_name, &file.data, options.normalize)
+            .map(|meshes| (source, ObjectSource::Obj(meshes))),
+        #[cfg(not(target_arch = "wasm32"))]
+        "glb" | "gltf" => {
+            // Reconstruct the staged path from the validated bare name so the
+            // write target can never contain traversal components.
+            let candidate = format!("objects/{file_name}");
+            let asset_path = ensure_scene_asset_path(&candidate, Some((file_name, &file.data)))?;
+            Ok((source, ObjectSource::Gltf(asset_path)))
+        }
+        #[cfg(target_arch = "wasm32")]
+        "glb" | "gltf" => bail!("format {extension} is not supported in the web build yet"),
+        _ => bail!("unsupported object format for {file_name}"),
+    }
+}
+
 /// Loads an object source from inline bytes.
 ///
 /// # Errors
