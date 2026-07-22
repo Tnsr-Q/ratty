@@ -95,6 +95,9 @@ pub struct TerminalInlineObjects {
     revisions: HashMap<u32, u64>,
     mutation_seq: u64,
     osc_guard: OscGuard,
+    /// Set while swallowing the remainder of an APC that overran
+    /// [`MAX_APC_SEQUENCE_BYTES`]; persists across chunks.
+    apc_discarding: bool,
 }
 
 /// Upper bound on the payload of a single OSC sequence that reaches the
@@ -112,6 +115,47 @@ const MAX_OSC_SEQUENCE_BYTES: usize = 64 * 1024;
 // The watchdog cap must never sit below the query-acceptance bound, or a
 // valid-but-large 778 query would be truncated before it could be parsed.
 const _: () = assert!(MAX_OSC_SEQUENCE_BYTES >= crate::query::MAX_QUERY_SEQUENCE_BYTES);
+
+/// Upper bound on a single *unterminated* APC sequence held in
+/// `pending_bytes` while waiting for its `ESC \` terminator.
+///
+/// The APC sibling of [`MAX_OSC_SEQUENCE_BYTES`]: OSC payloads accumulate
+/// inside vte, APC payloads accumulate here. An APC that never terminates
+/// would otherwise be retained in full and re-extended by every following
+/// PTY read (`cat` of a hostile file emitting `ESC _ ratty;g;` and then
+/// gigabytes), growing `pending_bytes` without bound.
+///
+/// Sized well above anything legitimate. The canonical encoder
+/// (`RattyGraphic::register_payload_sequences_with_name`) splits asset
+/// payloads at `PAYLOAD_CHUNK_SIZE` = 3072 base64 characters per sequence,
+/// so the largest single APC ratty's own tooling emits is ~3.2 KiB —
+/// measured across every shipped transmission, the real maximum is 3157
+/// bytes. Chunked RGP registrations are *many individually terminated*
+/// APCs (the `more=1` flag in [`crate::rgp`]), never one enormous one, so
+/// no legitimate single sequence approaches this cap. The headroom covers
+/// unchunked Kitty graphics transmissions, which carry a whole image in
+/// one APC: 8 MiB still exceeds the base64 of the largest asset shipped
+/// here (`assets/objects/SpinyMouse.glb`, 1.68 MB → 2.25 MB encoded).
+const MAX_APC_SEQUENCE_BYTES: usize = 8 * 1024 * 1024;
+
+/// Upper bound on the combined size of all in-flight chunked RGP payloads
+/// ([`TerminalInlineObjects::handle_rgp_payload_chunk`]).
+///
+/// [`MAX_APC_SEQUENCE_BYTES`] cannot bound this: every chunk in a run is a
+/// well-formed, individually terminated APC that passes the per-sequence
+/// cap, while the *accumulator* they feed grows with the run. Both the
+/// length of a run (`more=1` forever) and the number of concurrent runs
+/// (a fresh `id=` each time) are attacker-chosen, so one budget spans the
+/// whole in-flight set rather than each object.
+///
+/// Decoded bytes, not base64 — 38x the largest asset shipped here
+/// (`assets/objects/SpinyMouse.glb`, 1.68 MB).
+const MAX_PENDING_RGP_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
+
+/// Upper bound on the number of concurrent chunked RGP payload runs, so a
+/// stream of distinct `id=`s cannot grow the map itself without bound even
+/// while each run stays tiny.
+const MAX_PENDING_RGP_PAYLOADS: usize = 256;
 
 /// Streaming guard that bounds how many bytes of a single OSC sequence
 /// reach the vt100 parser.
@@ -273,6 +317,14 @@ impl TerminalInlineObjects {
         // out of this function restores it.
         let mut osc_guard = std::mem::take(&mut self.osc_guard);
 
+        // An earlier chunk overran the APC cap: keep swallowing bytes until
+        // this sequence's terminator, so its tail is never mistaken for
+        // text and printed to the screen.
+        if self.apc_discarding && !self.resync_after_overlong_apc() {
+            self.osc_guard = osc_guard;
+            return replies;
+        }
+
         let mut cursor = 0;
         loop {
             let Some(start_offset) = self.pending_bytes[cursor..]
@@ -305,7 +357,17 @@ impl TerminalInlineObjects {
 
             let payload_start = start + APC_START.len();
             let Some(end) = apc_end(&self.pending_bytes, payload_start) else {
+                // Retain the in-progress APC so a later chunk can complete
+                // it — but never past the cap, or a never-terminated
+                // sequence grows this buffer by every following PTY read.
                 self.pending_bytes.drain(..start);
+                if self.pending_bytes.len() > MAX_APC_SEQUENCE_BYTES {
+                    warn!(
+                        "discarding a malformed APC sequence: unterminated past {MAX_APC_SEQUENCE_BYTES} bytes"
+                    );
+                    self.apc_discarding = true;
+                    self.resync_after_overlong_apc();
+                }
                 self.osc_guard = osc_guard;
                 return replies;
             };
@@ -322,6 +384,27 @@ impl TerminalInlineObjects {
         }
     }
 
+    /// Advances past an APC that overran [`MAX_APC_SEQUENCE_BYTES`] and is
+    /// being discarded.
+    ///
+    /// Returns whether the sequence's terminator was found and dropped, so
+    /// normal parsing can resume. When it was not, the buffer is emptied
+    /// bar a trailing lone `ESC` — which may be the first half of an
+    /// `ESC \` terminator split across two PTY reads — and discarding
+    /// continues into the next chunk.
+    fn resync_after_overlong_apc(&mut self) -> bool {
+        if let Some(end) = apc_end(&self.pending_bytes, 0) {
+            self.pending_bytes.drain(..end);
+            self.apc_discarding = false;
+            true
+        } else {
+            let keep = usize::from(self.pending_bytes.last() == Some(&ST[0]));
+            let drop_to = self.pending_bytes.len() - keep;
+            self.pending_bytes.drain(..drop_to);
+            false
+        }
+    }
+
     /// Test-only view of the OSC watchdog's engagement after a
     /// [`Self::consume_pty_output`] call.
     #[cfg(test)]
@@ -329,6 +412,26 @@ impl TerminalInlineObjects {
         (
             self.osc_guard.state == OscGuardState::OscDropping,
             self.osc_guard.osc_len,
+        )
+    }
+
+    /// Test-only view of the APC accumulator: retained bytes and whether
+    /// an over-long sequence is being discarded.
+    #[cfg(test)]
+    pub(crate) fn apc_buffer_state(&self) -> (usize, bool) {
+        (self.pending_bytes.len(), self.apc_discarding)
+    }
+
+    /// Test-only view of the in-flight chunked RGP payload accumulator:
+    /// run count and combined decoded bytes.
+    #[cfg(test)]
+    pub(crate) fn pending_rgp_payload_state(&self) -> (usize, usize) {
+        (
+            self.pending_rgp_payloads.len(),
+            self.pending_rgp_payloads
+                .values()
+                .map(|pending| pending.data.len())
+                .sum(),
         )
     }
 
@@ -910,6 +1013,38 @@ impl TerminalInlineObjects {
         data: Vec<u8>,
         options: ObjectLoadOptions,
     ) -> Option<Vec<u8>> {
+        // Every chunk in a run is its own terminated APC, so the
+        // per-sequence cap never sees this accumulator grow. Bound the
+        // whole in-flight set here instead: first the number of concurrent
+        // runs, then their combined size. The sum walks at most
+        // `MAX_PENDING_RGP_PAYLOADS` entries per ~3 KiB chunk, which is
+        // cheaper than keeping a running total correct across every
+        // insertion, finalization, and removal path.
+        if self.pending_rgp_payloads.len() >= MAX_PENDING_RGP_PAYLOADS
+            && !self.pending_rgp_payloads.contains_key(&object_id)
+        {
+            warn!(
+                "ignoring RGP payload chunk for object {object_id}: \
+                 {MAX_PENDING_RGP_PAYLOADS} chunk runs are already in flight"
+            );
+            return None;
+        }
+        let in_flight: usize = self
+            .pending_rgp_payloads
+            .values()
+            .map(|pending| pending.data.len())
+            .sum();
+        if in_flight.saturating_add(data.len()) > MAX_PENDING_RGP_PAYLOAD_BYTES {
+            warn!(
+                "dropping the RGP payload chunk run for object {object_id}: in-flight \
+                 payloads would exceed {MAX_PENDING_RGP_PAYLOAD_BYTES} bytes"
+            );
+            // The run can never finalize correctly now, so free it rather
+            // than leaving it pinning the budget.
+            self.pending_rgp_payloads.remove(&object_id);
+            return None;
+        }
+
         let pending = self
             .pending_rgp_payloads
             .entry(object_id)
@@ -1826,5 +1961,168 @@ mod tests {
         // proving the forwarded terminator kept vte's parser in sync.
         inline.consume_pty_output(b"\x07hello", &mut parser);
         assert!(parser.screen().contents().contains("hello"));
+    }
+
+    fn test_parser() -> vt100::Parser<crate::runtime::TerminalParserCallbacks> {
+        vt100::Parser::new_with_callbacks(
+            4,
+            40,
+            0,
+            crate::runtime::TerminalParserCallbacks::default(),
+        )
+    }
+
+    #[test]
+    fn unterminated_apc_stays_bounded_across_chunks() {
+        let mut parser = test_parser();
+        let mut inline = TerminalInlineObjects::default();
+
+        // An RGP register that opens and then never terminates, arriving in
+        // realistic 64 KiB PTY reads until it is well past the cap.
+        let mut first = b"\x1b_ratty;g;r;id=1;fmt=obj;source=payload;more=0;".to_vec();
+        first.resize(64 * 1024, b'A');
+        inline.consume_pty_output(&first, &mut parser);
+        for _ in 0..192 {
+            inline.consume_pty_output(&vec![b'A'; 64 * 1024], &mut parser);
+            let (buffered, _) = inline.apc_buffer_state();
+            assert!(
+                buffered <= MAX_APC_SEQUENCE_BYTES + 64 * 1024,
+                "the APC accumulator grew to {buffered} bytes, past the cap",
+            );
+        }
+
+        // 12 MiB in: the cap engaged and the buffer collapsed to (at most)
+        // the retained terminator prefix, rather than holding the stream.
+        let (buffered, discarding) = inline.apc_buffer_state();
+        assert!(discarding, "the over-long APC is being discarded");
+        assert!(
+            buffered <= 1,
+            "a discarded APC retains at most a split terminator, held {buffered} bytes",
+        );
+    }
+
+    #[test]
+    fn discarded_apc_resyncs_at_its_terminator() {
+        let mut parser = test_parser();
+        let mut inline = TerminalInlineObjects::default();
+
+        let mut seq = b"\x1b_ratty;g;r;id=1;fmt=obj;source=payload;more=0;".to_vec();
+        seq.resize(MAX_APC_SEQUENCE_BYTES + 4096, b'A');
+        inline.consume_pty_output(&seq, &mut parser);
+        assert!(inline.apc_buffer_state().1, "the guard engaged");
+
+        // The tail of the discarded APC must not reach the screen as text,
+        // even though it is plain printable base64.
+        inline.consume_pty_output(b"AAAAAAAA", &mut parser);
+        assert!(!parser.screen().contents().contains("AAAA"));
+
+        // Its terminator ends the discard; following output parses normally.
+        inline.consume_pty_output(b"\x1b\\hello", &mut parser);
+        let (buffered, discarding) = inline.apc_buffer_state();
+        assert!(!discarding, "the terminator resynced the parser");
+        assert_eq!(buffered, 0, "the buffer drained past the terminator");
+        assert!(parser.screen().contents().contains("hello"));
+    }
+
+    #[test]
+    fn discarded_apc_resyncs_on_a_split_terminator() {
+        let mut parser = test_parser();
+        let mut inline = TerminalInlineObjects::default();
+
+        let mut seq = b"\x1b_ratty;g;".to_vec();
+        seq.resize(MAX_APC_SEQUENCE_BYTES + 16, b'A');
+        inline.consume_pty_output(&seq, &mut parser);
+        assert!(inline.apc_buffer_state().1);
+
+        // `ESC \` arriving split across two PTY reads must still terminate
+        // the discard — the lone ESC has to survive the buffer purge.
+        inline.consume_pty_output(b"\x1b", &mut parser);
+        assert!(inline.apc_buffer_state().1, "still awaiting the ST");
+        inline.consume_pty_output(b"\\hello", &mut parser);
+        assert!(!inline.apc_buffer_state().1, "the split ST resynced");
+        assert!(parser.screen().contents().contains("hello"));
+    }
+
+    #[test]
+    fn large_terminated_rgp_register_still_parses() {
+        let mut parser = test_parser();
+        let mut inline = TerminalInlineObjects::default();
+
+        // A single terminated APC far larger than anything ratty's own
+        // encoder emits (PAYLOAD_CHUNK_SIZE is 3072 base64 chars, and the
+        // largest sequence across all shipped transmissions is 3157 bytes)
+        // but under the cap: it must be consumed whole, not truncated.
+        let payload = "A".repeat(MAX_APC_SEQUENCE_BYTES / 2);
+        let sequence = format!(
+            "\x1b_ratty;g;r;id=7;fmt=obj;source=payload;more=1;name=big.obj;{payload}\x1b\\"
+        );
+        let bytes = sequence.into_bytes();
+        assert!(bytes.len() > 4 * 1024 * 1024);
+
+        // Delivered in 64 KiB PTY reads, the way a real stream arrives.
+        for chunk in bytes.chunks(64 * 1024) {
+            inline.consume_pty_output(chunk, &mut parser);
+        }
+
+        let (buffered, discarding) = inline.apc_buffer_state();
+        assert!(
+            !discarding,
+            "a terminated sequence under the cap is not discarded"
+        );
+        assert_eq!(buffered, 0, "the whole sequence was consumed");
+        // It reached the RGP payload accumulator intact rather than being
+        // truncated or printed: `more=1` leaves the run open.
+        let (runs, accumulated) = inline.pending_rgp_payload_state();
+        assert_eq!(runs, 1, "the register opened a chunk run");
+        assert!(
+            accumulated >= 3 * 1024 * 1024,
+            "decoded {accumulated} bytes"
+        );
+        assert!(
+            !parser.screen().contents().contains("AAAA"),
+            "a handled APC must never be echoed as text"
+        );
+    }
+
+    #[test]
+    fn one_rgp_payload_run_cannot_grow_without_bound() {
+        let mut parser = test_parser();
+        let mut inline = TerminalInlineObjects::default();
+
+        // Every chunk here is a well-formed, individually terminated APC,
+        // so MAX_APC_SEQUENCE_BYTES never sees it — only the accumulator
+        // budget stops the run.
+        let chunk = "A".repeat(4 * 1024 * 1024); // 3 MiB decoded per chunk
+        let sequence =
+            format!("\x1b_ratty;g;r;id=1;fmt=obj;source=payload;more=1;name=t.obj;{chunk}\x1b\\")
+                .into_bytes();
+        for _ in 0..32 {
+            inline.consume_pty_output(&sequence, &mut parser);
+            let (_, accumulated) = inline.pending_rgp_payload_state();
+            assert!(
+                accumulated <= MAX_PENDING_RGP_PAYLOAD_BYTES,
+                "in-flight payloads reached {accumulated} bytes, past the cap",
+            );
+        }
+    }
+
+    #[test]
+    fn concurrent_rgp_payload_runs_stay_bounded() {
+        let mut parser = test_parser();
+        let mut inline = TerminalInlineObjects::default();
+
+        // A fresh id per chunk grows the map, not any single run.
+        for id in 0..(MAX_PENDING_RGP_PAYLOADS as u32 * 4) {
+            let sequence = format!(
+                "\x1b_ratty;g;r;id={id};fmt=obj;source=payload;more=1;name=t.obj;QUFB\x1b\\"
+            );
+            inline.consume_pty_output(sequence.as_bytes(), &mut parser);
+        }
+
+        let (runs, _) = inline.pending_rgp_payload_state();
+        assert!(
+            runs <= MAX_PENDING_RGP_PAYLOADS,
+            "{runs} concurrent chunk runs are in flight, past the cap",
+        );
     }
 }
