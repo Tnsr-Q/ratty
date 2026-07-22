@@ -14,6 +14,13 @@
 //! through vt100's `Callbacks::unhandled_osc`, which delivers the
 //! `;`-split params with `params[0] == b"777"`.
 //!
+//! Any command may opt into a delivery ack by adding a `tok=<token>`
+//! payload key: the terminal replies over OSC 778 (`t=r;kind=ack`) once
+//! the command is rejected or its immediate state mutation commits. (The
+//! query-channel design named this key `id=`, but `id=` is already the
+//! object id on every `object.*` command, so the ack key is `tok=`.)
+//! Commands without `tok=` stay fire-and-forget.
+//!
 //! This module is dependency-free (std only) so the `ratty-ai` CLI can
 //! include it verbatim, the same way `tools/silk` includes `rgp.rs` — the
 //! parser can then never drift from the terminal's real behavior.
@@ -22,6 +29,8 @@
 pub const RATTY_AI_OSC: &[u8] = b"777";
 /// Namespace prefix distinguishing ratty commands from other OSC 777 users.
 pub const RATTY_AI_PREFIX: &str = "ratty:";
+/// Reserved payload key carrying the optional ack correlation token.
+pub const ACK_TOKEN_KEY: &str = "tok";
 
 /// First id in the AI-owned object range (high bit set).
 ///
@@ -415,11 +424,32 @@ pub enum RattyAiCommand {
     },
 }
 
+/// A `ratty:`-namespaced OSC 777 sequence parsed at terminal ingress.
+///
+/// `command` is `None` when the sequence claimed the namespace but did not
+/// parse into a command (unknown action, missing required key). The ack
+/// token is extracted at the envelope layer, *before* command parsing can
+/// fail, so a malformed command that opted in still gets its error ack.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AiControl {
+    /// The parsed command, when the sequence parsed.
+    pub command: Option<RattyAiCommand>,
+    /// The `tok=` ack opt-in token, when present and valid.
+    pub ack_token: Option<String>,
+}
+
 /// Parses an OSC sequence delivered by vt100 as `;`-split params.
 ///
 /// Returns `None` for any OSC not claiming code `777` with the `ratty:`
 /// namespace, so unrelated OSC 777 users pass through untouched.
 pub fn parse_osc(params: &[&[u8]]) -> Option<RattyAiCommand> {
+    parse_osc_control(params)?.command
+}
+
+/// Parses an OSC sequence delivered by vt100 as `;`-split params, keeping
+/// the ack token even when the command itself fails to parse. This is the
+/// terminal's ingress entry point; [`parse_osc`] is the command-only view.
+pub fn parse_osc_control(params: &[&[u8]]) -> Option<AiControl> {
     let first = params.first()?;
     if *first != RATTY_AI_OSC {
         return None;
@@ -433,17 +463,36 @@ pub fn parse_osc(params: &[&[u8]]) -> Option<RattyAiCommand> {
         .map(|p| String::from_utf8_lossy(p).into_owned())
         .collect::<Vec<_>>()
         .join(";");
-    parse_command(&joined)
+    parse_control(&joined)
 }
 
 /// Parses the post-`777;` command string (`ratty:<action>;<payload>`).
 ///
 /// Exposed for the CLI and tests; [`parse_osc`] is the terminal entry point.
 pub fn parse_command(data: &str) -> Option<RattyAiCommand> {
+    parse_control(data)?.command
+}
+
+/// Parses the post-`777;` command string, separating the ack opt-in token
+/// from the command so envelope-level failures can still be acked.
+pub fn parse_control(data: &str) -> Option<AiControl> {
     let rest = data.strip_prefix(RATTY_AI_PREFIX)?;
     let (action, payload) = rest.split_once(';').unwrap_or((rest, ""));
     let p = Payload::parse(payload);
+    let ack_token = p.string(ACK_TOKEN_KEY).filter(|token| {
+        !token.is_empty()
+            && token.len() <= 64
+            && token
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    });
+    Some(AiControl {
+        command: parse_action(action, &p),
+        ack_token,
+    })
+}
 
+fn parse_action(action: &str, p: &Payload) -> Option<RattyAiCommand> {
     Some(match action {
         // Presentation & objects
         "mode" => RattyAiCommand::SetMode {
@@ -915,6 +964,49 @@ mod tests {
     #[test]
     fn unknown_action_is_none() {
         assert!(parse_command("ratty:teleport;x=1").is_none());
+    }
+
+    #[test]
+    fn ack_token_rides_any_command() {
+        let control = parse_control("ratty:mode;3d&tok=abc-123").expect("ratty namespace");
+        assert_eq!(control.ack_token.as_deref(), Some("abc-123"));
+        assert_eq!(
+            control.command,
+            Some(RattyAiCommand::SetMode {
+                mode: "3d".to_string()
+            })
+        );
+        // `tok=` never collides with `id=`: object commands keep their id.
+        let control = parse_control("ratty:object.add;id=2147483648&path=rat.obj&tok=t1")
+            .expect("ratty namespace");
+        assert_eq!(control.ack_token.as_deref(), Some("t1"));
+        assert!(matches!(
+            control.command,
+            Some(RattyAiCommand::SpawnObject {
+                id: 0x8000_0000,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn ack_token_survives_command_parse_failure() {
+        // Unknown action: no command, but the ack token is recovered so the
+        // terminal can reply with an error ack.
+        let control = parse_control("ratty:teleport;x=1&tok=t2").expect("ratty namespace");
+        assert!(control.command.is_none());
+        assert_eq!(control.ack_token.as_deref(), Some("t2"));
+        // Missing required key: same.
+        let control = parse_control("ratty:object.add;tok=t3").expect("ratty namespace");
+        assert!(control.command.is_none());
+        assert_eq!(control.ack_token.as_deref(), Some("t3"));
+    }
+
+    #[test]
+    fn invalid_ack_tokens_are_dropped() {
+        let control = parse_control("ratty:reset;tok=has%20space").expect("ratty namespace");
+        assert!(control.ack_token.is_none());
+        assert_eq!(control.command, Some(RattyAiCommand::Reset));
     }
 
     #[test]

@@ -1,5 +1,6 @@
 assets/img
 **/target
+.DS_Store
 result
 result-*
 

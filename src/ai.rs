@@ -57,6 +57,12 @@ pub const MAX_AI_OBJECT_IDS_PER_SESSION: usize = 4096;
 pub struct AiCommand {
     /// Where the command's bytes physically entered the terminal.
     pub source: IngressSource,
+    /// The `tok=` ack opt-in token, when the command carried one. Exactly
+    /// one handler system owns each command's ack (see the per-variant
+    /// comments in the handlers); commands without a token stay
+    /// fire-and-forget. Correlation tokens are transport metadata — the
+    /// future macro recorder must never capture them.
+    pub ack_token: Option<String>,
     /// The parsed command.
     pub command: RattyAiCommand,
 }
@@ -92,7 +98,11 @@ impl Plugin for RattyAiPlugin {
         // ordered after this system (see plugin.rs).
         app.add_message::<AiCommand>()
             .add_message::<AiObjectRemoved>()
+            .add_message::<crate::query_channel::QueryRequest>()
+            .add_message::<crate::query_channel::AckOutcome>()
             .init_resource::<AiObjectRegistry>()
+            .init_resource::<crate::query_channel::QuerySession>()
+            .init_resource::<crate::query_channel::AiDiagnostics>()
             .add_systems(
                 Update,
                 apply_ai_commands
@@ -107,6 +117,17 @@ impl Plugin for RattyAiPlugin {
                 apply_ai_object_commands
                     .after(crate::systems::pump_pty_output)
                     .before(crate::systems::sync_inline_objects),
+            )
+            // The query channel answers after every command applier so a
+            // same-chunk write-then-read observes the write, and acks are
+            // emitted after the outcome they report is decided.
+            .add_systems(
+                Update,
+                crate::query_channel::answer_queries
+                    .after(crate::systems::pump_pty_output)
+                    .after(apply_ai_commands)
+                    .after(apply_ai_object_commands)
+                    .after(crate::effects::apply_ai_effect_commands),
             );
     }
 }
@@ -116,6 +137,7 @@ impl Plugin for RattyAiPlugin {
 /// Mode/warp/reset lower onto the same machinery the RGP `c` verb uses, so
 /// they take effect the frame they arrive. Commands whose subsystem does not
 /// exist yet are logged rather than dropped.
+#[allow(clippy::too_many_arguments)]
 pub fn apply_ai_commands(
     mut commands: MessageReader<AiCommand>,
     mut presentation: ResMut<TerminalPresentation>,
@@ -124,24 +146,47 @@ pub fn apply_ai_commands(
     mut mobius: ResMut<MobiusTransition>,
     mut stage_tween: ResMut<StageTween>,
     mut redraw: ResMut<TerminalRedrawState>,
+    mut acks: MessageWriter<crate::query_channel::AckOutcome>,
+    mut diagnostics: ResMut<crate::query_channel::AiDiagnostics>,
 ) {
-    for AiCommand { command, .. } in commands.read() {
+    use crate::query::codes;
+    use crate::query_channel::{ack_commit, reject};
+
+    for AiCommand {
+        source,
+        ack_token,
+        command,
+    } in commands.read()
+    {
         match command {
             RattyAiCommand::SetMode { mode } => {
                 let Some(target) = parse_mode(mode) else {
                     warn!("ratty-ai: unknown mode '{mode}' (2d, 3d, mobius)");
+                    reject(
+                        &mut diagnostics,
+                        &mut acks,
+                        *source,
+                        ack_token,
+                        "mode",
+                        codes::BAD_MODE,
+                        format!("unknown mode '{mode}' (2d, 3d, mobius)"),
+                    );
                     continue;
                 };
+                // Requesting the already-active mode is an idempotent
+                // commit, so it acks ok either way.
                 if apply_stage_mode_change(target, &mut presentation, &plane_view, &mut mobius) {
                     stage_tween.stop();
                     redraw.request();
                 }
+                ack_commit(&mut acks, *source, ack_token);
             }
             RattyAiCommand::SetWarp { intensity } => {
                 // An explicit warp command wins over a running camera tween.
                 stage_tween.stop();
                 plane_warp.amount = intensity.clamp(0.0, 1.0);
                 redraw.request();
+                ack_commit(&mut acks, *source, ack_token);
             }
             RattyAiCommand::Reset => {
                 presentation.mode = TerminalPresentationMode::Flat2d;
@@ -150,10 +195,13 @@ pub fn apply_ai_commands(
                 mobius.stop();
                 stage_tween.stop();
                 redraw.request();
+                // Reset is handled by three systems; this one owns its
+                // single ack (objects and effects reset silently).
+                ack_commit(&mut acks, *source, ack_token);
             }
             // The soul: flash/pulse/tint/think/confidence/mood are handled by
             // the effects overlay (crate::effects), which reads the same
-            // AiCommand messages independently.
+            // AiCommand messages independently and owns their acks.
             RattyAiCommand::Flash { .. }
             | RattyAiCommand::Pulse { .. }
             | RattyAiCommand::Tint { .. }
@@ -161,7 +209,8 @@ pub fn apply_ai_commands(
             | RattyAiCommand::Confidence { .. }
             | RattyAiCommand::Mood { .. } => {}
             // Objects and the cursor are handled by apply_ai_object_commands,
-            // which reads the same AiCommand messages independently.
+            // which reads the same AiCommand messages independently and owns
+            // their acks.
             RattyAiCommand::SpawnObject { .. }
             | RattyAiCommand::RemoveObject { .. }
             | RattyAiCommand::ClearObjects
@@ -169,6 +218,15 @@ pub fn apply_ai_commands(
             | RattyAiCommand::UpdateCursor { .. } => {}
             other => {
                 debug!("ratty-ai: command received, handler not yet built: {other:?}");
+                reject(
+                    &mut diagnostics,
+                    &mut acks,
+                    *source,
+                    ack_token,
+                    "command",
+                    codes::UNSUPPORTED,
+                    "command parsed but its subsystem is not built yet".to_string(),
+                );
             }
         }
     }
@@ -179,6 +237,7 @@ pub fn apply_ai_commands(
 ///
 /// All failures are explicit `warn!`s (the query channel gives them a real
 /// return path when it lands); nothing is silently dropped.
+#[allow(clippy::too_many_arguments)]
 pub fn apply_ai_object_commands(
     mut commands: MessageReader<AiCommand>,
     mut inline_objects: ResMut<TerminalInlineObjects>,
@@ -187,8 +246,34 @@ pub fn apply_ai_object_commands(
     mut cursor: ResMut<CursorSettings>,
     app_config: Res<AppConfig>,
     mut redraw: ResMut<TerminalRedrawState>,
+    mut acks: MessageWriter<crate::query_channel::AckOutcome>,
+    mut diagnostics: ResMut<crate::query_channel::AiDiagnostics>,
 ) {
-    for AiCommand { source, command } in commands.read() {
+    use crate::query::codes;
+    use crate::query_channel::ack_commit;
+
+    for AiCommand {
+        source,
+        ack_token,
+        command,
+    } in commands.read()
+    {
+        // Every rejection below both warns (unchanged behavior) and lands
+        // in the caller's `state.errors` ring via `reject`; `tok=` commands
+        // additionally get their error ack.
+        macro_rules! reject {
+            ($action:literal, $code:expr, $($message:tt)+) => {
+                crate::query_channel::reject(
+                    &mut diagnostics,
+                    &mut acks,
+                    *source,
+                    ack_token,
+                    $action,
+                    $code,
+                    format!($($message)+),
+                )
+            };
+        }
         match command {
             RattyAiCommand::SpawnObject {
                 id,
@@ -207,6 +292,12 @@ pub fn apply_ai_object_commands(
                          AI range/namespace ({})",
                         source.namespace()
                     );
+                    reject!(
+                        "object.add",
+                        codes::NOT_OWNER,
+                        "id {id:#010x} is outside the caller's AI range/namespace ({})",
+                        source.namespace()
+                    );
                     continue;
                 }
                 let live = inline_objects.contains_object(id);
@@ -214,6 +305,11 @@ pub fn apply_ai_object_commands(
                     warn!(
                         "ratty-ai: object.add rejected: id {id:#010x} already exists \
                          (pass replace=true to replace it)"
+                    );
+                    reject!(
+                        "object.add",
+                        codes::ALREADY_EXISTS,
+                        "id {id:#010x} already exists (pass replace=true to replace it)"
                     );
                     continue;
                 }
@@ -223,12 +319,22 @@ pub fn apply_ai_object_commands(
                             "ratty-ai: object.add rejected: id {id:#010x} was already used \
                              this session; ids are never reused"
                         );
+                        reject!(
+                            "object.add",
+                            codes::ID_REUSED,
+                            "id {id:#010x} was already used this session; ids are never reused"
+                        );
                         continue;
                     }
                     if registry.used.len() >= MAX_AI_OBJECT_IDS_PER_SESSION {
                         warn!(
                             "ratty-ai: object.add rejected: the session id budget \
                              ({MAX_AI_OBJECT_IDS_PER_SESSION}) is exhausted"
+                        );
+                        reject!(
+                            "object.add",
+                            codes::SESSION_BUDGET,
+                            "the session id budget ({MAX_AI_OBJECT_IDS_PER_SESSION}) is exhausted"
                         );
                         continue;
                     }
@@ -238,6 +344,12 @@ pub fn apply_ai_object_commands(
                         warn!(
                             "ratty-ai: object.add rejected: namespace {} is at its \
                              {MAX_AI_OBJECTS_PER_NAMESPACE}-object limit",
+                            source.namespace()
+                        );
+                        reject!(
+                            "object.add",
+                            codes::NAMESPACE_CAP,
+                            "namespace {} is at its {MAX_AI_OBJECTS_PER_NAMESPACE}-object limit",
                             source.namespace()
                         );
                         continue;
@@ -250,6 +362,7 @@ pub fn apply_ai_object_commands(
                     }
                     Err(error) => {
                         warn!("ratty-ai: object.add rejected: {error:#}");
+                        reject!("object.add", codes::BAD_ASSET, "{error:#}");
                         continue;
                     }
                 };
@@ -270,6 +383,7 @@ pub fn apply_ai_object_commands(
                 registry.used.insert(id);
                 inline_objects.ai_insert_object(id, object, *x, *y, style);
                 redraw.request();
+                ack_commit(&mut acks, *source, ack_token);
             }
             RattyAiCommand::UpdateObject {
                 id,
@@ -286,17 +400,37 @@ pub fn apply_ai_object_commands(
                          caller's AI range/namespace ({})",
                         source.namespace()
                     );
+                    reject!(
+                        "object.update",
+                        codes::NOT_OWNER,
+                        "id {id:#010x} is outside the caller's AI range/namespace ({})",
+                        source.namespace()
+                    );
                     continue;
                 }
                 match inline_objects.ai_update_object(id, *x, *y, *scale, *spin, *brightness) {
-                    AiUpdateOutcome::Applied => redraw.request(),
+                    AiUpdateOutcome::Applied => {
+                        redraw.request();
+                        ack_commit(&mut acks, *source, ack_token);
+                    }
                     AiUpdateOutcome::UnknownId => {
                         warn!("ratty-ai: object.update rejected: no object with id {id:#010x}");
+                        reject!(
+                            "object.update",
+                            codes::UNKNOWN_ID,
+                            "no object with id {id:#010x}"
+                        );
                     }
                     AiUpdateOutcome::NoAnchor => {
                         warn!(
                             "ratty-ai: object.update rejected: object {id:#010x} scrolled \
                              away; object.add with replace=true re-anchors it"
+                        );
+                        reject!(
+                            "object.update",
+                            codes::NO_ANCHOR,
+                            "object {id:#010x} scrolled away; object.add with replace=true \
+                             re-anchors it"
                         );
                     }
                 }
@@ -309,13 +443,25 @@ pub fn apply_ai_object_commands(
                          caller's AI range/namespace ({})",
                         source.namespace()
                     );
+                    reject!(
+                        "object.remove",
+                        codes::NOT_OWNER,
+                        "id {id:#010x} is outside the caller's AI range/namespace ({})",
+                        source.namespace()
+                    );
                     continue;
                 }
                 if inline_objects.ai_remove_object(id) {
                     removals.write(AiObjectRemoved { id });
                     redraw.request();
+                    ack_commit(&mut acks, *source, ack_token);
                 } else {
                     warn!("ratty-ai: object.remove rejected: no object with id {id:#010x}");
+                    reject!(
+                        "object.remove",
+                        codes::UNKNOWN_ID,
+                        "no object with id {id:#010x}"
+                    );
                 }
             }
             RattyAiCommand::ClearObjects => {
@@ -328,6 +474,7 @@ pub fn apply_ai_object_commands(
                     }
                     redraw.request();
                 }
+                ack_commit(&mut acks, *source, ack_token);
             }
             RattyAiCommand::UpdateCursor {
                 model,
@@ -337,18 +484,30 @@ pub fn apply_ai_object_commands(
                 brightness,
                 visible,
             } => {
+                // The command is atomic: a bad model name rejects the whole
+                // update rather than partially applying the other fields,
+                // so the ack's reject-or-commit is the truth. (Previously
+                // the other fields still committed under a warn.)
+                if let Some(name) = model
+                    && !embedded_object_loadable(name)
+                {
+                    warn!(
+                        "ratty-ai: cursor rejected: model '{name}' is not a loadable embedded \
+                         asset (wire model swaps resolve embedded names only)"
+                    );
+                    reject!(
+                        "cursor",
+                        codes::BAD_ASSET,
+                        "model '{name}' is not a loadable embedded asset (wire model swaps \
+                         resolve embedded names only)"
+                    );
+                    continue;
+                }
                 if let Some(name) = model {
-                    if embedded_object_loadable(name) {
-                        let choice = CursorModelChoice::Embedded(name.clone());
-                        if cursor.model != choice {
-                            cursor.model = choice;
-                            cursor.needs_respawn = true;
-                        }
-                    } else {
-                        warn!(
-                            "ratty-ai: cursor model '{name}' is not a loadable embedded asset \
-                             (wire model swaps resolve embedded names only)"
-                        );
+                    let choice = CursorModelChoice::Embedded(name.clone());
+                    if cursor.model != choice {
+                        cursor.model = choice;
+                        cursor.needs_respawn = true;
                     }
                 }
                 if let Some(spin) = spin {
@@ -371,10 +530,12 @@ pub fn apply_ai_object_commands(
                     cursor.visible = *visible;
                 }
                 redraw.request();
+                ack_commit(&mut acks, *source, ack_token);
             }
             RattyAiCommand::Reset => {
                 // Full-scene destruction of AI-owned objects across every
                 // namespace; used ids stay reserved (the session continues).
+                // Reset's single ack belongs to apply_ai_commands.
                 let removed = inline_objects.ai_clear_all();
                 if !removed.is_empty() {
                     for id in removed {
@@ -434,9 +595,11 @@ mod tests {
         app.init_resource::<AiObjectRegistry>();
         app.init_resource::<CursorSettings>();
         app.init_resource::<crate::terminal::TerminalRedrawState>();
+        app.init_resource::<crate::query_channel::AiDiagnostics>();
         app.init_resource::<RemovedLog>();
         app.add_message::<AiCommand>();
         app.add_message::<AiObjectRemoved>();
+        app.add_message::<crate::query_channel::AckOutcome>();
         app.add_systems(Update, (apply_ai_object_commands, collect_removals).chain());
         app
     }
@@ -446,6 +609,7 @@ mod tests {
             .resource_mut::<Messages<AiCommand>>()
             .write(AiCommand {
                 source: IngressSource::Local,
+                ack_token: None,
                 command,
             });
         app.update();
@@ -615,6 +779,8 @@ mod tests {
     #[test]
     fn cursor_updates_apply_and_reset_restores_config() {
         let mut app = test_app();
+        // A bad model name rejects the whole command atomically: none of
+        // the other fields apply (the ack's reject-or-commit is the truth).
         send(
             &mut app,
             RattyAiCommand::UpdateCursor {
@@ -628,11 +794,32 @@ mod tests {
         );
         {
             let cursor = app.world().resource::<CursorSettings>();
+            let config = AppConfig::default();
             assert_eq!(
                 cursor.model,
                 CursorModelChoice::Config,
                 "unknown embedded names never swap the model"
             );
+            assert_eq!(
+                cursor.spin_speed, config.cursor.animation.spin_speed,
+                "a rejected cursor command applies nothing"
+            );
+            assert_eq!(cursor.brightness, config.cursor.model.brightness);
+            assert!(cursor.visible);
+        }
+        send(
+            &mut app,
+            RattyAiCommand::UpdateCursor {
+                model: None,
+                spin: Some(9.0),
+                bob_speed: None,
+                bob_amp: None,
+                brightness: Some(0.5),
+                visible: Some(false),
+            },
+        );
+        {
+            let cursor = app.world().resource::<CursorSettings>();
             assert_eq!(cursor.spin_speed, 9.0);
             assert_eq!(cursor.brightness, 0.5);
             assert!(cursor.needs_respawn, "brightness is baked; needs a rebuild");

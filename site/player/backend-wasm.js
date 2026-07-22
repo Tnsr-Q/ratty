@@ -46,6 +46,18 @@ export class WasmBackend {
     this.pollHandle = requestAnimationFrame(poll);
   }
 
+  // Read live terminal state over the OSC 778 query channel. Thin glue
+  // only: the envelope, correlation, and decoding all live in Rust.
+  // Resolves with the decoded JSON payload; rejects with an Error whose
+  // `code` property is the stable wire code. Try from the console (the
+  // page exposes the live backend as `window.ratty`):
+  //   await ratty.query("caps")
+  //   await ratty.query("state.visible_objects")
+  query(op, data = null, timeoutMs = 2000) {
+    if (!this.session) return Promise.reject(new Error("wasm session not booted"));
+    return this.session.query(op, data, timeoutMs);
+  }
+
   reset(header) {
     // A fresh loop: clear all inline objects and the screen.
     if (this.session) {

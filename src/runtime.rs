@@ -21,7 +21,8 @@ use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 use vt100::{Callbacks, Parser, Screen};
 
 use crate::config::AppConfig;
-use crate::osc::{RattyAiCommand, parse_osc};
+use crate::osc::{RattyAiCommand, parse_osc_control};
+use crate::query::{QueryEnvelope, Wire778, WireErrorReply, codes, parse_778};
 
 /// Command-line runtime overrides.
 #[derive(Debug, Clone, Default)]
@@ -64,7 +65,9 @@ pub struct TerminalParserCallbacks {
     seen_csi: HashSet<String>,
     seen_escape: HashSet<String>,
     pending_replies: Vec<Vec<u8>>,
-    pending_ai: Vec<(IngressSource, RattyAiCommand)>,
+    pending_ai: Vec<(IngressSource, Option<String>, RattyAiCommand)>,
+    pending_queries: Vec<(IngressSource, QueryEnvelope)>,
+    pending_wire_errors: Vec<(IngressSource, WireErrorReply)>,
     kitty_keyboard_flags: u8,
     modify_other_keys: Option<u8>,
     // The ingress context stamped onto every parsed AI command. Survives
@@ -80,9 +83,23 @@ impl TerminalParserCallbacks {
     }
 
     /// Drains any `ratty-ai` OSC 777 control commands queued by the parser,
-    /// each stamped with the ingress context that delivered it.
-    pub fn take_ai_commands(&mut self) -> Vec<(IngressSource, RattyAiCommand)> {
+    /// each stamped with the ingress context that delivered it and the
+    /// optional `tok=` ack token.
+    pub fn take_ai_commands(&mut self) -> Vec<(IngressSource, Option<String>, RattyAiCommand)> {
         std::mem::take(&mut self.pending_ai)
+    }
+
+    /// Drains any OSC 778 queries queued by the parser, each stamped with
+    /// the ingress context that delivered it.
+    pub fn take_queries(&mut self) -> Vec<(IngressSource, QueryEnvelope)> {
+        std::mem::take(&mut self.pending_queries)
+    }
+
+    /// Drains error replies owed for sequences that failed at the parse
+    /// layer (malformed 778 envelopes, unparseable `tok=`-carrying 777
+    /// commands) but still carried a correlatable token.
+    pub fn take_wire_errors(&mut self) -> Vec<(IngressSource, WireErrorReply)> {
+        std::mem::take(&mut self.pending_wire_errors)
     }
 
     /// Returns the active kitty keyboard enhancement flags.
@@ -199,12 +216,58 @@ impl Callbacks for TerminalParserCallbacks {
     }
 
     fn unhandled_osc(&mut self, _: &mut Screen, params: &[&[u8]]) {
+        // OSC 778 is the ratty query channel. Queries queue here and are
+        // answered by a Bevy system with ECS access; reply echoes are
+        // swallowed; malformed sequences owe an error reply when a token
+        // could be recovered and are dropped otherwise (nothing to
+        // correlate a reply to).
+        if let Some(wire) = parse_778(params) {
+            match wire {
+                Wire778::Query(query) => self.pending_queries.push((self.source, query)),
+                Wire778::ReplyEcho => {}
+                Wire778::Malformed {
+                    token: Some(token),
+                    code,
+                } => self.pending_wire_errors.push((
+                    self.source,
+                    WireErrorReply {
+                        token,
+                        code,
+                        ack: false,
+                    },
+                )),
+                Wire778::Malformed { token: None, code } => {
+                    bevy::log::debug!("ratty-query: dropped uncorrelatable OSC 778 ({code})");
+                }
+            }
+            return;
+        }
+
         // OSC 777 with the `ratty:` namespace is the ratty-ai control
         // channel; anything else (other OSC 777 users, unknown OSC codes)
         // is ignored. Commands fire inside `pump_pty_output` on the Bevy
         // thread, so they queue here and drain there — no channel needed.
-        if let Some(command) = parse_osc(params) {
-            self.pending_ai.push((self.source, command));
+        // A sequence that claimed the namespace but failed to parse still
+        // gets its error ack when it opted in with `tok=`.
+        if let Some(control) = parse_osc_control(params) {
+            match control.command {
+                Some(command) => {
+                    self.pending_ai
+                        .push((self.source, control.ack_token, command));
+                }
+                None => {
+                    if let Some(token) = control.ack_token {
+                        self.pending_wire_errors.push((
+                            self.source,
+                            WireErrorReply {
+                                token,
+                                code: codes::BAD_COMMAND,
+                                ack: true,
+                            },
+                        ));
+                    }
+                }
+            }
         }
     }
 
@@ -652,18 +715,92 @@ mod tests {
             vec![
                 (
                     IngressSource::Local,
+                    None,
                     RattyAiCommand::SetMode {
                         mode: "3d".to_string()
                     }
                 ),
                 (
                     IngressSource::Local,
+                    None,
                     RattyAiCommand::SetWarp { intensity: 0.5 }
                 ),
             ]
         );
         // Drained.
         assert!(parser.callbacks_mut().take_ai_commands().is_empty());
+    }
+
+    #[test]
+    fn osc_778_bytes_reach_the_query_queue() {
+        // Drive a real ST-terminated OSC 778 query through vt100 and
+        // confirm the ingress hook classified and queued it.
+        let mut parser = Parser::new_with_callbacks(24, 80, 0, TerminalParserCallbacks::default());
+        parser.process(crate::query::query_sequence("tok1", "state.scene", None).as_bytes());
+        let queries = parser.callbacks_mut().take_queries();
+        assert_eq!(
+            queries,
+            vec![(
+                IngressSource::Local,
+                QueryEnvelope {
+                    token: "tok1".into(),
+                    op: "state.scene".into(),
+                    data: Vec::new(),
+                }
+            )]
+        );
+        assert!(parser.callbacks_mut().take_queries().is_empty());
+        assert!(parser.callbacks_mut().take_wire_errors().is_empty());
+    }
+
+    #[test]
+    fn malformed_778_owes_an_error_reply_and_replies_are_swallowed() {
+        let mut parser = Parser::new_with_callbacks(24, 80, 0, TerminalParserCallbacks::default());
+        // Wrong version, recoverable token: owes bad-version.
+        parser.process(b"\x1b]778;v=9;t=q;id=tok2;op=caps\x1b\\");
+        // A reply echoed back through the output stream: swallowed.
+        parser.process(b"\x1b]778;v=1;t=r;id=tok3;ok=1\x1b\\");
+        // Uncorrelatable garbage: dropped.
+        parser.process(b"\x1b]778;nonsense\x1b\\");
+        let errors = parser.callbacks_mut().take_wire_errors();
+        assert_eq!(
+            errors,
+            vec![(
+                IngressSource::Local,
+                WireErrorReply {
+                    token: "tok2".into(),
+                    code: codes::BAD_VERSION,
+                    ack: false,
+                }
+            )]
+        );
+        assert!(parser.callbacks_mut().take_queries().is_empty());
+    }
+
+    #[test]
+    fn tokened_777_commands_and_parse_failures_carry_the_token() {
+        let mut parser = Parser::new_with_callbacks(24, 80, 0, TerminalParserCallbacks::default());
+        parser.process(b"\x1b]777;ratty:reset;tok=t1\x07");
+        parser.process(b"\x1b]777;ratty:teleport;tok=t2\x07");
+        assert_eq!(
+            parser.callbacks_mut().take_ai_commands(),
+            vec![(
+                IngressSource::Local,
+                Some("t1".into()),
+                RattyAiCommand::Reset
+            )]
+        );
+        assert_eq!(
+            parser.callbacks_mut().take_wire_errors(),
+            vec![(
+                IngressSource::Local,
+                WireErrorReply {
+                    token: "t2".into(),
+                    code: codes::BAD_COMMAND,
+                    ack: true,
+                }
+            )]
+        );
     }
 
     #[test]
