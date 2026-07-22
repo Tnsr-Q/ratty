@@ -187,7 +187,9 @@ pub fn spawn_cursor_model(
 
     let resolved = match &settings.model {
         CursorModelChoice::Config => load_object_source(app_config.cursor.model.path.as_path()),
-        CursorModelChoice::Embedded(name) => load_embedded_object_source(name),
+        CursorModelChoice::Embedded(name) => {
+            load_embedded_object_source(name, ObjectLoadOptions::default())
+        }
     };
     match resolved {
         Ok((source, ObjectSource::Obj(loaded_meshes))) if !loaded_meshes.is_empty() => {
@@ -302,18 +304,25 @@ pub fn embedded_object_loadable(name: &str) -> bool {
 
 /// Loads an object source from the embedded asset registry only.
 ///
-/// This is the resolution rule for the untrusted wire (OSC 777 `object.add`
-/// and `cursor` model swaps): a name resolves against ratty-embedded assets
-/// and nothing else. The filesystem stays a trusted-config privilege — a
-/// cat'd file can emit escape sequences, so the byte stream must never
-/// reach disk.
+/// This is the resolution rule for every untrusted wire surface — the
+/// OSC 777 `object.add` and `cursor` model swaps, and the RGP `path=`
+/// register source. A name resolves against ratty-embedded assets and
+/// nothing else. The filesystem stays a trusted-config privilege: a cat'd
+/// file can emit escape sequences, so the byte stream must never reach
+/// disk.
+///
+/// Only the bare file name is honored, so path components (`..`, absolute
+/// roots) cannot escape the registry.
 ///
 /// # Errors
 ///
 /// Returns an error when the name is not embedded, the format is
 /// unsupported (glTF is native-only here — the web build cannot stage scene
 /// assets), or the asset fails to parse.
-pub fn load_embedded_object_source(name: &str) -> anyhow::Result<(String, ObjectSource)> {
+pub fn load_embedded_object_source(
+    name: &str,
+    options: ObjectLoadOptions,
+) -> anyhow::Result<(String, ObjectSource)> {
     let file_name = Path::new(name)
         .file_name()
         .and_then(|file_name| file_name.to_str())
@@ -331,12 +340,8 @@ pub fn load_embedded_object_source(name: &str) -> anyhow::Result<(String, Object
         "stl" => {
             load_stl_meshes_from_bytes(&file.data).map(|mesh| (source, ObjectSource::Stl(mesh)))
         }
-        "obj" => load_obj_meshes_from_bytes(
-            file_name,
-            &file.data,
-            ObjectLoadOptions::default().normalize,
-        )
-        .map(|meshes| (source, ObjectSource::Obj(meshes))),
+        "obj" => load_obj_meshes_from_bytes(file_name, &file.data, options.normalize)
+            .map(|meshes| (source, ObjectSource::Obj(meshes))),
         #[cfg(not(target_arch = "wasm32"))]
         "glb" | "gltf" => {
             let candidate = format!("objects/{file_name}");

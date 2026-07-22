@@ -2,14 +2,13 @@
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
 
 use bevy::prelude::*;
 use vt100::Callbacks;
 
 use crate::kitty::{KittyOperation, KittyParserState, refresh_kitty_placeholder_anchors};
 use crate::model::{
-    ObjectLoadOptions, load_object_source_from_bytes_with_options, load_object_source_with_options,
+    ObjectLoadOptions, load_embedded_object_source, load_object_source_from_bytes_with_options,
 };
 use crate::rgp::{
     RgpOperation, RgpPlacementStyle, RgpPlacementUpdate, RgpRegisterSource, RgpStageUpdate,
@@ -562,7 +561,11 @@ impl TerminalInlineObjects {
                     match source {
                         RgpRegisterSource::Path { path } => {
                             self.pending_rgp_payloads.remove(&object_id);
-                            match load_object_source_with_options(Path::new(&path), load_options) {
+                            // The `path=` register resolves embedded ratty
+                            // assets only — never a filesystem path. The byte
+                            // stream is untrusted, so a printed escape must not
+                            // be able to read an arbitrary file from disk.
+                            match load_embedded_object_source(&path, load_options) {
                                 Ok((source, source_data)) => {
                                     info!("registered RGP object {} from {}", object_id, source);
                                     self.objects.insert(object_id, source_data.into());
@@ -1223,6 +1226,57 @@ mod tests {
             inline.contains_object(7),
             "reset spares transmission objects"
         );
+    }
+
+    #[test]
+    fn rgp_path_register_resolves_embedded_assets_only() {
+        // Write a real, loadable OBJ to disk. The wire `path=` register must
+        // NOT read it — a program printing to the terminal cannot make ratty
+        // load an arbitrary file. (On the pre-fix disk-first loader this file
+        // would register, so this assertion is the regression guard.)
+        let dir = std::env::temp_dir().join("ratty_rgp_path_register_test");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let disk_asset = dir.join("disk_only.obj");
+        std::fs::write(&disk_asset, "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n")
+            .expect("write disk asset");
+
+        // The file genuinely loads through the trusted config loader — so the
+        // wire register's refusal below is the embedded-only gate, not an
+        // unloadable asset.
+        assert!(
+            crate::model::load_object_source_with_options(
+                &disk_asset,
+                crate::model::ObjectLoadOptions::default(),
+            )
+            .is_ok(),
+            "the disk asset is loadable through the trusted path"
+        );
+
+        let mut inline = TerminalInlineObjects::default();
+        inline.handle_rgp_sequence(&rgp_sequence(&format!(
+            "r;id=1;fmt=obj;path={}",
+            disk_asset.display()
+        )));
+        assert!(
+            !inline.objects.contains_key(&1),
+            "an absolute filesystem path must not load: the wire cannot read disk"
+        );
+
+        // A traversal path is refused for the same reason.
+        inline.handle_rgp_sequence(&rgp_sequence("r;id=2;fmt=obj;path=../../etc/passwd.obj"));
+        assert!(
+            !inline.objects.contains_key(&2),
+            "traversal paths resolve to a non-embedded name and are refused"
+        );
+
+        // An embedded ratty asset still registers by name.
+        inline.handle_rgp_sequence(&rgp_sequence("r;id=3;fmt=obj;path=CairoSpinyMouse.obj"));
+        assert!(
+            inline.objects.contains_key(&3),
+            "embedded assets still resolve by name"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
