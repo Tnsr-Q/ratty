@@ -94,6 +94,169 @@ pub struct TerminalInlineObjects {
     pub(crate) anchors: HashMap<u32, InlineAnchor>,
     revisions: HashMap<u32, u64>,
     mutation_seq: u64,
+    osc_guard: OscGuard,
+}
+
+/// Upper bound on the payload of a single OSC sequence that reaches the
+/// vt100 parser (see [`OscGuard`]).
+///
+/// This is an OSC-protocol-wide memory bound, deliberately well above the
+/// 8 KiB query-acceptance bound ([`crate::query::MAX_QUERY_SEQUENCE_BYTES`])
+/// so a legitimate max-size OSC 778 query reaches the query parser intact
+/// and is answered `too-large` there rather than being silently truncated.
+/// Ratty handles no OSC that legitimately exceeds this (titles, 778
+/// queries, and every other OSC code — all far smaller), so truncation
+/// only ever affects pathological or hostile input.
+const MAX_OSC_SEQUENCE_BYTES: usize = 64 * 1024;
+
+// The watchdog cap must never sit below the query-acceptance bound, or a
+// valid-but-large 778 query would be truncated before it could be parsed.
+const _: () = assert!(MAX_OSC_SEQUENCE_BYTES >= crate::query::MAX_QUERY_SEQUENCE_BYTES);
+
+/// Streaming guard that bounds how many bytes of a single OSC sequence
+/// reach the vt100 parser.
+///
+/// vt100 0.16 pulls vte 0.15 with its default `std` feature, under which
+/// vte accumulates OSC payload bytes in an unbounded `Vec` until the
+/// sequence terminates — the `MAX_OSC_RAW` cap only exists in `no_std`
+/// builds. A never-terminated or gigabyte-long OSC in untrusted terminal
+/// output (e.g. `cat` of a hostile file emitting `ESC ] 778 ; <gigabytes>`
+/// with no ST/BEL) would grow that buffer without bound, and ratty's own
+/// size checks in [`crate::query`] only run at the OSC terminator, too
+/// late to matter.
+///
+/// This guard sits on the byte stream just before it reaches the parser
+/// and mirrors vte's OSC entry and exit exactly (verified against vte
+/// 0.15's `advance_esc`/`advance_osc_string`): OSC is entered only by the
+/// 7-bit `ESC ]` introducer — vte is always UTF-8, so the C1 introducer
+/// `0x9d` is executed as a control, never an OSC start — and ends on BEL,
+/// CAN, SUB, or ESC. Once a single OSC's payload exceeds
+/// [`MAX_OSC_SEQUENCE_BYTES`], the guard stops forwarding that payload
+/// (still forwarding the eventual terminator so vte closes the sequence
+/// in sync), so vte can never buffer more than the cap. State persists
+/// across chunks because an OSC may span many PTY reads.
+#[derive(Default)]
+struct OscGuard {
+    state: OscGuardState,
+    /// Payload bytes counted since the current OSC's introducer; frozen at
+    /// the cap once the guard begins dropping.
+    osc_len: usize,
+}
+
+#[derive(Default, PartialEq, Eq, Clone, Copy, Debug)]
+enum OscGuardState {
+    /// Outside any escape sequence.
+    #[default]
+    Ground,
+    /// The previous byte was a lone `ESC` (vte's `Escape` state); the next
+    /// byte decides whether an OSC begins.
+    Escape,
+    /// Inside an OSC string, forwarding its payload.
+    Osc,
+    /// Inside an oversized OSC, suppressing payload until it terminates.
+    OscDropping,
+}
+
+impl OscGuard {
+    const ESC: u8 = 0x1b;
+    const BEL: u8 = 0x07;
+    const CAN: u8 = 0x18;
+    const SUB: u8 = 0x1a;
+    const OSC_INTRODUCER: u8 = 0x5d; // `]`
+
+    /// Forwards `bytes` to the parser, eliding the payload of any single
+    /// OSC sequence past the cap.
+    fn forward<CB: Callbacks>(&mut self, parser: &mut vt100::Parser<CB>, bytes: &[u8]) {
+        self.for_each_run(bytes, |run| parser.process(run));
+    }
+
+    /// Walks `bytes`, invoking `emit` on each contiguous run that should
+    /// reach the parser. Factored out so the state machine can be tested
+    /// without a live parser.
+    fn for_each_run(&mut self, bytes: &[u8], mut emit: impl FnMut(&[u8])) {
+        let mut run_start = 0;
+        for (i, &byte) in bytes.iter().enumerate() {
+            if !self.step(byte) {
+                if run_start < i {
+                    emit(&bytes[run_start..i]);
+                }
+                run_start = i + 1;
+            }
+        }
+        if run_start < bytes.len() {
+            emit(&bytes[run_start..]);
+        }
+    }
+
+    /// Advances the state machine by one byte, returning whether the byte
+    /// should be forwarded to the parser. Suppression happens only inside
+    /// an oversized OSC's payload, so sequences under the cap — and every
+    /// non-OSC byte — pass through untouched.
+    fn step(&mut self, byte: u8) -> bool {
+        match self.state {
+            OscGuardState::Ground => {
+                if byte == Self::ESC {
+                    self.state = OscGuardState::Escape;
+                }
+                true
+            }
+            OscGuardState::Escape => {
+                self.state = match byte {
+                    Self::OSC_INTRODUCER => {
+                        self.osc_len = 0;
+                        OscGuardState::Osc
+                    }
+                    // The bytes vte's `advance_esc` executes in place or
+                    // ignores *without leaving its escape state* (its
+                    // execute, `ESC`, and catch-all arms): C0 controls
+                    // except CAN/SUB, DEL, and 0x80..=0xFF. Mirroring this
+                    // is load-bearing — vte's next `]` still opens an OSC,
+                    // so collapsing these to Ground would let a one-byte
+                    // prefix (`ESC <c> ] <gigabytes>`) slip an unbounded
+                    // OSC straight past the guard.
+                    0x00..=0x17 | 0x19 | 0x1b..=0x1f | 0x7f..=0xff => OscGuardState::Escape,
+                    // Everything else advances vte out of Escape (CSI, DCS,
+                    // escape intermediates, single-byte dispatches, and
+                    // CAN/SUB) — none of which opens an OSC on a later `]`
+                    // without a fresh ESC.
+                    _ => OscGuardState::Ground,
+                };
+                true
+            }
+            OscGuardState::Osc => match byte {
+                Self::BEL | Self::CAN | Self::SUB => {
+                    self.state = OscGuardState::Ground;
+                    true
+                }
+                Self::ESC => {
+                    self.state = OscGuardState::Escape;
+                    true
+                }
+                _ => {
+                    self.osc_len += 1;
+                    if self.osc_len > MAX_OSC_SEQUENCE_BYTES {
+                        self.state = OscGuardState::OscDropping;
+                        false
+                    } else {
+                        true
+                    }
+                }
+            },
+            OscGuardState::OscDropping => match byte {
+                // The terminator is always forwarded so vte closes the
+                // (bounded) OSC and does not swallow following output.
+                Self::BEL | Self::CAN | Self::SUB => {
+                    self.state = OscGuardState::Ground;
+                    true
+                }
+                Self::ESC => {
+                    self.state = OscGuardState::Escape;
+                    true
+                }
+                _ => false,
+            },
+        }
+    }
 }
 
 impl TerminalInlineObjects {
@@ -105,6 +268,10 @@ impl TerminalInlineObjects {
     ) -> Vec<Vec<u8>> {
         self.pending_bytes.extend_from_slice(chunk);
         let mut replies = Vec::new();
+        // The OSC watchdog state persists across chunks; take it so the
+        // `pending_bytes` slices below can still be borrowed. Every path
+        // out of this function restores it.
+        let mut osc_guard = std::mem::take(&mut self.osc_guard);
 
         let mut cursor = 0;
         loop {
@@ -115,25 +282,31 @@ impl TerminalInlineObjects {
                 let pending_len = self.pending_bytes.len();
                 let keep_from = pending_apc_prefix_start(&self.pending_bytes, cursor);
                 if cursor < keep_from {
-                    parser.process(&normalize_hvp_sequences(
-                        &self.pending_bytes[cursor..keep_from],
-                    ));
+                    osc_guard.forward(
+                        parser,
+                        &normalize_hvp_sequences(&self.pending_bytes[cursor..keep_from]),
+                    );
                 }
                 if keep_from < pending_len {
                     self.pending_bytes.drain(..keep_from);
                 } else {
                     self.pending_bytes.clear();
                 }
+                self.osc_guard = osc_guard;
                 return replies;
             };
             let start = cursor + start_offset;
             if cursor < start {
-                parser.process(&normalize_hvp_sequences(&self.pending_bytes[cursor..start]));
+                osc_guard.forward(
+                    parser,
+                    &normalize_hvp_sequences(&self.pending_bytes[cursor..start]),
+                );
             }
 
             let payload_start = start + APC_START.len();
             let Some(end) = apc_end(&self.pending_bytes, payload_start) else {
                 self.pending_bytes.drain(..start);
+                self.osc_guard = osc_guard;
                 return replies;
             };
             let sequence = self.pending_bytes[start..end].to_vec();
@@ -143,10 +316,20 @@ impl TerminalInlineObjects {
                 replies.push(reply);
             }
             if !handled {
-                parser.process(&sequence);
+                osc_guard.forward(parser, &sequence);
             }
             cursor = end;
         }
+    }
+
+    /// Test-only view of the OSC watchdog's engagement after a
+    /// [`Self::consume_pty_output`] call.
+    #[cfg(test)]
+    pub(crate) fn osc_guard_state(&self) -> (bool, usize) {
+        (
+            self.osc_guard.state == OscGuardState::OscDropping,
+            self.osc_guard.osc_len,
+        )
     }
 
     /// Returns whether inline objects need synchronization.
@@ -1493,5 +1676,155 @@ mod tests {
         assert!(!inline.dirty);
         assert!(inline.rebuild_objects.is_empty());
         assert!(inline.restyle_objects.is_empty());
+    }
+
+    /// Runs bytes through the OSC guard, returning the bytes it forwarded
+    /// to the parser plus the guard's final state.
+    fn guard_forward(bytes: &[u8]) -> (Vec<u8>, OscGuard) {
+        let mut guard = OscGuard::default();
+        let mut out = Vec::new();
+        guard.for_each_run(bytes, |run| out.extend_from_slice(run));
+        (out, guard)
+    }
+
+    #[test]
+    fn osc_guard_passes_bounded_sequences_untouched() {
+        // A normal OSC (title) and surrounding text are forwarded verbatim.
+        let title = b"before\x1b]0;a window title\x07after";
+        let (out, guard) = guard_forward(title);
+        assert_eq!(out, title);
+        assert_eq!(guard.state, OscGuardState::Ground);
+
+        // Non-OSC escapes must never be mistaken for OSC: a CSI, an ST
+        // (`ESC \`), and a bare `]` in ground all pass through.
+        let mixed = b"\x1b[1;2mhi\x1b\\a ] bracket\x1b]0;t\x07";
+        let (out, _) = guard_forward(mixed);
+        assert_eq!(out, mixed);
+    }
+
+    #[test]
+    fn osc_guard_bounds_an_oversized_osc_payload() {
+        let mut seq = b"\x1b]52;".to_vec();
+        seq.resize(seq.len() + MAX_OSC_SEQUENCE_BYTES * 2, b'x'); // no terminator
+        let (out, guard) = guard_forward(&seq);
+
+        // vte receives the introducer plus at most the cap of payload —
+        // never the full oversized run.
+        assert!(out.starts_with(b"\x1b]52;"));
+        assert!(out.len() <= MAX_OSC_SEQUENCE_BYTES + 8);
+        assert_eq!(guard.state, OscGuardState::OscDropping);
+        assert_eq!(
+            guard.osc_len,
+            MAX_OSC_SEQUENCE_BYTES + 1,
+            "the counter freezes one past the cap"
+        );
+    }
+
+    #[test]
+    fn osc_guard_forwards_the_terminator_and_recovers() {
+        let mut guard = OscGuard::default();
+        let mut out = Vec::new();
+
+        // An oversized OSC ending in its BEL terminator, with no trailing
+        // bytes, so the only BEL in the output is the sequence's own
+        // terminator — a dropped terminator would leave zero.
+        let mut seq = b"\x1b]0;".to_vec();
+        seq.resize(seq.len() + MAX_OSC_SEQUENCE_BYTES + 100, b'x');
+        seq.push(OscGuard::BEL);
+        guard.for_each_run(&seq, |run| out.extend_from_slice(run));
+
+        assert_eq!(
+            guard.state,
+            OscGuardState::Ground,
+            "the terminator ended the OSC"
+        );
+        assert_eq!(
+            out.iter().filter(|&&byte| byte == OscGuard::BEL).count(),
+            1,
+            "the oversized OSC's own terminator is forwarded, not dropped"
+        );
+        assert_eq!(*out.last().expect("nonempty"), OscGuard::BEL);
+        assert!(out.len() <= MAX_OSC_SEQUENCE_BYTES + 8);
+
+        // The same guard recovers: a following normal OSC passes through
+        // intact, proving vte was left in sync (not stuck mid-OSC).
+        let recovered_at = out.len();
+        guard.for_each_run(b"\x1b]0;short\x07", |run| out.extend_from_slice(run));
+        assert_eq!(&out[recovered_at..], b"\x1b]0;short\x07");
+        assert_eq!(guard.state, OscGuardState::Ground);
+    }
+
+    #[test]
+    fn osc_guard_tracks_osc_after_an_intervening_escape_byte() {
+        // vte stays in its escape state after executing a C0 control (bar
+        // CAN/SUB), DEL, or a 0x80..=0xFF byte, so `ESC <c> ]` still opens
+        // an OSC. The guard must engage too, or a one-byte prefix bypasses
+        // the cap entirely.
+        for prefix in [0x00u8, 0x05, 0x17, 0x19, 0x1b, 0x1f, 0x7f, 0x80, 0xff] {
+            let mut seq = vec![OscGuard::ESC, prefix, OscGuard::OSC_INTRODUCER];
+            seq.resize(seq.len() + MAX_OSC_SEQUENCE_BYTES * 2, b'x');
+            let (out, guard) = guard_forward(&seq);
+            assert_eq!(
+                guard.state,
+                OscGuardState::OscDropping,
+                "ESC {prefix:#04x} ] must still be tracked as an OSC",
+            );
+            assert!(out.len() <= MAX_OSC_SEQUENCE_BYTES + 8);
+        }
+
+        // But a byte that advances vte OUT of Escape (a CSI `[`, or CAN)
+        // must not be treated as still-in-escape: `ESC [ ]` is a CSI then
+        // printable text, never an OSC.
+        let (_, guard) = guard_forward(b"\x1b[]xxxxx");
+        assert_eq!(guard.state, OscGuardState::Ground);
+        let (_, guard) = guard_forward(b"\x1b\x18]xxxxx");
+        assert_eq!(guard.state, OscGuardState::Ground);
+    }
+
+    #[test]
+    fn osc_guard_recovers_on_every_terminator_kind_while_dropping() {
+        // CAN, SUB, and ESC all terminate an OSC in vte; each must be
+        // forwarded so the guard leaves its dropping state in sync.
+        for terminator in [OscGuard::CAN, OscGuard::SUB, OscGuard::ESC] {
+            let mut seq = b"\x1b]0;".to_vec();
+            seq.resize(seq.len() + MAX_OSC_SEQUENCE_BYTES + 50, b'x');
+            seq.push(terminator);
+            let (_, guard) = guard_forward(&seq);
+            assert_ne!(
+                guard.state,
+                OscGuardState::OscDropping,
+                "terminator {terminator:#04x} must end the dropped OSC",
+            );
+        }
+    }
+
+    #[test]
+    fn oversized_osc_stays_bounded_across_chunks_and_keeps_vte_in_sync() {
+        use crate::runtime::TerminalParserCallbacks;
+
+        let mut parser =
+            vt100::Parser::new_with_callbacks(4, 40, 0, TerminalParserCallbacks::default());
+        let mut inline = TerminalInlineObjects::default();
+
+        // A multi-megabyte unterminated OSC arriving in realistic 16 KiB
+        // PTY reads: the introducer in the first chunk, payload after.
+        let mut first = b"\x1b]52;".to_vec();
+        first.resize(16 * 1024, b'x');
+        inline.consume_pty_output(&first, &mut parser);
+        for _ in 0..256 {
+            inline.consume_pty_output(&vec![b'x'; 16 * 1024], &mut parser);
+        }
+
+        let (dropping, osc_len) = inline.osc_guard_state();
+        assert!(dropping, "the guard engaged on the oversized OSC");
+        assert!(
+            osc_len <= MAX_OSC_SEQUENCE_BYTES + 1,
+            "vte received at most the cap, not the multi-megabyte stream"
+        );
+
+        // Terminate the OSC and print visible text: it must land on screen,
+        // proving the forwarded terminator kept vte's parser in sync.
+        inline.consume_pty_output(b"\x07hello", &mut parser);
+        assert!(parser.screen().contents().contains("hello"));
     }
 }

@@ -29,11 +29,13 @@ pub const QUERY_VERSION: &str = "1";
 /// Upper bound on a *terminated* inbound OSC 778 sequence that the
 /// terminal will accept and decode; anything larger answers `too-large`.
 ///
-/// This is an acceptance bound, not a memory bound: vt100/vte (with the
-/// default `std` feature) buffers OSC bytes without a size cap *before*
-/// dispatching them, so a hostile never-terminated OSC still accumulates
-/// upstream of this check. A stream-level OSC watchdog is a separate,
-/// protocol-wide concern.
+/// This is the query-acceptance bound. Memory against never-terminated or
+/// gigabyte-long *OSC* input is bounded separately by the OSC watchdog in
+/// `crate::inline`, which caps how many bytes of any single OSC sequence
+/// reach vte's unbounded `std` buffer; that cap sits above this one so a
+/// valid-but-oversized query still reaches this check and is answered
+/// `too-large` rather than truncated. (The APC channel accumulates through
+/// a different path and is bounded — or not — independently.)
 pub const MAX_QUERY_SEQUENCE_BYTES: usize = 8 * 1024;
 
 /// Upper bound on a decoded query `data=` payload.
