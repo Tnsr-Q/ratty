@@ -168,6 +168,9 @@
           player.attach(wasm);
           try {
             await wasm.boot(header);
+            // Console handle for the OSC 778 query channel:
+            //   await ratty.query("state.visible_objects")
+            window.ratty = wasm;
           } catch (error) {
             degrade(error?.message ?? String(error));
           }

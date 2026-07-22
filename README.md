@@ -139,7 +139,9 @@ Other useful cursor fields are:
 ## Inline 3D objects
 
 Ratty uses its own protocol, the [Ratty Graphics Protocol](protocols/graphics.md),
-to place inline 3D objects in terminal space.
+to place inline 3D objects in terminal space. Agents drive the scene over
+OSC 777 (the `ratty-ai` CLI) and read it back as structured JSON over the
+[Ratty Query Protocol](protocols/query.md) (OSC 778).
 
 RGP supports:
 

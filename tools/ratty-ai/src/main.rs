@@ -6,17 +6,60 @@
 //! green || ratty-ai flash red` — works over SSH, and the identical bytes
 //! drive the browser build through `feed()`.
 //!
-//! The wire format and its encoding live in the terminal's own `src/osc.rs`,
+//! The wire format and its encoding live in the terminal's own `src/osc.rs`
+//! (OSC 777 commands) and `src/query.rs` (OSC 778 queries and replies),
 //! included here verbatim so the CLI and the terminal share one source of
 //! truth (the same trick `tools/silk` uses with `rgp.rs`).
+//!
+//! `query`/`state` (and any command run with `--ack`) additionally *read*:
+//! they open the controlling tty raw, emit the sequence there, and wait for
+//! the correlated OSC 778 reply. Exit codes for those paths are stable:
+//! `0` success · `2` bad arguments/input JSON · `3` timeout · `4` malformed
+//! reply · `5` the terminal returned `ok=0` · `6` tty/transport failure.
 
 use std::io::{Read, Write};
+use std::process::ExitCode;
+use std::time::Duration;
 
 use clap::{Parser, Subcommand, ValueEnum};
 
 #[allow(dead_code)] // The CLI uses the encoder half; the parser half is exercised by tests.
 #[path = "../../../src/osc.rs"]
 mod osc;
+
+#[allow(dead_code)] // Shared wire module; the CLI uses the client half.
+#[path = "../../../src/query.rs"]
+mod query;
+
+/// Exit codes for the reply-reading paths (`query`, `state`, `--ack`):
+/// `0` success, `2` bad arguments/input JSON (clap usage errors also exit
+/// 2), `3` timeout, `4` malformed reply, `5` the terminal answered `ok=0`,
+/// `6` tty/transport failure.
+mod exit_codes {
+    use std::process::ExitCode;
+
+    pub const OK: ExitCode = ExitCode::SUCCESS;
+
+    pub fn bad_input() -> ExitCode {
+        ExitCode::from(2)
+    }
+
+    pub fn timeout() -> ExitCode {
+        ExitCode::from(3)
+    }
+
+    pub fn malformed_reply() -> ExitCode {
+        ExitCode::from(4)
+    }
+
+    pub fn reply_error() -> ExitCode {
+        ExitCode::from(5)
+    }
+
+    pub fn transport() -> ExitCode {
+        ExitCode::from(6)
+    }
+}
 
 /// AI-facing control client for Ratty's 3D terminal scene.
 #[derive(Parser)]
@@ -27,10 +70,51 @@ struct Cli {
     /// Print the escape sequence in readable form instead of emitting it.
     #[arg(long, global = true)]
     dry_run: bool,
+    /// Request a delivery ack (over OSC 778) for this command and wait for
+    /// it: exit 0 when the command committed, 5 when it was rejected.
+    /// Ignored by `query`/`state`, which always read a reply.
+    #[arg(long, global = true)]
+    ack: bool,
+    /// Reply timeout in milliseconds for `query`, `state`, and `--ack`.
+    #[arg(long, global = true, default_value_t = 2000)]
+    timeout: u64,
+    /// Machine mode: failures print `{"ok":false,"code","message"}` JSON on
+    /// stdout (exit codes unchanged).
+    #[arg(long, global = true)]
+    json: bool,
+    /// TTY device to use instead of the controlling terminal.
+    #[arg(long, global = true)]
+    tty: Option<std::path::PathBuf>,
 }
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Query live terminal state over OSC 778 (`caps`, `state.*`).
+    ///
+    /// The decoded JSON payload prints on stdout. New 778 ops never grow
+    /// new subcommands — discover them with `ratty-ai query caps`.
+    Query {
+        /// Query op (e.g. `state.scene`, `state.objects`, `caps`).
+        op: String,
+        /// Inline JSON payload for ops that take parameters.
+        #[arg(long, conflicts_with = "data_file")]
+        data: Option<String>,
+        /// Read the JSON payload from a file, or `-` for stdin.
+        #[arg(long)]
+        data_file: Option<String>,
+        /// Pretty-print the decoded reply.
+        #[arg(long)]
+        pretty: bool,
+    },
+    /// Sugar for `query state.<path>`; bare `state` reads `state.scene`.
+    State {
+        /// State path (`scene`, `objects`, `visible_objects`, `neighbors`,
+        /// `namespaces`, `errors`, …).
+        path: Option<String>,
+        /// Pretty-print the decoded reply.
+        #[arg(long)]
+        pretty: bool,
+    },
     /// Manage inline 3D objects.
     #[command(subcommand)]
     Object(ObjectAction),
@@ -542,6 +626,9 @@ impl Payload {
 fn command_to_osc(command: &Commands, stdin: &str) -> (String, String) {
     let p = Payload::default;
     match command {
+        Commands::Query { .. } | Commands::State { .. } => {
+            unreachable!("query/state are handled before command_to_osc")
+        }
         Commands::Object(action) => match action {
             ObjectAction::Add {
                 id,
@@ -862,9 +949,25 @@ fn reads_stdin(command: &Commands) -> bool {
     )
 }
 
-fn main() {
+fn main() -> ExitCode {
     let cli = Cli::parse();
+    match &cli.command {
+        Commands::Query {
+            op,
+            data,
+            data_file,
+            pretty,
+        } => run_query(&cli, op, data.as_deref(), data_file.as_deref(), *pretty),
+        Commands::State { path, pretty } => {
+            let op = format!("state.{}", path.as_deref().unwrap_or("scene"));
+            run_query(&cli, &op, None, None, *pretty)
+        }
+        _ => run_command(&cli),
+    }
+}
 
+/// The classic fire-and-forget path, plus the `--ack` wait when requested.
+fn run_command(cli: &Cli) -> ExitCode {
     let stdin = if reads_stdin(&cli.command) {
         let mut buffer = String::new();
         let _ = std::io::stdin().read_to_string(&mut buffer);
@@ -872,16 +975,350 @@ fn main() {
     } else {
         String::new()
     };
-
     let (action, payload) = command_to_osc(&cli.command, &stdin);
-    let sequence = osc::osc_sequence(&action, &payload);
 
-    if cli.dry_run {
-        // Readable form for testing and inspection.
-        println!("{}", sequence.replace('\x1b', "ESC").replace('\x07', "BEL"));
+    if !cli.ack {
+        let sequence = osc::osc_sequence(&action, &payload);
+        if cli.dry_run {
+            // Readable form for testing and inspection.
+            println!("{}", readable(&sequence));
+        } else {
+            print!("{sequence}");
+            let _ = std::io::stdout().flush();
+        }
+        return exit_codes::OK;
+    }
+
+    // --ack: opt in with a correlation token and wait for the kind=ack
+    // reply on the tty (the command goes to the tty too, so it reaches
+    // ratty even when stdout is piped).
+    let token = generate_token();
+    let payload = if payload.is_empty() {
+        format!("{}={token}", osc::ACK_TOKEN_KEY)
     } else {
-        print!("{sequence}");
-        let _ = std::io::stdout().flush();
+        format!("{payload}&{}={token}", osc::ACK_TOKEN_KEY)
+    };
+    let sequence = osc::osc_sequence(&action, &payload);
+    if cli.dry_run {
+        println!("{}", readable(&sequence));
+        return exit_codes::OK;
+    }
+
+    match roundtrip(cli, sequence.as_bytes(), &token) {
+        Ok(reply) if reply.ok => {
+            if cli.json {
+                println!("{}", serde_json::json!({ "ok": true }));
+            }
+            exit_codes::OK
+        }
+        Ok(reply) => {
+            let code = reply.code.unwrap_or_else(|| "error".to_string());
+            emit_failure(cli.json, &code, "the terminal rejected the command");
+            exit_codes::reply_error()
+        }
+        Err(exit) => exit,
+    }
+}
+
+/// `query`/`state`: emit an OSC 778 query and print the decoded payload.
+fn run_query(
+    cli: &Cli,
+    op: &str,
+    data: Option<&str>,
+    data_file: Option<&str>,
+    pretty: bool,
+) -> ExitCode {
+    let data_text = match (data, data_file) {
+        (Some(inline), _) => Some(inline.to_string()),
+        (None, Some("-")) => {
+            let mut buffer = String::new();
+            if std::io::stdin().read_to_string(&mut buffer).is_err() {
+                emit_failure(
+                    cli.json,
+                    "bad-input",
+                    "could not read the JSON payload from stdin",
+                );
+                return exit_codes::bad_input();
+            }
+            Some(buffer)
+        }
+        (None, Some(path)) => match std::fs::read_to_string(path) {
+            Ok(text) => Some(text),
+            Err(error) => {
+                emit_failure(
+                    cli.json,
+                    "bad-input",
+                    &format!("could not read {path}: {error}"),
+                );
+                return exit_codes::bad_input();
+            }
+        },
+        (None, None) => None,
+    };
+    // Validate client-side so garbage never reaches the wire.
+    let data_json = match data_text {
+        None => None,
+        Some(text) => match serde_json::from_str::<serde_json::Value>(&text) {
+            Ok(value) => Some(value.to_string()),
+            Err(error) => {
+                emit_failure(
+                    cli.json,
+                    "bad-input",
+                    &format!("data is not valid JSON: {error}"),
+                );
+                return exit_codes::bad_input();
+            }
+        },
+    };
+
+    let token = generate_token();
+    let sequence = query::query_sequence(&token, op, data_json.as_deref().map(str::as_bytes));
+    if cli.dry_run {
+        println!("{}", readable(&sequence));
+        return exit_codes::OK;
+    }
+
+    match roundtrip(cli, sequence.as_bytes(), &token) {
+        Ok(reply) if reply.ok => {
+            let payload = if reply.data.is_empty() {
+                serde_json::Value::Null
+            } else {
+                match serde_json::from_slice::<serde_json::Value>(&reply.data) {
+                    Ok(value) => value,
+                    Err(_) => {
+                        emit_failure(
+                            cli.json,
+                            "malformed",
+                            "the reply payload was not valid JSON",
+                        );
+                        return exit_codes::malformed_reply();
+                    }
+                }
+            };
+            let text = if pretty {
+                serde_json::to_string_pretty(&payload).expect("a JSON value serializes")
+            } else {
+                payload.to_string()
+            };
+            println!("{text}");
+            exit_codes::OK
+        }
+        Ok(reply) => {
+            let code = reply.code.unwrap_or_else(|| "error".to_string());
+            emit_failure(cli.json, &code, "the terminal returned ok=0");
+            exit_codes::reply_error()
+        }
+        Err(exit) => exit,
+    }
+}
+
+fn generate_token() -> String {
+    let mut bytes = [0_u8; 16];
+    getrandom::fill(&mut bytes).expect("system entropy is available");
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// Readable escape form for `--dry-run` output.
+fn readable(sequence: &str) -> String {
+    sequence.replace('\x1b', "ESC").replace('\x07', "BEL")
+}
+
+/// Reports a failure: JSON on stdout in `--json` mode, stderr otherwise.
+fn emit_failure(json: bool, code: &str, message: &str) {
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({ "ok": false, "code": code, "message": message })
+        );
+    } else {
+        eprintln!("ratty-ai: {code}: {message}");
+    }
+}
+
+/// Writes `sequence` to the tty and reads until the reply correlated to
+/// `token` arrives, the timeout lapses, or the transport fails.
+fn roundtrip(cli: &Cli, sequence: &[u8], token: &str) -> Result<query::ParsedReply, ExitCode> {
+    #[cfg(not(unix))]
+    {
+        let _ = (sequence, token);
+        emit_failure(
+            cli.json,
+            "transport",
+            "query/state/--ack need a Unix controlling tty (unsupported on this platform)",
+        );
+        Err(exit_codes::transport())
+    }
+    #[cfg(unix)]
+    {
+        let mut tty = match tty::RawTty::open(cli.tty.as_deref()) {
+            Ok(tty) => tty,
+            Err(error) => {
+                emit_failure(
+                    cli.json,
+                    "transport",
+                    &format!("could not open the tty: {error}"),
+                );
+                return Err(exit_codes::transport());
+            }
+        };
+        if let Err(error) = tty.write_all(sequence) {
+            emit_failure(cli.json, "transport", &format!("tty write failed: {error}"));
+            return Err(exit_codes::transport());
+        }
+        match await_reply(&mut tty, token, Duration::from_millis(cli.timeout)) {
+            Ok(reply) => Ok(reply),
+            Err(WaitError::Timeout) => {
+                emit_failure(
+                    cli.json,
+                    "timeout",
+                    "no reply within the timeout (does this terminal speak OSC 778?)",
+                );
+                Err(exit_codes::timeout())
+            }
+            Err(WaitError::Malformed) => {
+                emit_failure(cli.json, "malformed", "the correlated reply was malformed");
+                Err(exit_codes::malformed_reply())
+            }
+            Err(WaitError::Transport(message)) => {
+                emit_failure(cli.json, "transport", &message);
+                Err(exit_codes::transport())
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+enum WaitError {
+    Timeout,
+    Malformed,
+    Transport(String),
+}
+
+/// Scans tty input for the token's reply, ignoring unrelated bytes and
+/// unmatched replies (user keystrokes and other terminal reports are
+/// consumed while the query is outstanding — the spec'd behavior).
+#[cfg(unix)]
+fn await_reply(
+    tty: &mut tty::RawTty,
+    token: &str,
+    timeout: Duration,
+) -> Result<query::ParsedReply, WaitError> {
+    use std::time::Instant;
+
+    let deadline = Instant::now() + timeout;
+    let mut scanner = query::ReplyScanner::default();
+    let mut buf = [0_u8; 1024];
+    loop {
+        while let Some(frame) = scanner.next_frame() {
+            match query::parse_reply_body(&frame) {
+                Some(reply) if reply.token == token => return Ok(reply),
+                // Unmatched replies are ignored; a frame that names our
+                // token but does not parse is a malformed reply.
+                Some(_) => {}
+                None if frame.contains(&format!("id={token}")) => {
+                    return Err(WaitError::Malformed);
+                }
+                None => {}
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(WaitError::Timeout);
+        }
+        match tty.read_chunk(&mut buf) {
+            // A VMIN=0/VTIME poll tick with nothing pending.
+            Ok(0) => {}
+            Ok(size) => scanner.push(&buf[..size]),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(WaitError::Transport(format!("tty read failed: {error}"))),
+        }
+    }
+}
+
+/// Raw-mode controlling-tty transport for the reply-reading paths.
+///
+/// Raw mode turns off echo and canonical buffering so reply bytes are
+/// readable immediately and invisible to the user, and turns off ISIG so a
+/// Ctrl-C cannot kill the process while the terminal is raw. Restoration
+/// is covered on every exit path: the `Drop` guard handles ordinary exits
+/// and panics, a SIGTERM/SIGHUP/SIGINT/SIGQUIT handler restores and
+/// re-raises for external signals, and VMIN=0/VTIME=1 keeps reads from
+/// ever blocking past the deadline loop.
+#[cfg(unix)]
+mod tty {
+    use std::fs::{File, OpenOptions};
+    use std::io::{self, Read, Write};
+    use std::os::unix::io::{AsRawFd, RawFd};
+    use std::path::Path;
+    use std::sync::OnceLock;
+
+    static SAVED_FOR_SIGNALS: OnceLock<(RawFd, libc::termios)> = OnceLock::new();
+
+    /// Restores the terminal, then re-raises with the default disposition
+    /// so the exit status still reflects the signal. Only
+    /// async-signal-safe calls: `tcsetattr`, `signal`, `raise`.
+    extern "C" fn restore_and_reraise(signal: libc::c_int) {
+        if let Some((fd, saved)) = SAVED_FOR_SIGNALS.get() {
+            unsafe { libc::tcsetattr(*fd, libc::TCSANOW, saved) };
+        }
+        unsafe {
+            libc::signal(signal, libc::SIG_DFL);
+            libc::raise(signal);
+        }
+    }
+
+    /// The controlling (or supplied) tty, held in raw mode until dropped.
+    pub struct RawTty {
+        file: File,
+        fd: RawFd,
+        saved: libc::termios,
+    }
+
+    impl RawTty {
+        pub fn open(path: Option<&Path>) -> io::Result<Self> {
+            let path = path.unwrap_or_else(|| Path::new("/dev/tty"));
+            let file = OpenOptions::new().read(true).write(true).open(path)?;
+            let fd = file.as_raw_fd();
+            if unsafe { libc::isatty(fd) } == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!("{} is not a tty", path.display()),
+                ));
+            }
+            let mut saved = unsafe { std::mem::zeroed::<libc::termios>() };
+            if unsafe { libc::tcgetattr(fd, &mut saved) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let mut raw = saved;
+            unsafe { libc::cfmakeraw(&mut raw) };
+            // Poll-style reads: return within 100 ms even with no bytes,
+            // so the caller's deadline loop is never stuck in read().
+            raw.c_cc[libc::VMIN] = 0;
+            raw.c_cc[libc::VTIME] = 1;
+            if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let _ = SAVED_FOR_SIGNALS.set((fd, saved));
+            let handler = restore_and_reraise as extern "C" fn(libc::c_int);
+            for signal in [libc::SIGTERM, libc::SIGHUP, libc::SIGINT, libc::SIGQUIT] {
+                unsafe { libc::signal(signal, handler as libc::sighandler_t) };
+            }
+            Ok(Self { file, fd, saved })
+        }
+
+        pub fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
+            self.file.write_all(bytes)?;
+            self.file.flush()
+        }
+
+        pub fn read_chunk(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.file.read(buf)
+        }
+    }
+
+    impl Drop for RawTty {
+        fn drop(&mut self) {
+            unsafe { libc::tcsetattr(self.fd, libc::TCSANOW, &self.saved) };
+        }
     }
 }
 
@@ -1047,5 +1484,58 @@ mod tests {
     fn cli_definition_is_valid() {
         use clap::CommandFactory;
         Cli::command().debug_assert();
+    }
+
+    /// The `--ack` token appends to any payload shape and the terminal's
+    /// parser recovers both the command and the token — the CLI↔terminal
+    /// ack contract.
+    #[test]
+    fn ack_token_appends_and_round_trips() {
+        // Keyed payload.
+        let (action, payload) = command_to_osc(&Commands::Mode { mode: "3d".into() }, "");
+        let payload = format!("{payload}&{}=abc123", osc::ACK_TOKEN_KEY);
+        let sequence = osc::osc_sequence(&action, &payload);
+        let inner = sequence
+            .strip_prefix("\x1b]777;")
+            .and_then(|s| s.strip_suffix('\x07'))
+            .expect("well-framed sequence");
+        let control = osc::parse_control(inner).expect("ratty namespace");
+        assert_eq!(control.ack_token.as_deref(), Some("abc123"));
+        assert_eq!(
+            control.command,
+            Some(RattyAiCommand::SetMode { mode: "3d".into() })
+        );
+
+        // Empty payload.
+        let (action, payload) = command_to_osc(&Commands::Object(ObjectAction::Clear), "");
+        assert!(payload.is_empty());
+        let sequence = osc::osc_sequence(&action, &format!("{}=t1", osc::ACK_TOKEN_KEY));
+        let inner = sequence
+            .strip_prefix("\x1b]777;")
+            .and_then(|s| s.strip_suffix('\x07'))
+            .expect("well-framed sequence");
+        let control = osc::parse_control(inner).expect("ratty namespace");
+        assert_eq!(control.ack_token.as_deref(), Some("t1"));
+        assert_eq!(control.command, Some(RattyAiCommand::ClearObjects));
+    }
+
+    /// The query builder emits exactly what the terminal's 778 gate
+    /// accepts — the CLI↔terminal query contract.
+    #[test]
+    fn query_sequence_round_trips_through_the_terminal_gate() {
+        let sequence = query::query_sequence("feedbeef", "state.scene", Some(b"{\"a\":1}"));
+        let body = sequence
+            .strip_prefix("\x1b]")
+            .and_then(|s| s.strip_suffix("\x1b\\"))
+            .expect("well-framed sequence");
+        let params: Vec<&[u8]> = body.split(';').map(str::as_bytes).collect();
+        match query::parse_778(&params) {
+            Some(query::Wire778::Query(envelope)) => {
+                assert_eq!(envelope.token, "feedbeef");
+                assert_eq!(envelope.op, "state.scene");
+                assert_eq!(envelope.data, b"{\"a\":1}");
+            }
+            other => panic!("expected a query, got {other:?}"),
+        }
     }
 }

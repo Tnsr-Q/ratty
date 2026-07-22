@@ -17,6 +17,15 @@ publish = false
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
+# 128-bit correlation tokens for `query`/`state`/`--ack`.
+getrandom = "0.3"
+# `--data` validation and reply pretty-printing (the shared wire module in
+# ../../src/query.rs stays std-only; JSON lives at this edge).
+serde_json = "1.0"
+
+[target.'cfg(unix)'.dependencies]
+# Raw-mode tty transport (termios + signal-safe restore).
+libc = "0.2"
 
 [profile.release]
 opt-level = 3
