@@ -319,10 +319,11 @@ enum Commands {
     /// the invoking user already holds /bin/kill authority.
     ///
     /// Exit codes: 0 the signal was delivered and the exit was observed
-    /// (died) · 10 the process survived SIGTERM · 11 permission denied ·
-    /// 12 no such process (or its identity changed) · 13 outcome
-    /// unobserved within the timeout. `--dry-run` signals nothing and
-    /// prints the sequence a confirmed death would emit.
+    /// (died — a reused pid counts, the original is gone) · 10 the
+    /// process survived SIGTERM · 11 permission denied · 12 no such
+    /// process · 13 outcome unobserved within the timeout. `--dry-run`
+    /// signals nothing and prints the sequence a confirmed death would
+    /// emit.
     Kill {
         /// PID to signal.
         pid: u32,
