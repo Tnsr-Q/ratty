@@ -22,6 +22,11 @@ getrandom = "0.3"
 # `--data` validation and reply pretty-printing (the shared wire module in
 # ../../src/query.rs stays std-only; JSON lives at this edge).
 serde_json = "1.0"
+# The `ps`/`net` collectors and the `kill` watcher's stable process
+# identity (pid + start time). "system" covers processes/cpu/memory,
+# "network" the interface counters; the rest of the default set (disks,
+# components, users, rayon) stays off.
+sysinfo = { version = "0.39", default-features = false, features = ["system", "network"] }
 
 [target.'cfg(unix)'.dependencies]
 # Raw-mode tty transport (termios + signal-safe restore).

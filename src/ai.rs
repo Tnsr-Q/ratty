@@ -127,7 +127,8 @@ impl Plugin for RattyAiPlugin {
                     .after(crate::systems::pump_pty_output)
                     .after(apply_ai_commands)
                     .after(apply_ai_object_commands)
-                    .after(crate::effects::apply_ai_effect_commands),
+                    .after(crate::effects::apply_ai_effect_commands)
+                    .after(crate::viz::apply_viz_commands),
             );
     }
 }
@@ -216,6 +217,12 @@ pub fn apply_ai_commands(
             | RattyAiCommand::ClearObjects
             | RattyAiCommand::UpdateObject { .. }
             | RattyAiCommand::UpdateCursor { .. } => {}
+            // Data visualizations are handled by crate::viz::apply_viz_commands,
+            // which reads the same AiCommand messages independently and owns
+            // their acks.
+            RattyAiCommand::VizSet { .. }
+            | RattyAiCommand::VizEffect { .. }
+            | RattyAiCommand::VizRemove { .. } => {}
             other => {
                 debug!("ratty-ai: command received, handler not yet built: {other:?}");
                 reject(
@@ -596,6 +603,7 @@ mod tests {
         app.init_resource::<CursorSettings>();
         app.init_resource::<crate::terminal::TerminalRedrawState>();
         app.init_resource::<crate::query_channel::AiDiagnostics>();
+        app.init_resource::<crate::viz::VizRegistry>();
         app.init_resource::<RemovedLog>();
         app.add_message::<AiCommand>();
         app.add_message::<AiObjectRemoved>();

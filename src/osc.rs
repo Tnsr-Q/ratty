@@ -50,6 +50,32 @@ pub fn ai_object_namespace(id: u32) -> Option<u8> {
     (id >= AI_OBJECT_ID_MIN).then_some(((id >> AI_OBJECT_INDEX_BITS) & 0x7F) as u8)
 }
 
+// ── Viz wire limits ──
+//
+// These bounds are part of the `viz.*` wire contract, so they live in this
+// shared std-only module: the terminal enforces them at decode and the
+// `ratty-ai` collectors normalize under them at encode — compiling the same
+// constants on both ends means the two can never drift.
+
+/// Upper bound on one *decoded* `viz.set` payload, in bytes. The terminal
+/// enforces it before allocating (bounding the memory a hostile sequence
+/// can pin); collectors bound their `--top` output so a worst-case snapshot
+/// provably encodes under it. The terminal side additionally const-asserts
+/// that the 4/3 base64url expansion plus envelope survives its OSC
+/// watchdog.
+pub const MAX_VIZ_PAYLOAD_BYTES: usize = 32 * 1024;
+
+/// Upper bound on the items in one snapshot (`ps`/`fs`/`net` items, `git`
+/// branches). Bounds per-entry render work and memory against a hostile
+/// emitter packing the byte budget with tiny items.
+pub const MAX_VIZ_ITEMS_PER_SNAPSHOT: usize = 256;
+
+/// Upper bound, in bytes, on any single label string inside a payload
+/// (names, paths, states, capture provenance) and on `viz.effect` keys.
+/// Bounds stored-string memory and keeps every projection record small
+/// enough for size-bounded reply pages.
+pub const MAX_VIZ_LABEL_BYTES: usize = 128;
+
 /// A command parsed from an OSC 777 control sequence.
 ///
 /// Variants are grouped by subsystem. The first block is reachable today
@@ -200,77 +226,56 @@ pub enum RattyAiCommand {
         /// Output path.
         path: String,
     },
-
-    // ── Process ──
-    /// Visualize processes.
-    Ps {
-        /// Whether to draw the visualization.
-        visualize: bool,
-        /// PID to highlight.
-        highlight: Option<u32>,
-        /// Highlight color.
-        color: Option<String>,
+    /// Publish or refresh a data-visualization snapshot (`viz.set`).
+    ///
+    /// The payload is trusted-collector data lowered onto the wire by the
+    /// `ratty-ai` CLI (or authored synthetically by a transmission); the
+    /// terminal only ever *renders* it — a viz command never causes the
+    /// terminal to execute, read, or enumerate anything.
+    VizSet {
+        /// Caller-chosen visualization id; must lie in the AI-owned range
+        /// (see [`AI_OBJECT_ID_MIN`]) and the caller's namespace.
+        id: u32,
+        /// Registered, versioned payload kind (e.g. `ps.v1`). The version
+        /// is part of the kind name; unknown kinds are rejected.
+        kind: String,
+        /// Raw unpadded-base64url JSON payload. Carried opaquely here —
+        /// this module stays dependency-free — and decoded terminal-side
+        /// under hard size limits.
+        data: String,
+        /// Raw anchor column (top-left) when the snapshot places itself.
+        /// Carried unparsed off this std-only module and parsed as a `u16`
+        /// terminal-side, so a *present* but malformed value rejects
+        /// `bad-payload` instead of silently coercing to absent (which
+        /// would drop the placement the caller asked for and still ack ok).
+        x: Option<String>,
+        /// Raw anchor row (top-left); parsed terminal-side, like `x`.
+        y: Option<String>,
+        /// Raw footprint width in cells; parsed terminal-side, like `x`.
+        cols: Option<String>,
+        /// Raw footprint height in cells; parsed terminal-side, like `x`.
+        rows: Option<String>,
+        /// Allow replacing a live visualization of a *different* kind under
+        /// the same id (same-kind sets are always atomic upserts).
+        replace: bool,
     },
-    /// Kill a process with a visual effect.
-    Kill {
-        /// PID.
-        pid: u32,
-        /// Effect (`explode`/`shrink`/`dissolve`).
+    /// Trigger a bounded, self-expiring effect on a domain key inside a
+    /// visualization (`viz.effect`). Effects target stable domain keys
+    /// (pid / path / branch / interface), never entities; a known id with
+    /// an absent key renders nothing and still acks ok.
+    VizEffect {
+        /// Target visualization id.
+        id: u32,
+        /// Domain key inside the snapshot (e.g. a pid as a string).
+        key: String,
+        /// Registered effect name (e.g. `died`, `survived`, `highlight`).
         effect: String,
     },
-
-    // ── File system ──
-    /// Enter a directory as a 3D space.
-    Cd {
-        /// Target path.
-        path: String,
-        /// Whether to visualize.
-        visualize: bool,
-    },
-    /// List a directory as floating icons.
-    Ls {
-        /// Target path.
-        path: String,
-        /// Whether to visualize.
-        visualize: bool,
-    },
-    /// Render a directory tree as branching 3D structure.
-    Tree {
-        /// Recursion depth.
-        depth: u8,
-        /// Whether to visualize.
-        visualize: bool,
-    },
-
-    // ── Git ──
-    /// Visualize branches as 3D rivers.
-    GitBranch {
-        /// Whether to visualize.
-        visualize: bool,
-    },
-    /// Visualize a diff as before/after.
-    GitDiff {
-        /// Whether to visualize.
-        visualize: bool,
-    },
-    /// Visualize a merge.
-    GitMerge {
-        /// Whether to visualize.
-        visualize: bool,
-    },
-    /// Visualize the stash as a compressed cube.
-    GitStash {
-        /// Whether to visualize.
-        visualize: bool,
-    },
-
-    // ── Network ──
-    /// Visualize network connections.
-    Net {
-        /// Whether to visualize.
-        visualize: bool,
-        /// Specific host.
-        host: Option<String>,
+    /// Remove a visualization (`viz.remove`). Unlike `object.*` ids, a
+    /// removed viz id may be reused — watchers restart under stable ids.
+    VizRemove {
+        /// Target visualization id.
+        id: u32,
     },
 
     // ── Panes ──
@@ -575,50 +580,26 @@ fn parse_action(action: &str, p: &Payload) -> Option<RattyAiCommand> {
         "screenshot" => RattyAiCommand::Screenshot {
             path: p.string_or("path", "ratty-screenshot.png"),
         },
-
-        // Process
-        "ps" => RattyAiCommand::Ps {
-            visualize: p.flag("visualize"),
-            highlight: p.opt("highlight"),
-            color: p.string("color"),
+        "viz.set" => RattyAiCommand::VizSet {
+            id: p.parse_req("id")?,
+            kind: p.string("kind")?,
+            data: p.string("data")?,
+            // Placement params ride raw (like `data`) and are parsed
+            // terminal-side so a malformed present value is an explicit
+            // reject, not a silent unplacement.
+            x: p.string("x"),
+            y: p.string("y"),
+            cols: p.string("cols"),
+            rows: p.string("rows"),
+            replace: p.flag("replace"),
         },
-        "kill" => RattyAiCommand::Kill {
-            pid: p.parse_req("pid")?,
-            effect: p.string_or("effect", "explode"),
+        "viz.effect" => RattyAiCommand::VizEffect {
+            id: p.parse_req("id")?,
+            key: p.string("key")?,
+            effect: p.string("effect")?,
         },
-
-        // File system
-        "cd" => RattyAiCommand::Cd {
-            path: p.string("path")?,
-            visualize: p.flag("visualize"),
-        },
-        "ls" => RattyAiCommand::Ls {
-            path: p.string_or("path", "."),
-            visualize: p.flag("visualize"),
-        },
-        "tree" => RattyAiCommand::Tree {
-            depth: p.u8("depth", 3),
-            visualize: p.flag("visualize"),
-        },
-
-        // Git
-        "git.branch" => RattyAiCommand::GitBranch {
-            visualize: p.flag("visualize"),
-        },
-        "git.diff" => RattyAiCommand::GitDiff {
-            visualize: p.flag("visualize"),
-        },
-        "git.merge" => RattyAiCommand::GitMerge {
-            visualize: p.flag("visualize"),
-        },
-        "git.stash" => RattyAiCommand::GitStash {
-            visualize: p.flag("visualize"),
-        },
-
-        // Network
-        "net" => RattyAiCommand::Net {
-            visualize: p.flag("visualize"),
-            host: p.string("host"),
+        "viz.remove" => RattyAiCommand::VizRemove {
+            id: p.parse_req("id")?,
         },
 
         // Panes
@@ -824,10 +805,6 @@ impl Payload {
         self.opt(key).unwrap_or(default)
     }
 
-    fn u8(&self, key: &str, default: u8) -> u8 {
-        self.opt(key).unwrap_or(default)
-    }
-
     fn usize(&self, key: &str, default: usize) -> usize {
         self.opt(key).unwrap_or(default)
     }
@@ -922,20 +899,98 @@ mod tests {
 
     #[test]
     fn flags_default_false_and_read_true() {
+        let replace_of = |payload: &str| {
+            let command = parse_command(payload).expect("object.add parses");
+            let RattyAiCommand::SpawnObject { replace, .. } = command else {
+                panic!("expected SpawnObject");
+            };
+            replace
+        };
+        assert!(replace_of(
+            "ratty:object.add;id=2147483648&path=rat.obj&replace=true"
+        ));
+        // Absent flags read false.
+        assert!(!replace_of("ratty:object.add;id=2147483648&path=rat.obj"));
+        // Only the literal string "true" reads true.
+        assert!(!replace_of(
+            "ratty:object.add;id=2147483648&path=rat.obj&replace=1"
+        ));
+    }
+
+    #[test]
+    fn viz_set_requires_id_kind_and_data() {
         assert_eq!(
-            parse_command("ratty:ps;visualize=true&highlight=1234&color=red"),
-            Some(RattyAiCommand::Ps {
-                visualize: true,
-                highlight: Some(1234),
-                color: Some("red".to_string()),
+            parse_command(
+                "ratty:viz.set;id=2147483648&kind=ps.v1&data=e30&x=10&y=5&cols=24&rows=8"
+            ),
+            Some(RattyAiCommand::VizSet {
+                id: 0x8000_0000,
+                kind: "ps.v1".to_string(),
+                data: "e30".to_string(),
+                x: Some("10".to_string()),
+                y: Some("5".to_string()),
+                cols: Some("24".to_string()),
+                rows: Some("8".to_string()),
+                replace: false,
             })
         );
-        let RattyAiCommand::Ps { visualize, .. } =
-            parse_command("ratty:ps").expect("bare ps parses")
-        else {
-            panic!("expected Ps");
-        };
-        assert!(!visualize);
+        // Placement values ride raw: parse never validates them (that is
+        // the terminal's job), so even a nonsense value still parses here.
+        assert_eq!(
+            parse_command("ratty:viz.set;id=2147483648&kind=ps.v1&data=e30&x=abc&y=5"),
+            Some(RattyAiCommand::VizSet {
+                id: 0x8000_0000,
+                kind: "ps.v1".to_string(),
+                data: "e30".to_string(),
+                x: Some("abc".to_string()),
+                y: Some("5".to_string()),
+                cols: None,
+                rows: None,
+                replace: false,
+            })
+        );
+        // Placement and footprint are optional; replace is a flag.
+        assert_eq!(
+            parse_command("ratty:viz.set;id=2147483648&kind=ps.v1&data=e30&replace=true"),
+            Some(RattyAiCommand::VizSet {
+                id: 0x8000_0000,
+                kind: "ps.v1".to_string(),
+                data: "e30".to_string(),
+                x: None,
+                y: None,
+                cols: None,
+                rows: None,
+                replace: true,
+            })
+        );
+        // Missing data, kind, then id: all three are required.
+        assert!(parse_command("ratty:viz.set;id=2147483648&kind=ps.v1").is_none());
+        assert!(parse_command("ratty:viz.set;id=2147483648&data=e30").is_none());
+        assert!(parse_command("ratty:viz.set;kind=ps.v1&data=e30").is_none());
+    }
+
+    #[test]
+    fn viz_effect_requires_id_key_and_effect() {
+        assert_eq!(
+            parse_command("ratty:viz.effect;id=2147483648&key=1234&effect=died"),
+            Some(RattyAiCommand::VizEffect {
+                id: 0x8000_0000,
+                key: "1234".to_string(),
+                effect: "died".to_string(),
+            })
+        );
+        assert!(parse_command("ratty:viz.effect;id=2147483648&key=1234").is_none());
+        assert!(parse_command("ratty:viz.effect;id=2147483648&effect=died").is_none());
+        assert!(parse_command("ratty:viz.effect;key=1234&effect=died").is_none());
+    }
+
+    #[test]
+    fn viz_remove_requires_id() {
+        assert_eq!(
+            parse_command("ratty:viz.remove;id=2147483648"),
+            Some(RattyAiCommand::VizRemove { id: 0x8000_0000 })
+        );
+        assert!(parse_command("ratty:viz.remove").is_none());
     }
 
     #[test]
@@ -1030,16 +1085,9 @@ mod tests {
             "ratty:chart;data=%5B1%2C2%5D",
             "ratty:timeline;input=x",
             "ratty:screenshot;path=s.png",
-            "ratty:ps;visualize=true",
-            "ratty:kill;pid=9&effect=explode",
-            "ratty:cd;path=%2Ftmp&visualize=true",
-            "ratty:ls;visualize=true",
-            "ratty:tree;depth=3",
-            "ratty:git.branch;visualize=true",
-            "ratty:git.diff;visualize=true",
-            "ratty:git.merge;visualize=true",
-            "ratty:git.stash;visualize=true",
-            "ratty:net;visualize=true",
+            "ratty:viz.set;id=2147483648&kind=ps.v1&data=e30",
+            "ratty:viz.effect;id=2147483648&key=1234&effect=died",
+            "ratty:viz.remove;id=2147483648",
             "ratty:pane.split;direction=vertical&ratio=0.3",
             "ratty:pane.focus;pane=2",
             "ratty:pane.resize;pane=1&width=80",

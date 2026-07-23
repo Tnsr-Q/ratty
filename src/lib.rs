@@ -28,4 +28,5 @@ pub mod runtime;
 pub mod scene;
 pub mod systems;
 pub mod terminal;
+pub mod viz;
 pub mod web;
