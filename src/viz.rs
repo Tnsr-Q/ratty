@@ -35,18 +35,24 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use bevy::ecs::message::{MessageReader, MessageWriter};
 use bevy::prelude::*;
-use serde::Deserialize;
 
 use crate::ai::AiCommand;
 use crate::osc::{RattyAiCommand, ai_object_namespace};
-use crate::query::{B64DecodeError, b64url_decode, codes};
+use crate::query::codes;
 use crate::query_channel::{AckOutcome, AiDiagnostics, ack_commit};
 
 // The payload/item/label limits are part of the wire contract and live in
 // the shared std-only `osc` module so the `ratty-ai` collectors compile
 // the exact same numbers; re-exported here because this module owns their
 // enforcement (decode limits below).
-pub use crate::osc::{MAX_VIZ_ITEMS_PER_SNAPSHOT, MAX_VIZ_LABEL_BYTES, MAX_VIZ_PAYLOAD_BYTES};
+pub use crate::osc::{
+    MAX_VIZ_ITEMS_PER_SNAPSHOT, MAX_VIZ_LABEL_BYTES, MAX_VIZ_PAYLOAD_BYTES,
+    MAX_VIZ_POINTS_PER_SERIES, MAX_VIZ_POINTS_PER_SNAPSHOT, MAX_VIZ_SERIES_PER_SNAPSHOT,
+};
+// The schemas and decoder live in the std-only `viz_wire` sibling module so
+// `tools/silk` can include and re-run the terminal's real decoder;
+// re-exported wholesale so this module remains the viz family's one door.
+pub use crate::viz_wire::*;
 
 // A `viz.set` payload rides a single OSC 777 sequence, and the OSC
 // watchdog (`crate::inline::MAX_OSC_SEQUENCE_BYTES`) truncates anything
@@ -83,347 +89,6 @@ pub const DEFAULT_VIZ_COLUMNS: u16 = 24;
 /// Default footprint height in cells when `viz.set` places an anchor
 /// without `rows=`.
 pub const DEFAULT_VIZ_ROWS: u16 = 8;
-
-/// The registered, versioned payload kinds this build decodes and renders.
-/// The version is part of the name; anything else rejects `bad-kind`.
-pub const REGISTERED_VIZ_KINDS: &[&str] = &["ps.v1", "fs.v1", "git.v1", "net.v1"];
-
-// ── Payload schemas ──
-//
-// Unknown JSON fields are deliberately *ignored* (serde's default) so the
-// wire can evolve additively; over-limit sizes are hard-rejected. Identity
-// fields (pids, paths, names) and capture provenance are required;
-// magnitude fields default.
-
-/// Capture provenance carried by every snapshot. Required: ratty never
-/// implies liveness it was not given — a transmission shipping synthetic
-/// data declares itself here, and a collector stamps its real source.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-pub struct VizCapture {
-    /// Where the data came from (e.g. `ratty-ai ps/sysinfo darwin`).
-    pub source: String,
-    /// When it was captured (RFC 3339 recommended; opaque on the wire).
-    pub ts: String,
-}
-
-/// `ps.v1`: a process snapshot.
-#[derive(Debug, Clone, Deserialize)]
-pub struct PsV1 {
-    /// Capture provenance.
-    pub capture: VizCapture,
-    /// Process items, keyed by pid.
-    #[serde(default)]
-    pub items: Vec<PsItem>,
-}
-
-/// One `ps.v1` process entry.
-#[derive(Debug, Clone, Deserialize)]
-pub struct PsItem {
-    /// Process id — the stable domain key `viz.effect` targets.
-    pub pid: u32,
-    /// Process name.
-    pub name: String,
-    /// CPU usage percentage.
-    #[serde(default)]
-    pub cpu: f32,
-    /// Resident memory in bytes.
-    #[serde(default)]
-    pub mem: u64,
-    /// Scheduler state tag (e.g. `running`, `sleeping`).
-    #[serde(default)]
-    pub state: String,
-}
-
-/// `fs.v1`: a bounded filesystem-walk snapshot.
-#[derive(Debug, Clone, Deserialize)]
-pub struct FsV1 {
-    /// Capture provenance.
-    pub capture: VizCapture,
-    /// The walked root path.
-    pub root: String,
-    /// Walk entries, keyed by path.
-    #[serde(default)]
-    pub items: Vec<FsItem>,
-}
-
-/// One `fs.v1` walk entry.
-#[derive(Debug, Clone, Deserialize)]
-pub struct FsItem {
-    /// Path relative to the root — the stable domain key.
-    pub path: String,
-    /// Whether the entry is a file or a directory.
-    pub kind: FsEntryKind,
-    /// Size in bytes.
-    #[serde(default)]
-    pub size: u64,
-    /// Depth below the walked root.
-    #[serde(default)]
-    pub depth: u8,
-}
-
-/// The `fs.v1` entry kinds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum FsEntryKind {
-    /// A regular file.
-    File,
-    /// A directory.
-    Dir,
-}
-
-/// `git.v1`: a repository snapshot.
-#[derive(Debug, Clone, Deserialize)]
-pub struct GitV1 {
-    /// Capture provenance.
-    pub capture: VizCapture,
-    /// Repository path or name.
-    pub repo: String,
-    /// Branches, keyed by name.
-    #[serde(default)]
-    pub branches: Vec<GitBranchInfo>,
-    /// Working-tree status counts.
-    #[serde(default)]
-    pub status: GitStatusCounts,
-    /// Commits ahead of upstream.
-    #[serde(default)]
-    pub ahead: u32,
-    /// Commits behind upstream.
-    #[serde(default)]
-    pub behind: u32,
-}
-
-/// One `git.v1` branch entry.
-#[derive(Debug, Clone, Deserialize)]
-pub struct GitBranchInfo {
-    /// Branch name — the stable domain key.
-    pub name: String,
-    /// Whether this is the checked-out branch.
-    #[serde(default)]
-    pub current: bool,
-}
-
-/// `git.v1` working-tree status counts.
-#[derive(Debug, Clone, Copy, Default, Deserialize)]
-pub struct GitStatusCounts {
-    /// Staged changes.
-    #[serde(default)]
-    pub staged: u32,
-    /// Unstaged changes.
-    #[serde(default)]
-    pub unstaged: u32,
-    /// Untracked files.
-    #[serde(default)]
-    pub untracked: u32,
-}
-
-/// `net.v1`: a network-interface counter snapshot. Interfaces, not
-/// sockets — a portable, honest v1; per-connection detail can arrive
-/// additively as a future kind.
-#[derive(Debug, Clone, Deserialize)]
-pub struct NetV1 {
-    /// Capture provenance.
-    pub capture: VizCapture,
-    /// Interface counters, keyed by interface name.
-    #[serde(default)]
-    pub items: Vec<NetInterface>,
-}
-
-/// One `net.v1` interface entry.
-#[derive(Debug, Clone, Deserialize)]
-pub struct NetInterface {
-    /// Interface name — the stable domain key.
-    pub iface: String,
-    /// Received bytes.
-    #[serde(default)]
-    pub rx_bytes: u64,
-    /// Transmitted bytes.
-    #[serde(default)]
-    pub tx_bytes: u64,
-    /// Whether the interface is up. Required — defaulting a link state
-    /// would claim knowledge the emitter did not send.
-    pub up: bool,
-}
-
-/// A decoded, validated `viz.set` payload.
-#[derive(Debug, Clone)]
-pub enum VizPayload {
-    /// A `ps.v1` process snapshot.
-    Ps(PsV1),
-    /// An `fs.v1` filesystem snapshot.
-    Fs(FsV1),
-    /// A `git.v1` repository snapshot.
-    Git(GitV1),
-    /// A `net.v1` interface-counter snapshot.
-    Net(NetV1),
-}
-
-impl VizPayload {
-    /// The registered kind name this payload decoded as.
-    pub fn kind(&self) -> &'static str {
-        match self {
-            VizPayload::Ps(_) => "ps.v1",
-            VizPayload::Fs(_) => "fs.v1",
-            VizPayload::Git(_) => "git.v1",
-            VizPayload::Net(_) => "net.v1",
-        }
-    }
-
-    /// The capture provenance every payload carries.
-    pub fn capture(&self) -> &VizCapture {
-        match self {
-            VizPayload::Ps(payload) => &payload.capture,
-            VizPayload::Fs(payload) => &payload.capture,
-            VizPayload::Git(payload) => &payload.capture,
-            VizPayload::Net(payload) => &payload.capture,
-        }
-    }
-
-    /// Number of keyed items in the snapshot (`git` counts branches).
-    pub fn item_count(&self) -> usize {
-        match self {
-            VizPayload::Ps(payload) => payload.items.len(),
-            VizPayload::Fs(payload) => payload.items.len(),
-            VizPayload::Git(payload) => payload.branches.len(),
-            VizPayload::Net(payload) => payload.items.len(),
-        }
-    }
-
-    /// Enforces the size limits the schema types cannot express: item
-    /// counts and label byte lengths.
-    fn validate(&self) -> Result<(), VizDecodeError> {
-        let capture = self.capture();
-        check_label("capture.source", &capture.source)?;
-        check_label("capture.ts", &capture.ts)?;
-        check_items(self.item_count())?;
-        match self {
-            VizPayload::Ps(payload) => {
-                for item in &payload.items {
-                    check_label("name", &item.name)?;
-                    check_label("state", &item.state)?;
-                    // A hostile `cpu` such as `3.5e38` (valid JSON, above
-                    // f32::MAX) decodes to a non-finite f32; left unchecked
-                    // it produces NaN magnitudes that poison child
-                    // transforms and every later effect animation. The
-                    // terminal does not trust the emitter — reject here
-                    // rather than sanitize silently.
-                    if !item.cpu.is_finite() {
-                        return Err(VizDecodeError {
-                            code: codes::BAD_PAYLOAD,
-                            message: format!(
-                                "pid {} carries a non-finite cpu; magnitudes must be finite",
-                                item.pid
-                            ),
-                        });
-                    }
-                }
-            }
-            VizPayload::Fs(payload) => {
-                check_label("root", &payload.root)?;
-                for item in &payload.items {
-                    check_label("path", &item.path)?;
-                }
-            }
-            VizPayload::Git(payload) => {
-                check_label("repo", &payload.repo)?;
-                for branch in &payload.branches {
-                    check_label("branch name", &branch.name)?;
-                }
-            }
-            VizPayload::Net(payload) => {
-                for item in &payload.items {
-                    check_label("iface", &item.iface)?;
-                }
-            }
-        }
-        Ok(())
-    }
-}
-
-fn check_label(field: &'static str, value: &str) -> Result<(), VizDecodeError> {
-    if value.len() > MAX_VIZ_LABEL_BYTES {
-        return Err(VizDecodeError {
-            code: codes::TOO_LARGE,
-            message: format!("{field} exceeds {MAX_VIZ_LABEL_BYTES} bytes"),
-        });
-    }
-    Ok(())
-}
-
-fn check_items(count: usize) -> Result<(), VizDecodeError> {
-    if count > MAX_VIZ_ITEMS_PER_SNAPSHOT {
-        return Err(VizDecodeError {
-            code: codes::TOO_LARGE,
-            message: format!("snapshot exceeds {MAX_VIZ_ITEMS_PER_SNAPSHOT} items"),
-        });
-    }
-    Ok(())
-}
-
-/// A rejected viz payload: the stable append-only reject code
-/// (`bad-kind`, `bad-payload`, or `too-large`) plus a human-readable
-/// detail for the diagnostics ring.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct VizDecodeError {
-    /// The reject code (see [`crate::query::codes`]).
-    pub code: &'static str,
-    /// Detail for `state.errors`; may embed wire-derived text (the
-    /// diagnostics ring truncates at its own storage boundary).
-    pub message: String,
-}
-
-fn parse_json<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, VizDecodeError> {
-    serde_json::from_slice(bytes).map_err(|error| VizDecodeError {
-        code: codes::BAD_PAYLOAD,
-        message: format!("payload does not match the kind schema: {error}"),
-    })
-}
-
-/// Decodes and validates a `viz.set` payload: registered kind, unpadded
-/// base64url under [`MAX_VIZ_PAYLOAD_BYTES`], schema-conforming JSON,
-/// bounded item counts and label lengths.
-///
-/// # Errors
-///
-/// Returns a [`VizDecodeError`] carrying the stable reject code:
-/// `bad-kind` for an unregistered kind (an unknown schema version is the
-/// same case), `too-large` for any exceeded size limit, `bad-payload` for
-/// malformed base64url or schema-violating JSON.
-pub fn decode_viz_payload(kind: &str, data: &str) -> Result<VizPayload, VizDecodeError> {
-    // Kind gates first so an oversized payload of an unknown kind still
-    // reports the more actionable error.
-    if !REGISTERED_VIZ_KINDS.contains(&kind) {
-        return Err(VizDecodeError {
-            code: codes::BAD_KIND,
-            message: format!("unknown viz kind '{kind}' (registered: {REGISTERED_VIZ_KINDS:?})"),
-        });
-    }
-    let bytes = b64url_decode(data, MAX_VIZ_PAYLOAD_BYTES).map_err(|error| match error {
-        B64DecodeError::TooLarge => VizDecodeError {
-            code: codes::TOO_LARGE,
-            message: format!("decoded payload exceeds {MAX_VIZ_PAYLOAD_BYTES} bytes"),
-        },
-        B64DecodeError::BadChar | B64DecodeError::BadLength => VizDecodeError {
-            code: codes::BAD_PAYLOAD,
-            message: "data= is not unpadded base64url".to_string(),
-        },
-    })?;
-    let payload = match kind {
-        "ps.v1" => VizPayload::Ps(parse_json(&bytes)?),
-        "fs.v1" => VizPayload::Fs(parse_json(&bytes)?),
-        "git.v1" => VizPayload::Git(parse_json(&bytes)?),
-        "net.v1" => VizPayload::Net(parse_json(&bytes)?),
-        other => {
-            // Unreachable while REGISTERED_VIZ_KINDS and this match move
-            // together; kept as an honest error rather than a panic.
-            return Err(VizDecodeError {
-                code: codes::BAD_KIND,
-                message: format!("kind '{other}' is registered but has no decoder"),
-            });
-        }
-    };
-    payload.validate()?;
-    Ok(payload)
-}
 
 // ── Effects ──
 
@@ -486,9 +151,12 @@ pub struct QueuedVizEffect {
 
 // ── Render vocabulary ──
 //
-// The v1 vocabulary is deliberately small: every kind lowers onto keyed
-// grid cells (one small mesh per item) with a normalized magnitude and a
-// palette slot. M3.6 grows real chart kinds on the same substrate.
+// Every kind lowers onto keyed children (one small mesh per item) with a
+// normalized magnitude, a palette slot, and a placement slot. The M3.5
+// telemetry kinds place children on a near-square grid; the M3.6 chart
+// kinds place them at data-driven positions inside a plot area whose
+// static geometry (axes, gridlines, labels, tracks) draws as vello paths
+// in `crate::viz_draw`.
 
 /// The fixed material palette viz children draw from. Slots are semantic
 /// (what the color *means*), so every kind maps states onto the same
@@ -521,24 +189,166 @@ impl VizPaletteSlot {
     }
 }
 
-/// One snapshot item lowered onto the shared grid-render vocabulary: a
-/// stable domain key, a normalized magnitude, and a palette slot.
+impl From<VizStateTag> for VizPaletteSlot {
+    /// The chart-family state vocabulary is the palette by its wire names.
+    fn from(tag: VizStateTag) -> Self {
+        match tag {
+            VizStateTag::Active => Self::Active,
+            VizStateTag::Idle => Self::Idle,
+            VizStateTag::Alert => Self::Alert,
+            VizStateTag::Container => Self::Container,
+            VizStateTag::Neutral => Self::Neutral,
+        }
+    }
+}
+
+/// The palette rotation `chart.line.v1` series fall back to when they
+/// carry no explicit state, so neighboring series stay distinguishable.
+/// `Alert` is deliberately absent — red stays an explicit claim.
+pub const SERIES_PALETTE_CYCLE: [VizPaletteSlot; 4] = [
+    VizPaletteSlot::Active,
+    VizPaletteSlot::Idle,
+    VizPaletteSlot::Container,
+    VizPaletteSlot::Neutral,
+];
+
+/// Where a keyed child sits inside its visualization's footprint. `Grid`
+/// is the M3.5 near-square vocabulary; the chart kinds place children at
+/// data-driven positions inside the plot area. `crate::viz_draw` maps
+/// these normalized coordinates into root-local space with the same
+/// insets it draws the vello underlay with, so meshes and paths can
+/// never drift apart.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum VizSlot {
+    /// A near-square grid cell by item order (the M3.5 telemetry kinds).
+    Grid,
+    /// One bar in a single-row category chart, rising to the child's
+    /// magnitude.
+    Bar,
+    /// A series end-marker at plot coordinates, each normalized to
+    /// `0..=1` (y up).
+    Marker {
+        /// Normalized x within the plot area.
+        x: f32,
+        /// Normalized y within the plot area.
+        y: f32,
+    },
+    /// A gauge needle-tip at `fraction` around its dial.
+    Needle {
+        /// Normalized dial position in `0..=1`.
+        fraction: f32,
+    },
+    /// A span on a timeline lane covering `t0..=t1` of the window.
+    Span {
+        /// Lane index, top to bottom.
+        lane: usize,
+        /// Total lane count in the snapshot.
+        lane_count: usize,
+        /// Normalized span start in `0..=1`.
+        t0: f32,
+        /// Normalized span end in `0..=1`.
+        t1: f32,
+    },
+}
+
+/// One snapshot item lowered onto the shared render vocabulary: a stable
+/// domain key, a normalized magnitude, a palette slot, and a placement
+/// slot.
 #[derive(Debug, Clone, PartialEq)]
 pub struct VizChildSpec {
-    /// The item's stable semantic key (pid / path / branch / iface as a
-    /// string) — the same key `viz.effect` targets.
+    /// The item's stable semantic key (pid / path / branch / iface /
+    /// series name / event id as a string) — the same key `viz.effect`
+    /// targets.
     pub key: String,
     /// Magnitude in `0.0..=1.0`, normalized *within the snapshot* (the
-    /// tallest bar is the snapshot's largest item, not an absolute unit).
+    /// tallest bar is the snapshot's largest item, not an absolute unit)
+    /// unless the kind carries a fixed axis (`chart.bar.v1 max`, gauge
+    /// ranges), which pins the scale across refreshes.
     pub magnitude: f32,
     /// The semantic palette slot for the item's state.
     pub palette: VizPaletteSlot,
+    /// Where the child sits inside the footprint.
+    pub slot: VizSlot,
 }
 
-/// Lowers a decoded payload onto the shared grid vocabulary, in item
-/// order. Magnitudes are normalized within the snapshot (cpu for `ps`,
-/// log-scaled size for `fs`, log-scaled rx+tx for `net`; `git` branches
-/// weight the checked-out branch over the rest).
+/// The `chart.bar.v1` axis maximum: the fixed `max` when the payload
+/// carries one, else the snapshot's largest value (never below epsilon).
+/// Shared with the underlay so the drawn axis label and the mesh heights
+/// can never disagree.
+pub(crate) fn bar_axis_max(bar: &ChartBarV1) -> f64 {
+    bar.max.unwrap_or_else(|| {
+        bar.items
+            .iter()
+            .map(|item| item.value)
+            .fold(0.0_f64, f64::max)
+    })
+    .max(f64::EPSILON)
+}
+
+/// The `chart.line.v1` plot ranges as `((x_min, x_max), (y_min, y_max))`:
+/// x always spans the data; y honors the fixed pair when present. Shared
+/// with the underlay so polylines and series markers land on identical
+/// coordinates.
+pub(crate) fn line_chart_ranges(line: &ChartLineV1) -> ((f64, f64), (f64, f64)) {
+    let mut x_min = f64::INFINITY;
+    let mut x_max = f64::NEG_INFINITY;
+    let mut y_min = f64::INFINITY;
+    let mut y_max = f64::NEG_INFINITY;
+    for point in line.series.iter().flat_map(|series| &series.points) {
+        x_min = x_min.min(point.x);
+        x_max = x_max.max(point.x);
+        y_min = y_min.min(point.y);
+        y_max = y_max.max(point.y);
+    }
+    if x_min > x_max {
+        (x_min, x_max) = (0.0, 1.0);
+    }
+    if let (Some(low), Some(high)) = (line.y_min, line.y_max) {
+        (y_min, y_max) = (low, high);
+    } else if y_min > y_max {
+        (y_min, y_max) = (0.0, 1.0);
+    }
+    ((x_min, x_max), (y_min, y_max))
+}
+
+/// The `timeline.v1` window as `(start, end)`: the fixed pair when
+/// present, else derived from the events (`min t` to `max t + dur`).
+/// Shared with the underlay so the drawn window labels match the spans.
+pub(crate) fn timeline_window(timeline: &TimelineV1) -> (f64, f64) {
+    if let (Some(t0), Some(t1)) = (timeline.t0, timeline.t1) {
+        return (t0, t1);
+    }
+    let mut start = f64::INFINITY;
+    let mut end = f64::NEG_INFINITY;
+    for event in timeline.lanes.iter().flat_map(|lane| &lane.events) {
+        start = start.min(event.t);
+        end = end.max(event.t + event.dur);
+    }
+    if start > end { (0.0, 1.0) } else { (start, end) }
+}
+
+/// Normalizes `value` into `low..=high` as `0..=1`, mapping a degenerate
+/// range onto its center.
+fn range_normalized(value: f64, low: f64, high: f64) -> f32 {
+    let span = high - low;
+    if span <= f64::EPSILON {
+        return 0.5;
+    }
+    (((value - low) / span) as f32).clamp(0.0, 1.0)
+}
+
+/// The gauge needle fraction: `value` inside `min..=max`, clamped — the
+/// dial pins, the printed value stays honest.
+pub(crate) fn gauge_fraction(item: &ChartGaugeItem) -> f32 {
+    range_normalized(item.value, item.min, item.max)
+}
+
+/// Lowers a decoded payload onto the shared render vocabulary, in item
+/// order. Grid magnitudes are normalized within the snapshot (cpu for
+/// `ps`, log-scaled size for `fs`, log-scaled rx+tx for `net`; `git`
+/// branches weight the checked-out branch); chart kinds normalize against
+/// their axis (`bar_axis_max`, `line_chart_ranges`, gauge ranges,
+/// `timeline_window`).
 pub fn viz_child_specs(payload: &VizPayload) -> Vec<VizChildSpec> {
     match payload {
         VizPayload::Ps(ps) => {
@@ -554,6 +364,7 @@ pub fn viz_child_specs(payload: &VizPayload) -> Vec<VizChildSpec> {
                     key: item.pid.to_string(),
                     magnitude: (item.cpu / max_cpu).clamp(0.0, 1.0),
                     palette: ps_state_palette(&item.state),
+                    slot: VizSlot::Grid,
                 })
                 .collect()
         }
@@ -568,6 +379,7 @@ pub fn viz_child_specs(payload: &VizPayload) -> Vec<VizChildSpec> {
                         FsEntryKind::Dir => VizPaletteSlot::Container,
                         FsEntryKind::File => VizPaletteSlot::Neutral,
                     },
+                    slot: VizSlot::Grid,
                 })
                 .collect()
         }
@@ -582,6 +394,7 @@ pub fn viz_child_specs(payload: &VizPayload) -> Vec<VizChildSpec> {
                 } else {
                     VizPaletteSlot::Neutral
                 },
+                slot: VizSlot::Grid,
             })
             .collect(),
         VizPayload::Net(net) => {
@@ -604,8 +417,90 @@ pub fn viz_child_specs(payload: &VizPayload) -> Vec<VizChildSpec> {
                     } else {
                         VizPaletteSlot::Alert
                     },
+                    slot: VizSlot::Grid,
                 })
                 .collect()
+        }
+        VizPayload::ChartBar(bar) => {
+            let axis_max = bar_axis_max(bar);
+            bar.items
+                .iter()
+                .map(|item| VizChildSpec {
+                    key: item.key.clone(),
+                    magnitude: ((item.value / axis_max) as f32).clamp(0.0, 1.0),
+                    palette: item.state.into(),
+                    slot: VizSlot::Bar,
+                })
+                .collect()
+        }
+        VizPayload::ChartLine(line) => {
+            let ((x_min, x_max), (y_min, y_max)) = line_chart_ranges(line);
+            line.series
+                .iter()
+                .enumerate()
+                .map(|(index, series)| {
+                    // The marker sits on the series' last point — the
+                    // freshest reading — or centers on an empty series.
+                    let (x, y) = series.points.last().map_or((0.5, 0.5), |point| {
+                        (
+                            range_normalized(point.x, x_min, x_max),
+                            range_normalized(point.y, y_min, y_max),
+                        )
+                    });
+                    VizChildSpec {
+                        key: series.name.clone(),
+                        magnitude: y,
+                        palette: series.state.map_or(
+                            SERIES_PALETTE_CYCLE[index % SERIES_PALETTE_CYCLE.len()],
+                            VizPaletteSlot::from,
+                        ),
+                        slot: VizSlot::Marker { x, y },
+                    }
+                })
+                .collect()
+        }
+        VizPayload::ChartGauge(gauge) => gauge
+            .items
+            .iter()
+            .map(|item| {
+                let fraction = gauge_fraction(item);
+                VizChildSpec {
+                    key: item.key.clone(),
+                    magnitude: fraction,
+                    palette: item.state.into(),
+                    slot: VizSlot::Needle { fraction },
+                }
+            })
+            .collect(),
+        VizPayload::Timeline(timeline) => {
+            let (window_start, window_end) = timeline_window(timeline);
+            let lane_count = timeline.lanes.len();
+            let mut specs = Vec::new();
+            for (lane, lane_data) in timeline.lanes.iter().enumerate() {
+                for event in &lane_data.events {
+                    // An event wholly outside an explicit window renders
+                    // nothing — clipping is presentation, and effects on
+                    // its id tolerate the absent child like any other
+                    // absent key.
+                    if event.t + event.dur < window_start || event.t > window_end {
+                        continue;
+                    }
+                    let t0 = range_normalized(event.t, window_start, window_end);
+                    let t1 = range_normalized(event.t + event.dur, window_start, window_end);
+                    specs.push(VizChildSpec {
+                        key: event.id.clone(),
+                        magnitude: 1.0,
+                        palette: event.state.into(),
+                        slot: VizSlot::Span {
+                            lane,
+                            lane_count,
+                            t0,
+                            t1,
+                        },
+                    });
+                }
+            }
+            specs
         }
     }
 }

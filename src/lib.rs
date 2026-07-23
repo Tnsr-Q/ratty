@@ -30,4 +30,5 @@ pub mod sound;
 pub mod systems;
 pub mod terminal;
 pub mod viz;
+pub mod viz_wire;
 pub mod web;

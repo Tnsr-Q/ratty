@@ -75,6 +75,20 @@ pub const MAX_VIZ_ITEMS_PER_SNAPSHOT: usize = 256;
 /// Bounds stored-string memory and keeps every projection record small
 /// enough for size-bounded reply pages.
 pub const MAX_VIZ_LABEL_BYTES: usize = 128;
+
+/// Upper bound on the series in a `chart.line.v1` snapshot and the lanes in
+/// a `timeline.v1` snapshot. More than a handful of series is unreadable in
+/// a cell-anchored footprint anyway; the bound keeps a hostile emitter from
+/// packing the byte budget with empty track groups.
+pub const MAX_VIZ_SERIES_PER_SNAPSHOT: usize = 8;
+
+/// Upper bound on the points in one `chart.line.v1` series.
+pub const MAX_VIZ_POINTS_PER_SERIES: usize = 256;
+
+/// Upper bound on the points across every series of one `chart.line.v1`
+/// snapshot. Sized so a max-point payload of short labels still encodes
+/// under [`MAX_VIZ_PAYLOAD_BYTES`]; the byte cap remains the hard wall.
+pub const MAX_VIZ_POINTS_PER_SNAPSHOT: usize = 1024;
 /// Classification of a registered semantic sound kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SoundKindClass {
