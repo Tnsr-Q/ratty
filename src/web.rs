@@ -37,6 +37,8 @@ struct WebControlState {
     mode: Option<TerminalPresentationMode>,
     warp: Option<f32>,
     view: Option<(f32, f32, f32)>,
+    /// Set by [`RattySession::user_gesture`]; unlocks the sound organ.
+    user_gesture: bool,
 }
 
 #[derive(Resource, Clone, Default)]
@@ -268,6 +270,22 @@ impl RattySession {
             controls.view = Some((yaw, pitch, zoom));
         }
     }
+
+    /// Reports a genuine user gesture (pointerdown/keydown) from the page.
+    ///
+    /// Browsers gate audible playback behind the first user gesture; the
+    /// site installs one-time listeners that call this (and resume the
+    /// page's `AudioContext`s — that half is JS-only by nature). The signal
+    /// queues like the stage controls and is drained frame-ordered before
+    /// the sound decision layer, so the gesture frame's own `sound.*`
+    /// commands already see unlocked audio and a deferred ambient bed
+    /// fades in. Idempotent after the first call; the unlock status is
+    /// polled via `query("state.scene")`, never pushed.
+    pub fn user_gesture(&self) {
+        if let Ok(mut controls) = self.controls.lock() {
+            controls.user_gesture = true;
+        }
+    }
 }
 
 impl Drop for RattySession {
@@ -358,12 +376,15 @@ pub fn start(canvas_selector: &str, config_toml: Option<String>) -> Result<Ratty
     // Deterministic stage-writer order: apply_rgp_stage → apply_ai_commands →
     // drain_web_controls → apply_terminal_presentation. JS controls are the
     // most explicit user input, so they run last among the writers and are
-    // read the same frame (before, not after, the presentation pass).
+    // read the same frame (before, not after, the presentation pass). The
+    // queued user gesture drains before the sound decision layer so audio
+    // unlocks ahead of the same frame's sound.* decisions.
     .add_systems(
         Update,
         drain_web_controls
             .after(crate::ai::apply_ai_commands)
-            .before(crate::scene::apply_terminal_presentation),
+            .before(crate::scene::apply_terminal_presentation)
+            .before(crate::sound::apply_sound_commands),
     )
     // Timeouts sweep after the reply writer so a reply arriving on the
     // deadline frame wins over its timeout.
@@ -381,7 +402,8 @@ pub fn start(canvas_selector: &str, config_toml: Option<String>) -> Result<Ratty
 
 /// Applies queued JS stage controls to the same resources the keyboard and
 /// mouse mutate, mirroring the keyboard's mode-toggle semantics (Möbius
-/// enters and exits through its camera transition).
+/// enters and exits through its camera transition). Also drains the queued
+/// user gesture into the sound organ's audio unlock.
 fn drain_web_controls(
     queue: Res<WebControlQueue>,
     mut presentation: ResMut<TerminalPresentation>,
@@ -390,11 +412,18 @@ fn drain_web_controls(
     mut mobius: ResMut<MobiusTransition>,
     mut stage_tween: ResMut<StageTween>,
     mut redraw: ResMut<TerminalRedrawState>,
+    mut sound: ResMut<crate::sound::SoundState>,
 ) {
     let pending = match queue.0.lock() {
         Ok(mut controls) => std::mem::take(&mut *controls),
         Err(_) => return,
     };
+
+    // The gesture unlocks audio and promotes any deferred ambient bed; it
+    // is not a stage control, so it never disturbs a running stage tween.
+    if pending.user_gesture && !sound.unlocked {
+        sound.unlock();
+    }
 
     // JS controls are user input: they win over any scripted stage tween.
     if (pending.mode.is_some() || pending.warp.is_some() || pending.view.is_some())

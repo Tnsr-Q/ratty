@@ -1,6 +1,6 @@
-//! Cast validator: reparses every output event through ratty's own RGP
-//! parser (`src/rgp.rs`, included verbatim) so validation can never drift
-//! from the terminal's real wire format.
+//! Cast validator: reparses every output event through ratty's own RGP and
+//! OSC 777 parsers (`src/rgp.rs` / `src/osc.rs`, included verbatim) so
+//! validation can never drift from the terminal's real wire format.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -9,6 +9,7 @@ use std::path::Path;
 use anyhow::Result;
 
 use crate::cast::{Cast, read_cast};
+use crate::osc;
 use crate::rgp::{RGP_APC_START, RgpOperation, RgpRegisterSource, consume_sequence};
 
 /// Assets that ship inside ratty itself and are legal `path=` registrations.
@@ -20,6 +21,9 @@ const EMBEDDED_ASSETS: [&str; 4] = [
 ];
 
 const KITTY_APC_START: &[u8] = b"\x1b_G";
+
+/// Introducer of an OSC 777 control frame (the `ratty:` command channel).
+const OSC_777_START: &[u8] = b"\x1b]777;";
 
 /// Validation outcome.
 #[derive(Debug, Default)]
@@ -124,6 +128,7 @@ pub fn validate(cast: &Cast) -> Report {
                     &mut kitty_warned,
                     &mut report,
                 );
+                scan_osc_777(line, event.data.as_bytes(), &mut report);
             }
             "m" | "i" => {}
             other => {
@@ -393,6 +398,109 @@ fn check_stage_fields(line: usize, sequence: &[u8], report: &mut Report) {
     }
 }
 
+/// Scans one output event for OSC 777 frames and re-parses `ratty:`-namespace
+/// commands through ratty's own decoder (`osc::parse_command`, included
+/// verbatim). The wire is deliberately permissive — the terminal silently
+/// drops a `ratty:` frame it cannot parse — so the validator surfaces those
+/// authoring mistakes instead. Foreign 777 frames (no `ratty:` prefix)
+/// belong to other 777 users and pass untouched.
+fn scan_osc_777(line: usize, bytes: &[u8], report: &mut Report) {
+    let mut cursor = 0usize;
+    while let Some(start) = find(bytes, cursor, OSC_777_START) {
+        let content_start = start + OSC_777_START.len();
+        let Some((content_end, end)) = osc_end(bytes, content_start) else {
+            report.errors.push(format!(
+                "line {line}: OSC 777 sequence starts but does not terminate within the \
+                 event (sequences must not be split across events)"
+            ));
+            break;
+        };
+        check_osc_777(line, &bytes[content_start..content_end], report);
+        cursor = end;
+    }
+}
+
+fn check_osc_777(line: usize, content: &[u8], report: &mut Report) {
+    // Only `ratty:`-namespace frames are ours to validate. Check the raw
+    // byte prefix *first* so a foreign 777 frame carrying a non-UTF-8
+    // payload passes untouched (the pass-through contract) instead of
+    // being reported as invalid UTF-8.
+    if !content.starts_with(osc::RATTY_AI_PREFIX.as_bytes()) {
+        return;
+    }
+    let Ok(content) = std::str::from_utf8(content) else {
+        report.errors.push(format!(
+            "line {line}: ratty OSC 777 frame content is not UTF-8 (ratty silently drops it)"
+        ));
+        return;
+    };
+    let Some(command) = osc::parse_command(content) else {
+        // Take the debug snippet on a char boundary: a fixed byte offset
+        // would panic when a multibyte UTF-8 char straddles it.
+        let snippet: String = content.chars().take(60).collect();
+        report.errors.push(format!(
+            "line {line}: unparseable ratty OSC 777 command {snippet:?} (ratty silently drops it)"
+        ));
+        return;
+    };
+    match command {
+        osc::RattyAiCommand::SoundPlay { kind, .. } => {
+            check_sound_kind(line, &kind, osc::SoundKindClass::OneShot, report);
+        }
+        osc::RattyAiCommand::SoundAmbientSet { kind, .. } => {
+            check_sound_kind(line, &kind, osc::SoundKindClass::Ambient, report);
+        }
+        _ => {}
+    }
+}
+
+/// Checks a sound kind against the registry ratty itself compiles
+/// (`osc::SOUND_KINDS`): unknown kinds and class mismatches are rejected
+/// terminal-side with `bad-kind`, so a cast carrying them is broken.
+fn check_sound_kind(
+    line: usize,
+    kind: &str,
+    expected: osc::SoundKindClass,
+    report: &mut Report,
+) {
+    match osc::sound_kind_class(kind) {
+        Some(class) if class == expected => {}
+        Some(_) => {
+            let hint = match expected {
+                osc::SoundKindClass::OneShot => {
+                    "is an ambient bed, not a one-shot (use sound.ambient.set)"
+                }
+                osc::SoundKindClass::Ambient => {
+                    "is a one-shot, not an ambient bed (use sound.play)"
+                }
+            };
+            report.errors.push(format!(
+                "line {line}: sound kind \"{kind}\" {hint}; ratty rejects this with bad-kind"
+            ));
+        }
+        None => {
+            report.errors.push(format!(
+                "line {line}: \"{kind}\" is not a registered sound kind; ratty rejects \
+                 this with bad-kind"
+            ));
+        }
+    }
+}
+
+/// Returns (exclusive content end, exclusive sequence end) for an OSC frame
+/// whose content starts at `from`, accepting BEL, `ESC \`, and the raw C1 ST.
+fn osc_end(bytes: &[u8], from: usize) -> Option<(usize, usize)> {
+    let mut index = from;
+    while index < bytes.len() {
+        match bytes[index] {
+            0x07 | 0x9c => return Some((index, index + 1)),
+            0x1b if bytes.get(index + 1) == Some(&b'\\') => return Some((index, index + 2)),
+            _ => index += 1,
+        }
+    }
+    None
+}
+
 fn find(bytes: &[u8], from: usize, needle: &[u8]) -> Option<usize> {
     bytes
         .get(from..)?
@@ -569,6 +677,140 @@ mod tests {
         let report = validate(&cast);
         assert!(report.errors.is_empty());
         assert!(report.warnings.iter().any(|w| w.contains("no-op")));
+    }
+
+    #[test]
+    fn accepts_parseable_ratty_osc_777_frames() {
+        let cast = cast_with_events(&[
+            (
+                0.0,
+                "o",
+                "\x1b]777;ratty:sound.ambient.set;kind=ambient.hum&gain=0.4&xfade=800\x07",
+            ),
+            (0.5, "o", "\x1b]777;ratty:sound.play;kind=chime&gain=0.5\x07"),
+            (0.6, "o", "\x1b]777;ratty:mood;mood=excited\x07"),
+            (1.0, "o", "\x1b]777;ratty:sound.ambient.stop;fade=250\x07"),
+        ]);
+        let report = validate(&cast);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+    }
+
+    #[test]
+    fn rejects_unparseable_ratty_osc_777_frames() {
+        // sound.play requires kind=; frobnicate is no action at all. Ratty
+        // silently drops both — the validator must not.
+        for data in [
+            "\x1b]777;ratty:sound.play\x07",
+            "\x1b]777;ratty:frobnicate\x07",
+        ] {
+            let cast = cast_with_events(&[(0.0, "o", data)]);
+            let report = validate(&cast);
+            assert!(
+                report
+                    .errors
+                    .iter()
+                    .any(|e| e.contains("unparseable ratty OSC 777")),
+                "expected an error for {data:?}, got {:?}",
+                report.errors
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_and_misclassed_sound_kinds() {
+        for (data, expected) in [
+            (
+                "\x1b]777;ratty:sound.play;kind=boom\x07",
+                "not a registered sound kind",
+            ),
+            (
+                "\x1b]777;ratty:sound.play;kind=ambient.hum\x07",
+                "is an ambient bed",
+            ),
+            (
+                "\x1b]777;ratty:sound.ambient.set;kind=chime\x07",
+                "is a one-shot",
+            ),
+        ] {
+            let cast = cast_with_events(&[(0.0, "o", data)]);
+            let report = validate(&cast);
+            assert!(
+                report.errors.iter().any(|e| e.contains(expected)),
+                "expected \"{expected}\" for {data:?}, got {:?}",
+                report.errors
+            );
+        }
+    }
+
+    #[test]
+    fn ignores_foreign_osc_777_frames() {
+        let cast = cast_with_events(&[(0.0, "o", "\x1b]777;notify;hello world\x07")]);
+        let report = validate(&cast);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+    }
+
+    #[test]
+    fn unparseable_ratty_osc_777_with_multibyte_content_does_not_panic() {
+        // A ratty-namespace frame that fails to parse, long enough that its
+        // 60th byte lands inside a multibyte char. Slicing the debug snippet
+        // on a fixed byte offset would panic; the validator must report it.
+        let payload = format!("ratty:x{}", "é".repeat(40));
+        let data = format!("\x1b]777;{payload}\x07");
+        let cast = cast_with_events(&[(0.0, "o", data.as_str())]);
+        let report = validate(&cast);
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|e| e.contains("unparseable ratty OSC 777")),
+            "{:?}",
+            report.errors
+        );
+    }
+
+    #[test]
+    fn foreign_non_utf8_osc_777_frame_passes_untouched() {
+        // A non-`ratty:` 777 frame carrying non-UTF-8 bytes belongs to
+        // another 777 user; the validator must not report it at all — the
+        // namespace check happens on the raw bytes, before UTF-8 decoding.
+        let mut report = Report::default();
+        check_osc_777(1, b"notify;body \xff\xfe\x00", &mut report);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+    }
+
+    #[test]
+    fn ratty_namespace_non_utf8_osc_777_frame_errors() {
+        // A `ratty:`-namespace frame that is not valid UTF-8 cannot be a
+        // real ratty command (the terminal only ever parses UTF-8); surface
+        // it rather than pass it through.
+        let mut report = Report::default();
+        check_osc_777(1, b"ratty:mood;mood=\xff\xfe", &mut report);
+        assert!(
+            report.errors.iter().any(|e| e.contains("not UTF-8")),
+            "{:?}",
+            report.errors
+        );
+    }
+
+    #[test]
+    fn rejects_unterminated_osc_777() {
+        let cast = cast_with_events(&[(0.0, "o", "\x1b]777;ratty:sound.play;kind=chime")]);
+        let report = validate(&cast);
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|e| e.contains("OSC 777 sequence starts but does not terminate")),
+            "{:?}",
+            report.errors
+        );
+    }
+
+    #[test]
+    fn accepts_st_terminated_osc_777() {
+        let cast = cast_with_events(&[(0.0, "o", "\x1b]777;ratty:sound.play;kind=click\x1b\\")]);
+        let report = validate(&cast);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
     }
 
     #[test]

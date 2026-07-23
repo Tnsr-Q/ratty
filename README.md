@@ -144,7 +144,9 @@ OSC 777 (the `ratty-ai` CLI) and read it back as structured JSON over the
 [Ratty Query Protocol](protocols/query.md) (OSC 778). Trusted `ratty-ai`
 collectors also publish live data visualizations — process, filesystem,
 git, and network snapshots — through the
-[Ratty Visualization Protocol](protocols/viz.md) (the OSC 777 `viz.*` family).
+[Ratty Visualization Protocol](protocols/viz.md) (the OSC 777 `viz.*` family),
+and the same 777 channel carries semantic sound — one-shot event marks and a
+scene ambient bed — documented in the [Ratty Sound Protocol](protocols/sound.md).
 
 RGP supports:
 

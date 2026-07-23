@@ -128,7 +128,8 @@ impl Plugin for RattyAiPlugin {
                     .after(apply_ai_commands)
                     .after(apply_ai_object_commands)
                     .after(crate::effects::apply_ai_effect_commands)
-                    .after(crate::viz::apply_viz_commands),
+                    .after(crate::viz::apply_viz_commands)
+                    .after(crate::sound::apply_sound_commands),
             );
     }
 }
@@ -223,6 +224,13 @@ pub fn apply_ai_commands(
             RattyAiCommand::VizSet { .. }
             | RattyAiCommand::VizEffect { .. }
             | RattyAiCommand::VizRemove { .. } => {}
+            // The sound organ (crate::sound::apply_sound_commands) reads the
+            // same AiCommand messages independently and owns the sound.*
+            // acks — in every build: feature-off it rejects `unsupported`
+            // itself, so this catch-all must never double-ack them.
+            RattyAiCommand::SoundPlay { .. }
+            | RattyAiCommand::SoundAmbientSet { .. }
+            | RattyAiCommand::SoundAmbientStop { .. } => {}
             other => {
                 debug!("ratty-ai: command received, handler not yet built: {other:?}");
                 reject(

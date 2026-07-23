@@ -425,15 +425,9 @@ enum Commands {
         #[arg(short, long, default_value = "1h")]
         expires: String,
     },
-    /// Play a sound.
-    Sound {
-        /// Sound kind.
-        #[arg(value_enum)]
-        kind: SoundKind,
-        /// Loop the sound.
-        #[arg(short, long)]
-        loop_sound: bool,
-    },
+    /// The sound organ: one-shot and ambient playback.
+    #[command(subcommand)]
+    Sound(SoundAction),
     /// AI presence avatar.
     #[command(subcommand)]
     Avatar(AvatarAction),
@@ -540,6 +534,42 @@ struct AnchorArgs {
 }
 
 #[derive(Subcommand)]
+enum SoundAction {
+    /// Play a registered one-shot kind.
+    Play {
+        /// Registered semantic kind (chime, alert, pulse, click).
+        kind: String,
+        /// Playback gain; the terminal clamps to the kind's registry max.
+        #[arg(short, long)]
+        gain: Option<f32>,
+    },
+    /// The scene ambient bed.
+    #[command(subcommand)]
+    Ambient(AmbientAction),
+}
+
+#[derive(Subcommand)]
+enum AmbientAction {
+    /// Set (or crossfade to) a registered ambient kind.
+    Set {
+        /// Registered ambient kind (ambient.hum).
+        kind: String,
+        /// Playback gain; the terminal clamps to the kind's registry max.
+        #[arg(short, long)]
+        gain: Option<f32>,
+        /// Crossfade duration in milliseconds.
+        #[arg(short, long)]
+        xfade: Option<u32>,
+    },
+    /// Fade out and clear the ambient bed.
+    Stop {
+        /// Fade-out duration in milliseconds.
+        #[arg(short, long)]
+        fade: Option<u32>,
+    },
+}
+
+#[derive(Subcommand)]
 enum UserAction {
     /// A user joins.
     Join {
@@ -634,16 +664,6 @@ enum MoodArg {
     Confused,
     Focused,
     Celebratory,
-}
-
-#[derive(Clone, Copy, ValueEnum)]
-enum SoundKind {
-    Click,
-    Error,
-    Success,
-    Warning,
-    Ambient,
-    Notify,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -870,12 +890,22 @@ fn command_to_osc(command: &Commands, stdin: &str) -> (String, String) {
                 .field("expires", expires)
                 .build(),
         ),
-        Commands::Sound { kind, loop_sound } => (
-            "sound".into(),
-            p().field("kind", sound_str(*kind))
-                .field("loop", loop_sound)
-                .build(),
-        ),
+        Commands::Sound(action) => match action {
+            SoundAction::Play { kind, gain } => (
+                "sound.play".into(),
+                p().field("kind", kind).opt("gain", *gain).build(),
+            ),
+            SoundAction::Ambient(AmbientAction::Set { kind, gain, xfade }) => (
+                "sound.ambient.set".into(),
+                p().field("kind", kind)
+                    .opt("gain", *gain)
+                    .opt("xfade", *xfade)
+                    .build(),
+            ),
+            SoundAction::Ambient(AmbientAction::Stop { fade }) => {
+                ("sound.ambient.stop".into(), p().opt("fade", *fade).build())
+            }
+        },
         Commands::Avatar(action) => match action {
             AvatarAction::Set { model, position } => (
                 "avatar.set".into(),
@@ -927,17 +957,6 @@ fn mood_str(mood: MoodArg) -> &'static str {
         MoodArg::Confused => "confused",
         MoodArg::Focused => "focused",
         MoodArg::Celebratory => "celebratory",
-    }
-}
-
-fn sound_str(kind: SoundKind) -> &'static str {
-    match kind {
-        SoundKind::Click => "click",
-        SoundKind::Error => "error",
-        SoundKind::Success => "success",
-        SoundKind::Warning => "warning",
-        SoundKind::Ambient => "ambient",
-        SoundKind::Notify => "notify",
     }
 }
 
@@ -2447,7 +2466,7 @@ mod tests {
     }
 
     #[test]
-    fn mood_and_sound_enums_map_to_strings() {
+    fn mood_enum_maps_to_strings() {
         assert_eq!(
             round_trip(
                 &Commands::Mood {
@@ -2459,18 +2478,44 @@ mod tests {
                 mood: "excited".into()
             }
         );
+    }
+
+    #[test]
+    fn sound_subcommands_round_trip() {
         assert_eq!(
             round_trip(
-                &Commands::Sound {
-                    kind: SoundKind::Success,
-                    loop_sound: false
-                },
+                &Commands::Sound(SoundAction::Play {
+                    kind: "chime".into(),
+                    gain: Some(0.5),
+                }),
                 ""
             ),
-            RattyAiCommand::Sound {
-                kind: "success".into(),
-                loop_sound: false,
+            RattyAiCommand::SoundPlay {
+                kind: "chime".into(),
+                gain: Some(0.5),
             }
+        );
+        assert_eq!(
+            round_trip(
+                &Commands::Sound(SoundAction::Ambient(AmbientAction::Set {
+                    kind: "ambient.hum".into(),
+                    gain: None,
+                    xfade: Some(800),
+                })),
+                ""
+            ),
+            RattyAiCommand::SoundAmbientSet {
+                kind: "ambient.hum".into(),
+                gain: None,
+                xfade: Some(800),
+            }
+        );
+        assert_eq!(
+            round_trip(
+                &Commands::Sound(SoundAction::Ambient(AmbientAction::Stop { fade: None })),
+                ""
+            ),
+            RattyAiCommand::SoundAmbientStop { fade: None }
         );
     }
 

@@ -73,6 +73,12 @@ its error ack (`code=bad-command`).
 > required object id on every `object.*` command — the wire cannot carry
 > both meanings, so the ack key is `tok=`.
 
+`code=` is an *outcome* code, not only a rejection code: an `ok=1` ack
+may carry a qualifier the caller should read. Today the only qualifier
+is `deferred` (a pre-unlock `sound.ambient.set` committed as retained
+state — see the [Ratty Sound Protocol](sound.md)); clients must ignore
+unknown codes on successful acks.
+
 Correlation tokens are transport metadata: the future macro recorder
 (M3.7) records canonical commands and must never capture them.
 
@@ -114,7 +120,8 @@ The 778 analog of the RGP support reply; keys are append-only.
               "max_reply_bytes": 4096, "objects_per_namespace": 64,
               "ids_per_session": 4096, "errors_per_namespace": 32,
               "viz_per_namespace": 32, "viz_payload_bytes": 32768,
-              "viz_items": 256 } }
+              "viz_items": 256, "sound_voices": 16,
+              "sound_plays_per_sec": 4 } }
 ```
 
 ### 2. `state.scene` — scene-global public state
@@ -122,6 +129,21 @@ The 778 analog of the RGP support reply; keys are append-only.
 Mode, warp, camera view (yaw/pitch/zoom/offset — drag internals are
 private), grid size, tween activity, cursor presentation, public effects
 (thinking/confidence/mood/flash/pulse/tint).
+
+Append-only `audio` key (M3.9): the sound organ's public state — see the
+[Ratty Sound Protocol](sound.md) for semantics:
+
+```json
+"audio": { "enabled": true, "unlocked": false,
+           "ambient": { "kind": null, "phase": "idle" }, "voices": 0 }
+```
+
+`enabled` reports whether the playback backend is compiled in (builds
+without the `sound` feature answer `false` honestly); `unlocked` is the
+browser autoplay gate (polled here, never pushed); `ambient.phase` is
+one of `idle`, `playing`, `crossfading`, `fading-out`; `voices` is the
+live one-shot count. Internal rate buckets and any retained pre-unlock
+request are not projected.
 
 ### 3. `state.objects` — the caller's complete records *(paginated)*
 
@@ -184,7 +206,10 @@ Append-only, kebab-case, carried in `code=`: `bad-envelope`,
 `unsupported`, `bad-command`, `bad-cursor`, `not-owner`, `unknown-id`,
 `no-anchor`, `already-exists`, `id-reused`, `session-budget`,
 `namespace-cap`, `bad-asset`, `bad-mode`, `bad-kind`, `kind-mismatch`,
-`internal` — plus the client-side `timeout` and `disposed`.
+`audio-locked`, `deferred`, `rate-limited`, `voice-cap`, `not-permitted`,
+`internal` — plus the client-side `timeout` and `disposed`. `deferred` is
+the one code that qualifies an `ok=1` ack rather than naming a rejection
+(see Command acks above and [sound.md](sound.md)).
 
 ## Client surfaces
 

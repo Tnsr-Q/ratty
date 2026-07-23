@@ -25,9 +25,24 @@ exclude = [
 # native binary and tests linking as before.
 crate-type = ["rlib", "cdylib"]
 
+[features]
+# The kira-backed sound organ (M3.9). The wire parser (`osc.rs`), the kind
+# registry, and the sound decision layer are always compiled; this feature
+# gates only the playback backend. `--no-default-features` builds answer
+# every sound.* command with an honest `unsupported` rejection.
+default = ["sound"]
+sound = ["dep:bevy_kira_audio"]
+
 [dependencies]
 anyhow = "1.0"
 base64 = "0.22"
+# The sound organ's playback backend (see [features]). Its bevy features
+# (std/bevy_asset/bevy_log) are already in the curated list below, and
+# bevy_audio stays off, as kira requires. Only ogg decoding is enabled —
+# the embedded sound registry ships .ogg exclusively.
+bevy_kira_audio = { version = "0.26", optional = true, default-features = false, features = [
+    "ogg",
+] }
 bevy = { version = "0.19.0", default-features = false, features = [
     "std",
     "async_executor",

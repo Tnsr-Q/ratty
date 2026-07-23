@@ -94,7 +94,8 @@ Each event is `[time, code, data]`:
   the byte stream (the terminal) never see time.
 - `code` — event type:
   - `"o"` — output: `data` is a string of bytes for the terminal (text, ANSI,
-    RGP, Kitty graphics). This is the only code required for playback.
+    RGP, OSC 777 control frames, Kitty graphics). This is the only code
+    required for playback.
   - `"m"` — marker: `data` is a label (e.g. `chapter:orchard`). Players MAY
     surface markers for navigation. Never fed to the terminal.
   - `"i"` — input (reserved): expected user input for future interactive
@@ -124,6 +125,51 @@ Each event is `[time, code, data]`:
 5. **Grid bounds.** Placement anchors SHOULD lie within the header
    `width`/`height` grid.
 
+## Sound inside Silk
+
+The scene DSL's typed `sound` step compiles to OSC 777 `sound.*` control
+frames — ordinary `"o"` bytes, so the container needs no format change (see
+[sound.md](sound.md) for the wire protocol and the terminal's decision
+table). One step sets exactly one of:
+
+| Field | Wire op | Meaning |
+|---|---|---|
+| `play` | `sound.play` | Play a one-shot kind: `chime`, `alert`, `pulse`, `click`. |
+| `ambient` | `sound.ambient.set` | Set or crossfade the scene ambient bed: `ambient.hum`. |
+| `stop: true` | `sound.ambient.stop` | Fade the ambient bed out. |
+
+plus optional `gain` (`0.0..=1.0`; the terminal clamps to the kind's registry
+maximum) and `xfade` (seconds — the crossfade for `ambient`, the fade-out for
+`stop`; the terminal clamps to its supported range, `0.1..=5.0` s).
+
+1. **Registered kinds only.** The wire names semantic kinds, never file
+   paths or URLs; the terminal resolves kinds against its embedded registry,
+   so the cast stays self-contained by construction. Unknown kinds are hard
+   compile errors, and `silk validate` re-checks the actual bytes against
+   the same shared registry.
+2. **No return channel.** A cast is one-way bytes: the compiler never emits
+   `tok=` (there is nowhere for an ack to go), and browser pre-unlock
+   drop/defer semantics play out entirely renderer-side — a cast cannot
+   react.
+3. **Prefer an ambient bed near `t=0` over precisely-timed one-shots.** In
+   the browser the first transmission autoplays before any user gesture:
+   pre-unlock one-shots are honestly dropped, while `ambient` is retained
+   and fades in after the first gesture — deferred semantics survive the
+   unlock.
+4. **Loop replays are clean.** The player's per-loop reset clears objects
+   and the screen, not the audio state, and setting the same ambient kind
+   again is a terminal-side no-op — a looping transmission that re-runs its
+   opening `ambient` step keeps its bed seamless.
+
+### Version skew
+
+The scene DSL is strict (unknown step fields are parse errors), so a
+`scene.json` containing a `sound` step does not parse in silk binaries built
+before the field existed. The answer is to rebuild silk — it is an in-repo
+tool (`cargo build --manifest-path tools/silk/Cargo.toml`). The *cast* side
+has no such skew: sound frames are just more `"o"` bytes, which older players
+pass through and non-sound terminals ignore.
+
 ## Conformance
 
 **Players** MUST: parse the header; deliver `"o"` event data to the terminal
@@ -132,7 +178,9 @@ header keys. Players SHOULD honor `loop`, `idle_time_limit`, markers, and the
 opening stage directives when the renderer supports them.
 
 **Validators** MUST reject: malformed JSONL, a missing or non-object header,
-non-monotonic times, and RGP rule violations (1)–(3) above.
+non-monotonic times, RGP rule violations (1)–(3) above, and `ratty:`-namespace
+OSC 777 frames the terminal's own parser cannot decode (the terminal drops
+those silently at playback; the validator surfaces them).
 
 ## Media type and naming
 

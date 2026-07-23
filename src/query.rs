@@ -97,6 +97,20 @@ pub mod codes {
     /// A live visualization under the id has a different kind and
     /// `replace=true` was not set.
     pub const KIND_MISMATCH: &str = "kind-mismatch";
+    /// A one-shot was requested while audio is locked (browser autoplay
+    /// policy, pre-gesture); the sound did not and will not play.
+    pub const AUDIO_LOCKED: &str = "audio-locked";
+    /// Qualifier on an `ok=1` ack: the ambient request committed as
+    /// retained state and fades in after the first user gesture unlocks
+    /// audio. There is no later notification — clients poll `state.scene`.
+    pub const DEFERRED: &str = "deferred";
+    /// The caller exceeded its per-namespace one-shot rate limit.
+    pub const RATE_LIMITED: &str = "rate-limited";
+    /// The one-shot voice caps (global or per-namespace) are full.
+    pub const VOICE_CAP: &str = "voice-cap";
+    /// The caller's ingress tier does not carry the required capability
+    /// (e.g. scene ambient audio is disabled by trusted config).
+    pub const NOT_PERMITTED: &str = "not-permitted";
     /// The query timed out client-side (never emitted by the terminal).
     pub const TIMEOUT: &str = "timeout";
     /// The session was disposed with the query outstanding.

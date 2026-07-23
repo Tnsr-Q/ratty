@@ -35,6 +35,7 @@ use crate::osc::{ACK_TOKEN_KEY, ai_object_namespace};
 use crate::query::{self, QueryEnvelope, WireErrorReply, codes};
 use crate::runtime::{IngressSource, TerminalRuntime};
 use crate::scene::{StageTween, TerminalPlaneView, TerminalPlaneWarp, TerminalPresentation};
+use crate::sound::SoundState;
 
 /// Diagnostics retained per agent namespace (a bounded ring; older entries
 /// are dropped, mirroring the bounded-resource posture of the object caps).
@@ -94,7 +95,9 @@ pub struct AckOutcome {
     pub token: String,
     /// Whether the command's immediate state mutation committed.
     pub ok: bool,
-    /// The rejection code when `ok` is false.
+    /// The outcome code: the rejection code when `ok` is false, or a
+    /// success qualifier (e.g. `deferred` for a pre-unlock ambient set)
+    /// when `ok` is true. The wire carries `code=` independently of `ok=`.
     pub code: Option<&'static str>,
 }
 
@@ -201,6 +204,26 @@ pub(crate) fn ack_commit(
     }
 }
 
+/// Writes a commit ack qualified by an outcome code (e.g. `deferred`)
+/// when the command opted in with `tok=`. The command committed — `ok=1`
+/// — but with a qualification the caller should read; this is not an
+/// error path and records no diagnostic.
+pub(crate) fn ack_commit_qualified(
+    acks: &mut MessageWriter<AckOutcome>,
+    source: IngressSource,
+    ack_token: &Option<String>,
+    code: &'static str,
+) {
+    if let Some(token) = ack_token {
+        acks.write(AckOutcome {
+            source,
+            token: token.clone(),
+            ok: true,
+            code: Some(code),
+        });
+    }
+}
+
 /// Records a rejection diagnostic and, when the command opted in with
 /// `tok=`, writes the matching error ack. Call this beside the existing
 /// rejection `warn!`s — it supplements them, it never replaces them.
@@ -246,6 +269,7 @@ pub fn answer_queries(
     cursor: Res<CursorSettings>,
     effects: Res<AiEffects>,
     viz: Res<crate::viz::VizRegistry>,
+    sound: Res<SoundState>,
 ) {
     // Acks first: a same-chunk "command with tok= then query" reads its
     // ack before the query reply, in mutation order.
@@ -284,6 +308,7 @@ pub fn answer_queries(
                     cursor: &cursor,
                     effects: &effects,
                     viz: &viz,
+                    sound: &sound,
                     grid: runtime.parser.screen().size(),
                 };
                 match answer(envelope, *source, &ctx) {
@@ -366,6 +391,7 @@ struct QueryCtx<'a> {
     cursor: &'a CursorSettings,
     effects: &'a AiEffects,
     viz: &'a crate::viz::VizRegistry,
+    sound: &'a SoundState,
     /// Live grid size as `(rows, cols)`, from the parser screen.
     grid: (u16, u16),
 }
@@ -416,6 +442,8 @@ fn caps(ctx: &QueryCtx<'_>) -> Value {
             "viz_per_namespace": crate::viz::MAX_VIZ_PER_NAMESPACE,
             "viz_payload_bytes": crate::viz::MAX_VIZ_PAYLOAD_BYTES,
             "viz_items": crate::viz::MAX_VIZ_ITEMS_PER_SNAPSHOT,
+            "sound_voices": crate::sound::MAX_SOUND_VOICES,
+            "sound_plays_per_sec": crate::sound::SOUND_PLAYS_PER_SEC,
         },
     })
 }
@@ -430,6 +458,7 @@ fn scene_state(ctx: &QueryCtx<'_>) -> Value {
         Mode::Mobius3d => "mobius3d",
     };
     let effects = ctx.effects.public_state();
+    let audio = ctx.sound.public_state();
     let (rows, cols) = ctx.grid;
     json!({
         "mode": mode,
@@ -460,6 +489,18 @@ fn scene_state(ctx: &QueryCtx<'_>) -> Value {
             "flash": effects.flash,
             "pulse": effects.pulse,
             "tint": effects.tint,
+        },
+        // Append-only (M3.9): the sound organ's public state. Feature-off
+        // builds report `enabled: false` honestly — the key shape is
+        // feature-independent. Unlock status is polled here, never pushed.
+        "audio": {
+            "enabled": audio.enabled,
+            "unlocked": audio.unlocked,
+            "ambient": {
+                "kind": audio.ambient_kind,
+                "phase": audio.ambient_phase,
+            },
+            "voices": audio.voices,
         },
     })
 }
@@ -838,12 +879,13 @@ mod tests {
     use crate::query::{ParsedReply, ReplyScanner, parse_reply_body, query_sequence};
     use crate::runtime::VirtualTerminalHost;
     use crate::scene::TerminalPresentationMode;
+    use crate::sound::apply_sound_commands;
     use crate::systems::pump_pty_output;
     use crate::terminal::TerminalRedrawState;
 
     /// A headless app wired exactly like the real pipeline: virtual
-    /// transport → pump → object handler → query answerer, chained so one
-    /// `update()` is one closed loop.
+    /// transport → pump → object handler → sound handler → query answerer,
+    /// chained so one `update()` is one closed loop.
     fn test_app() -> (App, VirtualTerminalHost) {
         let config = AppConfig::default();
         let (runtime, host) = TerminalRuntime::virtual_channel(&config);
@@ -858,6 +900,8 @@ mod tests {
         app.init_resource::<QuerySession>();
         app.init_resource::<AiEffects>();
         app.init_resource::<crate::viz::VizRegistry>();
+        app.init_resource::<SoundState>();
+        app.init_resource::<Time>();
         app.insert_resource(TerminalPresentation {
             mode: TerminalPresentationMode::Flat2d,
         });
@@ -875,6 +919,7 @@ mod tests {
                 pump_pty_output,
                 apply_ai_object_commands,
                 crate::viz::apply_viz_commands,
+                apply_sound_commands,
                 answer_queries,
             )
                 .chain(),
@@ -1424,5 +1469,84 @@ mod tests {
             "capture provenance is owner-only"
         );
         assert!(items[1].get("pending_effects").is_none());
+    }
+
+    /// The M3.9 closed loop: a locked one-shot drops honestly, a locked
+    /// ambient set defers (ok=1;code=deferred), the first user gesture
+    /// unlocks and starts the retained bed — observable only by polling
+    /// `state.scene` (there are no push events) — and stop fades it out.
+    #[test]
+    fn sound_locked_drop_deferred_ambient_unlock_and_poll() {
+        let (mut app, host) = test_app();
+        {
+            // The decision layer is under test in every feature matrix;
+            // pin the backend-present bit and start locked (the browser
+            // pre-unlock path — the normal first-load path on the site).
+            let mut sound = app.world_mut().resource_mut::<SoundState>();
+            sound.enabled = true;
+            sound.unlocked = false;
+        }
+        // One chunk: a tok='d one-shot (dropped) then a tok='d ambient
+        // set (deferred). Acks arrive in command order.
+        host.feed_tx
+            .send(
+                b"\x1b]777;ratty:sound.play;kind=chime&tok=t1\x07\
+                  \x1b]777;ratty:sound.ambient.set;kind=ambient.hum&tok=t2\x07"
+                    .to_vec(),
+            )
+            .expect("virtual feed accepts bytes");
+        app.update();
+        let replies = drain_replies(&host);
+        assert_eq!(replies.len(), 2);
+        assert!(replies[0].ack && !replies[0].ok);
+        assert_eq!(replies[0].code.as_deref(), Some(codes::AUDIO_LOCKED));
+        assert!(replies[1].ack && replies[1].ok, "deferred still commits");
+        assert_eq!(replies[1].code.as_deref(), Some(codes::DEFERRED));
+
+        // Poll while locked: nothing audible, the retained bed is private.
+        let reply = run_query(&mut app, &host, "q1", "state.scene", None);
+        let scene = payload(&reply);
+        assert_eq!(scene["audio"]["enabled"], json!(true));
+        assert_eq!(scene["audio"]["unlocked"], json!(false));
+        assert_eq!(scene["audio"]["ambient"]["kind"], json!(null));
+        assert_eq!(scene["audio"]["ambient"]["phase"], json!("idle"));
+        assert_eq!(scene["audio"]["voices"], json!(0));
+
+        // The first user gesture unlocks; the retained bed fades in.
+        app.world_mut().resource_mut::<SoundState>().unlock();
+        let reply = run_query(&mut app, &host, "q2", "state.scene", None);
+        let scene = payload(&reply);
+        assert_eq!(scene["audio"]["unlocked"], json!(true));
+        assert_eq!(scene["audio"]["ambient"]["kind"], json!("ambient.hum"));
+        assert_eq!(scene["audio"]["ambient"]["phase"], json!("crossfading"));
+
+        // Stop is an idempotent commit; the bed fades out.
+        host.feed_tx
+            .send(b"\x1b]777;ratty:sound.ambient.stop;tok=t3\x07".to_vec())
+            .expect("virtual feed accepts bytes");
+        app.update();
+        let replies = drain_replies(&host);
+        assert_eq!(replies.len(), 1);
+        assert!(replies[0].ok);
+        let reply = run_query(&mut app, &host, "q3", "state.scene", None);
+        assert_eq!(
+            payload(&reply)["audio"]["ambient"]["phase"],
+            json!("fading-out")
+        );
+    }
+
+    #[test]
+    fn sound_limits_are_advertised_in_caps() {
+        let (mut app, host) = test_app();
+        let reply = run_query(&mut app, &host, "q1", "caps", None);
+        let caps = payload(&reply);
+        assert_eq!(
+            caps["limits"]["sound_voices"],
+            json!(crate::sound::MAX_SOUND_VOICES)
+        );
+        assert_eq!(
+            caps["limits"]["sound_plays_per_sec"],
+            json!(crate::sound::SOUND_PLAYS_PER_SEC)
+        );
     }
 }

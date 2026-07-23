@@ -47,6 +47,8 @@ pub struct AppConfig {
     pub theme: ThemeConfig,
     /// Cursor settings.
     pub cursor: CursorConfig,
+    /// Audio settings.
+    pub audio: AudioConfig,
 }
 
 impl AppConfig {
@@ -422,6 +424,35 @@ impl ThemePaletteConfig {
             magenta: [214, 112, 214],
             cyan: [41, 184, 219],
             white: [255, 255, 255],
+        }
+    }
+}
+
+/// Audio configuration: the trusted mixer tier.
+///
+/// Master gain and mute are config-only — no wire command can write them;
+/// the wire supplies only registry-clamped per-play gains. The scene-ambient
+/// capability is likewise granted here (trusted config), never in-band.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct AudioConfig {
+    /// Master gain applied to all playback, `0.0..=1.0`.
+    pub master_gain: f32,
+    /// Mutes all playback without changing per-play gains.
+    pub muted: bool,
+    /// Grants the scene-ambient capability: whether `sound.ambient.set`
+    /// may drive the ambient bed. Transmissions and agents share the same
+    /// local ingress today, so config is the only trusted tier;
+    /// authenticated ingress tiers can carry this grant later.
+    pub allow_scene_ambient: bool,
+}
+
+impl Default for AudioConfig {
+    fn default() -> Self {
+        Self {
+            master_gain: 0.8,
+            muted: false,
+            allow_scene_ambient: true,
         }
     }
 }
