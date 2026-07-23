@@ -22,6 +22,18 @@ mod rgp;
 #[path = "../../../src/osc.rs"]
 mod osc;
 
+// Ratty's query-channel codec (base64url + reject codes), a viz_wire
+// dependency.
+#[allow(dead_code)]
+#[path = "../../../src/query.rs"]
+mod query;
+
+// Ratty's viz payload schemas and decoder, shared so `viz` steps are
+// validated with the terminal's own decoder at compile time.
+#[allow(dead_code)]
+#[path = "../../../src/viz_wire.rs"]
+mod viz_wire;
+
 use std::path::PathBuf;
 use std::process::ExitCode;
 

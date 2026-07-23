@@ -3,9 +3,10 @@
 //! A scene is JSON with `meta`, `stage`, and a `cast` of timed steps. Each
 //! step carries `at` (absolute seconds) plus exactly one verb field:
 //! `print`, `register`, `place`, `update`, `tween`, `camera`, `ai`,
-//! `sound`, `delete`, `marker`, or `clear`. Rows and columns are 0-based
-//! terminal cells; `place.row`/`col` are the CENTER of the placement,
-//! matching RGP semantics.
+//! `sound`, `viz`, `delete`, `marker`, or `clear`. Rows and columns are
+//! 0-based terminal cells; `place.row`/`col` are the CENTER of the
+//! placement, matching RGP semantics (viz anchors are the footprint's
+//! top-left, matching `viz.set`).
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -130,6 +131,9 @@ pub struct Step {
     /// Sound organ command (OSC 777 `sound.*` family).
     #[serde(default)]
     pub sound: Option<SoundArgs>,
+    /// Data visualization snapshot (OSC 777 `viz.set`).
+    #[serde(default)]
+    pub viz: Option<VizArgs>,
     /// Delete one object (`{"id": N}`) or all (`"all"`).
     #[serde(default)]
     pub delete: Option<DeleteArg>,
@@ -152,6 +156,7 @@ impl Step {
             + usize::from(self.camera.is_some())
             + usize::from(self.ai.is_some())
             + usize::from(self.sound.is_some())
+            + usize::from(self.viz.is_some())
             + usize::from(self.delete.is_some())
             + usize::from(self.marker.is_some())
             + usize::from(self.clear.is_some())
@@ -466,6 +471,45 @@ pub struct SoundArgs {
     /// the terminal clamps to its supported range.
     #[serde(default)]
     pub xfade: Option<f64>,
+}
+
+/// `viz` verb arguments: one typed data-visualization snapshot lowered
+/// onto the generic `viz.set` wire — no new wire authority. `data` is the
+/// kind's schema-conforming JSON inline in the scene; the compiler
+/// validates it with the terminal's own decoder, and a missing `capture`
+/// is stamped `authored` (deterministically, so compiled casts stay
+/// byte-reproducible). There is deliberately no effect or remove form and
+/// no `tok=` (a cast has no return channel); `deny_unknown_fields` makes
+/// those absences airtight.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VizArgs {
+    /// Caller-owned visualization id in the AI range (`>= 0x8000_0000`).
+    /// Required and explicit: two viz blocks sharing an id upsert the
+    /// same visualization, so the choice must be the author's.
+    #[serde(default)]
+    pub id: Option<u32>,
+    /// Registered payload kind (e.g. `chart.bar.v1`, `timeline.v1`).
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// Inline schema-conforming JSON payload.
+    #[serde(default)]
+    pub data: Option<serde_json::Value>,
+    /// Anchor column of the footprint's top-left cell (with `y`).
+    #[serde(default)]
+    pub x: Option<u16>,
+    /// Anchor row of the footprint's top-left cell (with `x`).
+    #[serde(default)]
+    pub y: Option<u16>,
+    /// Footprint width in cells.
+    #[serde(default)]
+    pub cols: Option<u16>,
+    /// Footprint height in cells.
+    #[serde(default)]
+    pub rows: Option<u16>,
+    /// Allow replacing a live visualization of a different kind.
+    #[serde(default)]
+    pub replace: Option<bool>,
 }
 
 /// `delete` verb argument.

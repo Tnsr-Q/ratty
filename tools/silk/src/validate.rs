@@ -11,6 +11,7 @@ use anyhow::Result;
 use crate::cast::{Cast, read_cast};
 use crate::osc;
 use crate::rgp::{RGP_APC_START, RgpOperation, RgpRegisterSource, consume_sequence};
+use crate::viz_wire;
 
 /// Assets that ship inside ratty itself and are legal `path=` registrations.
 const EMBEDDED_ASSETS: [&str; 4] = [
@@ -450,7 +451,56 @@ fn check_osc_777(line: usize, content: &[u8], report: &mut Report) {
         osc::RattyAiCommand::SoundAmbientSet { kind, .. } => {
             check_sound_kind(line, &kind, osc::SoundKindClass::Ambient, report);
         }
+        osc::RattyAiCommand::VizSet {
+            id,
+            kind,
+            data,
+            x,
+            y,
+            cols,
+            rows,
+            ..
+        } => {
+            check_viz(line, id, &kind, &data, [&x, &y, &cols, &rows], report);
+        }
         _ => {}
+    }
+}
+
+/// Re-runs the terminal's own viz decoder over a `viz.set` frame and
+/// re-parses the raw placement params the wire deliberately carries as
+/// strings (ratty rejects a present-but-malformed one with
+/// `bad-payload`), so `silk validate` reports exactly what ratty would
+/// reject.
+fn check_viz(
+    line: usize,
+    id: u32,
+    kind: &str,
+    data: &str,
+    placement: [&Option<String>; 4],
+    report: &mut Report,
+) {
+    if osc::ai_object_namespace(id).is_none() {
+        report.errors.push(format!(
+            "line {line}: viz.set id {id:#010x} is below the AI-owned range; ratty rejects \
+             this with not-owner"
+        ));
+    }
+    if let Err(error) = viz_wire::decode_viz_payload(kind, data) {
+        report.errors.push(format!(
+            "line {line}: viz.set payload fails ratty's decoder ({}): {}",
+            error.code, error.message
+        ));
+    }
+    for (name, value) in ["x", "y", "cols", "rows"].iter().zip(placement) {
+        if let Some(value) = value
+            && value.parse::<u16>().is_err()
+        {
+            report.errors.push(format!(
+                "line {line}: viz.set {name}={value:?} is not a u16 cell coordinate; ratty \
+                 rejects this with bad-payload"
+            ));
+        }
     }
 }
 
@@ -733,6 +783,59 @@ mod tests {
             ),
         ] {
             let cast = cast_with_events(&[(0.0, "o", data)]);
+            let report = validate(&cast);
+            assert!(
+                report.errors.iter().any(|e| e.contains(expected)),
+                "expected \"{expected}\" for {data:?}, got {:?}",
+                report.errors
+            );
+        }
+    }
+
+    #[test]
+    fn viz_frames_re_run_rattys_decoder() {
+        // A schema-valid payload passes.
+        let good = {
+            let payload = serde_json::json!({
+                "capture": { "source": "authored", "ts": "authored" },
+                "items": [{ "key": "a", "value": 1.0 }],
+            });
+            let encoded = crate::query::b64url_encode(payload.to_string().as_bytes());
+            format!("\x1b]777;ratty:viz.set;id=2147483720&kind=chart.bar.v1&data={encoded}\x07")
+        };
+        let cast = cast_with_events(&[(0.0, "o", good.as_str())]);
+        let report = validate(&cast);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+
+        // Unknown kind, schema-violating payload, out-of-range id, and a
+        // malformed placement param each report what ratty would reject.
+        let bad_payload = crate::query::b64url_encode(b"{}");
+        for (data, expected) in [
+            (
+                format!(
+                    "\x1b]777;ratty:viz.set;id=2147483720&kind=chart.pie.v1&data={bad_payload}\x07"
+                ),
+                "bad-kind",
+            ),
+            (
+                format!(
+                    "\x1b]777;ratty:viz.set;id=2147483720&kind=chart.bar.v1&data={bad_payload}\x07"
+                ),
+                "bad-payload",
+            ),
+            (
+                format!("\x1b]777;ratty:viz.set;id=42&kind=chart.bar.v1&data={bad_payload}\x07"),
+                "not-owner",
+            ),
+            (
+                format!(
+                    "\x1b]777;ratty:viz.set;id=2147483720&kind=chart.bar.v1&\
+                     data={bad_payload}&x=abc&y=1\x07"
+                ),
+                "not a u16 cell coordinate",
+            ),
+        ] {
+            let cast = cast_with_events(&[(0.0, "o", data.as_str())]);
             let report = validate(&cast);
             assert!(
                 report.errors.iter().any(|e| e.contains(expected)),
