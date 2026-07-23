@@ -329,7 +329,7 @@ pub(crate) fn timeline_window(timeline: &TimelineV1) -> (f64, f64) {
 
 /// Normalizes `value` into `low..=high` as `0..=1`, mapping a degenerate
 /// range onto its center.
-fn range_normalized(value: f64, low: f64, high: f64) -> f32 {
+pub(crate) fn range_normalized(value: f64, low: f64, high: f64) -> f32 {
     let span = high - low;
     if span <= f64::EPSILON {
         return 0.5;
@@ -341,6 +341,16 @@ fn range_normalized(value: f64, low: f64, high: f64) -> f32 {
 /// dial pins, the printed value stays honest.
 pub(crate) fn gauge_fraction(item: &ChartGaugeItem) -> f32 {
     range_normalized(item.value, item.min, item.max)
+}
+
+/// A series' palette slot: its explicit state, else its position in
+/// [`SERIES_PALETTE_CYCLE`]. Shared with the underlay so polylines and
+/// markers can never disagree on a series' color.
+pub(crate) fn line_series_palette(series: &ChartSeries, index: usize) -> VizPaletteSlot {
+    series.state.map_or(
+        SERIES_PALETTE_CYCLE[index % SERIES_PALETTE_CYCLE.len()],
+        VizPaletteSlot::from,
+    )
 }
 
 /// Lowers a decoded payload onto the shared render vocabulary, in item
@@ -450,10 +460,7 @@ pub fn viz_child_specs(payload: &VizPayload) -> Vec<VizChildSpec> {
                     VizChildSpec {
                         key: series.name.clone(),
                         magnitude: y,
-                        palette: series.state.map_or(
-                            SERIES_PALETTE_CYCLE[index % SERIES_PALETTE_CYCLE.len()],
-                            VizPaletteSlot::from,
-                        ),
+                        palette: line_series_palette(series, index),
                         slot: VizSlot::Marker { x, y },
                     }
                 })
