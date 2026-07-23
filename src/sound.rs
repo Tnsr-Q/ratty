@@ -28,6 +28,8 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use bevy::ecs::message::{MessageReader, MessageWriter};
+use bevy::input::ButtonState;
+use bevy::input::keyboard::KeyboardInput;
 use bevy::prelude::*;
 use rust_embed::RustEmbed;
 
@@ -363,13 +365,21 @@ pub struct SoundPlugin;
 impl Plugin for SoundPlugin {
     fn build(&self, app: &mut App) {
         // Message registrations are idempotent; RattyAiPlugin also adds
-        // these, but registering here keeps the plugin self-contained.
+        // these (and InputPlugin adds KeyboardInput), but registering here
+        // keeps the plugin self-contained.
         app.add_message::<AiCommand>()
             .add_message::<AckOutcome>()
+            .add_message::<KeyboardInput>()
             .init_resource::<SoundState>()
             .add_systems(
                 Update,
                 apply_sound_commands.after(crate::systems::pump_pty_output),
+            )
+            // A keystroke is a user gesture: unlock before this frame's
+            // decisions so the gesture's own commands already play.
+            .add_systems(
+                Update,
+                unlock_on_keyboard_input.before(apply_sound_commands),
             );
         #[cfg(feature = "sound")]
         {
@@ -600,6 +610,22 @@ pub fn apply_sound_commands(
             }
             _ => {}
         }
+    }
+}
+
+/// Unlocks audio on the first genuine keystroke: a key press IS a user
+/// gesture (the defensive unlock path for embedders that feed real
+/// keyboard input; the browser page additionally forwards pointer
+/// gestures through `RattySession::user_gesture`). Native builds are born
+/// unlocked, so this is a no-op outside wasm. Ordered before
+/// [`apply_sound_commands`] so the gesture frame's own `sound.*` commands
+/// already see the unlocked state.
+fn unlock_on_keyboard_input(mut keys: MessageReader<KeyboardInput>, mut state: ResMut<SoundState>) {
+    if state.unlocked {
+        return;
+    }
+    if keys.read().any(|event| event.state == ButtonState::Pressed) {
+        state.unlock();
     }
 }
 
@@ -1162,6 +1188,54 @@ mod tests {
         // Unlock promotes the retained request into a fade-in.
         app.world_mut().resource_mut::<SoundState>().unlock();
         let state = state(&app);
+        assert_eq!(
+            state.ambient.current.map(|track| track.kind),
+            Some("ambient.hum")
+        );
+        assert_eq!(state.ambient.phase, AmbientPhase::Crossfading);
+        assert!(state.ambient.retained_pre_unlock.is_none());
+    }
+
+    #[test]
+    fn first_key_press_unlocks_and_promotes_the_retained_ambient() {
+        use bevy::input::keyboard::Key;
+
+        fn key_event(state: ButtonState) -> KeyboardInput {
+            KeyboardInput {
+                key_code: KeyCode::Enter,
+                logical_key: Key::Enter,
+                state,
+                text: None,
+                repeat: false,
+                window: Entity::PLACEHOLDER,
+            }
+        }
+
+        let mut app = App::new();
+        app.add_message::<KeyboardInput>();
+        app.init_resource::<SoundState>();
+        app.add_systems(Update, unlock_on_keyboard_input);
+        {
+            let mut state = app.world_mut().resource_mut::<SoundState>();
+            state.unlocked = false;
+            state.ambient.retained_pre_unlock = Some(AmbientTrack {
+                kind: "ambient.hum",
+                gain: 0.5,
+            });
+        }
+        // A key release alone is not a gesture.
+        app.world_mut()
+            .resource_mut::<Messages<KeyboardInput>>()
+            .write(key_event(ButtonState::Released));
+        app.update();
+        assert!(!app.world().resource::<SoundState>().unlocked);
+        // The first press unlocks and fades the retained bed in.
+        app.world_mut()
+            .resource_mut::<Messages<KeyboardInput>>()
+            .write(key_event(ButtonState::Pressed));
+        app.update();
+        let state = app.world().resource::<SoundState>();
+        assert!(state.unlocked, "a key press is a user gesture");
         assert_eq!(
             state.ambient.current.map(|track| track.kind),
             Some("ambient.hum")

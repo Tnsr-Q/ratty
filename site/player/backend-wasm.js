@@ -21,6 +21,10 @@ export class WasmBackend {
     if (!WasmBackend.supported()) {
       throw new Error("WebGPU unavailable");
     }
+    // Before the module boots: wrap the AudioContext constructors so the
+    // context the wasm audio backend creates during startup (suspended by
+    // browser autoplay policy) can be resumed on the first real gesture.
+    const audioContexts = captureAudioContexts();
     const { default: init, start } = await import("../pkg/ratty.js");
     await init();
     this.session = start(this.canvasSelector, buildConfigToml(header));
@@ -29,7 +33,27 @@ export class WasmBackend {
     for (const data of this.backlog) this.feed(data);
     this.backlog = [];
     this.startInputPolling();
+    this.installUnlockListeners(audioContexts);
     this.onready?.();
+  }
+
+  // One-time browser-autoplay unlock. The first genuine gesture resumes
+  // the captured AudioContexts (the wasm audio backend only tries once,
+  // at creation — before any gesture exists) and reports the gesture to
+  // the session, which unlocks the sound organ and fades in a deferred
+  // ambient bed. Pre-unlock semantics are the normal first-load path:
+  // the first transmission autoplays with no gesture.
+  installUnlockListeners(audioContexts) {
+    const unlock = () => {
+      window.removeEventListener("pointerdown", unlock);
+      window.removeEventListener("keydown", unlock);
+      for (const context of audioContexts) {
+        if (context.state !== "running") context.resume().catch(() => {});
+      }
+      this.session?.user_gesture();
+    };
+    window.addEventListener("pointerdown", unlock, { passive: true });
+    window.addEventListener("keydown", unlock);
   }
 
   startInputPolling() {
@@ -93,6 +117,29 @@ export class WasmBackend {
   }
 
   marker() {}
+}
+
+// Wraps window.AudioContext (and the webkit alias) so every context
+// constructed after this call is recorded for gesture-time resume. The
+// wasm side never sees these: the page owns the browser-policy dance, the
+// terminal owns the unlock state. Idempotent — one shared capture list.
+function captureAudioContexts() {
+  if (window.__rattyAudioContexts) return window.__rattyAudioContexts;
+  const captured = [];
+  for (const name of ["AudioContext", "webkitAudioContext"]) {
+    const Original = window[name];
+    if (typeof Original !== "function") continue;
+    const Captured = function (...args) {
+      const context = new Original(...args);
+      captured.push(context);
+      return context;
+    };
+    Captured.prototype = Original.prototype;
+    Object.setPrototypeOf(Captured, Original);
+    window[name] = Captured;
+  }
+  window.__rattyAudioContexts = captured;
+  return captured;
 }
 
 // The cast header carries the stage; ratty's config carries the theme and
