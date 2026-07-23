@@ -50,6 +50,41 @@ pub fn ai_object_namespace(id: u32) -> Option<u8> {
     (id >= AI_OBJECT_ID_MIN).then_some(((id >> AI_OBJECT_INDEX_BITS) & 0x7F) as u8)
 }
 
+/// Classification of a registered semantic sound kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SoundKindClass {
+    /// A short event sound played once via `sound.play`.
+    OneShot,
+    /// A looping scene bed driven via `sound.ambient.set`.
+    Ambient,
+}
+
+/// The registered semantic sound kinds and their classes.
+///
+/// Sound has a semantic basis, not a decorative one: `chime` marks a task
+/// or transition completing, `alert` demands attention (an error), `pulse`
+/// is a heartbeat/progress tick, `click` is an acknowledgment, and
+/// `ambient.hum` is the scene bed. The wire only ever names these kinds —
+/// never paths or URLs; the terminal resolves kinds against its embedded
+/// registry. The list lives in this shared module so authoring tools
+/// (`tools/silk`, `ratty-ai`) validate kinds without the audio feature.
+pub const SOUND_KINDS: &[(&str, SoundKindClass)] = &[
+    ("chime", SoundKindClass::OneShot),
+    ("alert", SoundKindClass::OneShot),
+    ("pulse", SoundKindClass::OneShot),
+    ("click", SoundKindClass::OneShot),
+    ("ambient.hum", SoundKindClass::Ambient),
+];
+
+/// Looks up the class of a registered sound kind, or `None` when the kind
+/// is not registered.
+pub fn sound_kind_class(kind: &str) -> Option<SoundKindClass> {
+    SOUND_KINDS
+        .iter()
+        .find(|(name, _)| *name == kind)
+        .map(|(_, class)| *class)
+}
+
 /// A command parsed from an OSC 777 control sequence.
 ///
 /// Variants are grouped by subsystem. The first block is reachable today
@@ -355,12 +390,27 @@ pub enum RattyAiCommand {
     },
 
     // ── Sound ──
-    /// Play a sound.
-    Sound {
-        /// Sound kind.
+    /// Play a registered one-shot sound (`sound.play`).
+    SoundPlay {
+        /// Registered semantic kind (see [`SOUND_KINDS`]); never a path.
         kind: String,
-        /// Loop the sound.
-        loop_sound: bool,
+        /// Requested gain; the terminal clamps to the kind's registry
+        /// maximum (the wire requests, it never owns the mixer).
+        gain: Option<f32>,
+    },
+    /// Set (or crossfade to) the scene ambient bed (`sound.ambient.set`).
+    SoundAmbientSet {
+        /// Registered ambient kind (see [`SOUND_KINDS`]).
+        kind: String,
+        /// Requested gain; clamped to the kind's registry maximum.
+        gain: Option<f32>,
+        /// Crossfade duration in milliseconds; clamped terminal-side.
+        xfade: Option<u32>,
+    },
+    /// Fade out and clear the scene ambient bed (`sound.ambient.stop`).
+    SoundAmbientStop {
+        /// Fade-out duration in milliseconds; clamped terminal-side.
+        fade: Option<u32>,
     },
 
     // ── Avatar ──
@@ -670,10 +720,19 @@ fn parse_action(action: &str, p: &Payload) -> Option<RattyAiCommand> {
             expires: p.string_or("expires", "1h"),
         },
 
-        // Sound
-        "sound" => RattyAiCommand::Sound {
-            kind: p.string_or("kind", "click"),
-            loop_sound: p.flag("loop"),
+        // Sound. (The bare `sound` stub action is retired: nothing ever
+        // handled it, so its removal breaks no working caller.)
+        "sound.play" => RattyAiCommand::SoundPlay {
+            kind: p.string("kind")?,
+            gain: p.opt("gain"),
+        },
+        "sound.ambient.set" => RattyAiCommand::SoundAmbientSet {
+            kind: p.string("kind")?,
+            gain: p.opt("gain"),
+            xfade: p.opt("xfade"),
+        },
+        "sound.ambient.stop" => RattyAiCommand::SoundAmbientStop {
+            fade: p.opt("fade"),
         },
 
         // Avatar
@@ -967,6 +1026,68 @@ mod tests {
     }
 
     #[test]
+    fn sound_play_requires_a_kind_and_reads_optional_gain() {
+        assert_eq!(
+            parse_command("ratty:sound.play;kind=chime"),
+            Some(RattyAiCommand::SoundPlay {
+                kind: "chime".to_string(),
+                gain: None,
+            })
+        );
+        assert_eq!(
+            parse_command("ratty:sound.play;kind=alert&gain=0.5"),
+            Some(RattyAiCommand::SoundPlay {
+                kind: "alert".to_string(),
+                gain: Some(0.5),
+            })
+        );
+        assert!(parse_command("ratty:sound.play").is_none(), "kind required");
+    }
+
+    #[test]
+    fn sound_ambient_set_and_stop_parse_their_fields() {
+        assert_eq!(
+            parse_command("ratty:sound.ambient.set;kind=ambient.hum&gain=0.4&xfade=800"),
+            Some(RattyAiCommand::SoundAmbientSet {
+                kind: "ambient.hum".to_string(),
+                gain: Some(0.4),
+                xfade: Some(800),
+            })
+        );
+        assert!(
+            parse_command("ratty:sound.ambient.set").is_none(),
+            "kind required"
+        );
+        assert_eq!(
+            parse_command("ratty:sound.ambient.stop"),
+            Some(RattyAiCommand::SoundAmbientStop { fade: None })
+        );
+        assert_eq!(
+            parse_command("ratty:sound.ambient.stop;fade=250"),
+            Some(RattyAiCommand::SoundAmbientStop { fade: Some(250) })
+        );
+    }
+
+    #[test]
+    fn the_bare_sound_stub_action_is_retired() {
+        assert!(parse_command("ratty:sound;kind=success").is_none());
+    }
+
+    #[test]
+    fn sound_kind_registry_classifies_registered_kinds() {
+        assert_eq!(sound_kind_class("chime"), Some(SoundKindClass::OneShot));
+        assert_eq!(sound_kind_class("alert"), Some(SoundKindClass::OneShot));
+        assert_eq!(sound_kind_class("pulse"), Some(SoundKindClass::OneShot));
+        assert_eq!(sound_kind_class("click"), Some(SoundKindClass::OneShot));
+        assert_eq!(
+            sound_kind_class("ambient.hum"),
+            Some(SoundKindClass::Ambient)
+        );
+        assert_eq!(sound_kind_class("success"), None, "the stub kinds are gone");
+        assert_eq!(sound_kind_class(""), None);
+    }
+
+    #[test]
     fn ack_token_rides_any_command() {
         let control = parse_control("ratty:mode;3d&tok=abc-123").expect("ratty namespace");
         assert_eq!(control.ack_token.as_deref(), Some("abc-123"));
@@ -1051,7 +1172,11 @@ mod tests {
             "ratty:user.leave;name=alice",
             "ratty:user.cursor;name=alice&x=1&y=2",
             "ratty:note;text=hi&x=1&y=2",
-            "ratty:sound;kind=success",
+            "ratty:sound.play;kind=chime",
+            "ratty:sound.play;kind=click&gain=0.4",
+            "ratty:sound.ambient.set;kind=ambient.hum&xfade=800",
+            "ratty:sound.ambient.stop",
+            "ratty:sound.ambient.stop;fade=250",
             "ratty:avatar.set;model=a.glb",
             "ratty:avatar.gesture;gesture=point",
             "ratty:avatar.speak;text=hi",
