@@ -1003,21 +1003,63 @@ const MAX_FS_WALK_ENTRIES: usize = 4096;
 const KILL_POLL: Duration = Duration::from_millis(100);
 
 /// Replaces control characters (never legitimate in a label, potentially
-/// hostile in terminal-bound data) and truncates to `max` bytes on a char
-/// boundary.
-fn clean_label_to(value: &str, max: usize) -> String {
-    let cleaned: String = value
+/// hostile in terminal-bound data), returning the cleaned-but-unbounded
+/// string.
+fn clean_control(value: &str) -> String {
+    value
         .chars()
         .map(|c| if c.is_control() { '?' } else { c })
-        .collect();
+        .collect()
+}
+
+/// Bytes reserved for the disambiguating suffix on a truncated label:
+/// `#` plus eight hex digits of an FNV-1a hash of the full cleaned value.
+const LABEL_HASH_SUFFIX_BYTES: usize = 9;
+
+/// Whether [`clean_label`] would truncate (and thus hash-disambiguate)
+/// this value — i.e. its control-cleaned byte length exceeds the wire
+/// label bound. Used to declare path truncation in `fs` provenance.
+fn label_would_truncate(value: &str) -> bool {
+    clean_control(value).len() > osc::MAX_VIZ_LABEL_BYTES
+}
+
+/// Replaces control characters and bounds the result to `max` bytes on a
+/// char boundary. Plain truncation would collapse two distinct values
+/// that share a `max`-byte prefix into one string — and paths, branch
+/// names, and interface names are *domain keys*, so a collision makes the
+/// renderer first-wins-drop one item while the payload still counts both,
+/// and a `viz.effect` on the shared key is ambiguous. When truncation is
+/// needed, reserve [`LABEL_HASH_SUFFIX_BYTES`] for a stable hash of the
+/// full cleaned value so truncated keys stay unique and stable across
+/// refreshes.
+fn clean_label_to(value: &str, max: usize) -> String {
+    let cleaned = clean_control(value);
     if cleaned.len() <= max {
         return cleaned;
     }
-    let mut end = max;
+    let suffix = format!("#{:08x}", fnv1a32(cleaned.as_bytes()));
+    debug_assert_eq!(suffix.len(), LABEL_HASH_SUFFIX_BYTES);
+    // Leave room for the suffix (max is always far larger than it here).
+    let budget = max.saturating_sub(suffix.len());
+    let mut end = budget.min(cleaned.len());
     while end > 0 && !cleaned.is_char_boundary(end) {
         end -= 1;
     }
-    cleaned[..end].to_string()
+    let mut disambiguated = cleaned[..end].to_string();
+    disambiguated.push_str(&suffix);
+    disambiguated
+}
+
+/// FNV-1a (32-bit), std-only, fully deterministic: a truncated label's
+/// suffix is stable across snapshot refreshes so a domain key does not
+/// churn between watches.
+fn fnv1a32(bytes: &[u8]) -> u32 {
+    let mut hash = 0x811c_9dc5_u32;
+    for &byte in bytes {
+        hash ^= u32::from(byte);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    hash
 }
 
 /// [`clean_label_to`] at the shared wire label bound.
@@ -1419,6 +1461,17 @@ fn fs_snapshot(root: &str, mut walk: FsWalk, top: usize) -> serde_json::Value {
     }
     if walk.capped {
         source.push_str(&format!("; walk capped at {MAX_FS_WALK_ENTRIES}"));
+    }
+    // Over-long paths are truncated to a hash-disambiguated key
+    // ([`clean_label_to`]); declare how many so the provenance never
+    // implies the keys are verbatim paths.
+    let truncated = walk
+        .entries
+        .iter()
+        .filter(|entry| label_would_truncate(&entry.path))
+        .count();
+    if truncated > 0 {
+        source.push_str(&format!("; {truncated} paths truncated"));
     }
     let items: Vec<serde_json::Value> = walk
         .entries
@@ -2517,10 +2570,10 @@ mod tests {
                 id: DEFAULT_PS_VIZ_ID,
                 kind: "ps.v1".into(),
                 data: data.clone(),
-                x: Some(4),
-                y: Some(2),
-                cols: Some(24),
-                rows: Some(8),
+                x: Some("4".into()),
+                y: Some("2".into()),
+                cols: Some("24".into()),
+                rows: Some("8".into()),
                 replace: false,
             }
         );
@@ -2577,15 +2630,102 @@ mod tests {
     fn labels_are_cleaned_and_bounded() {
         assert_eq!(clean_label("plain"), "plain");
         assert_eq!(clean_label("tab\tbell\x07esc\x1b"), "tab?bell?esc?");
+        // Truncated labels stay within the wire bound, on a char boundary.
         let long = "x".repeat(300);
-        assert_eq!(clean_label(&long).len(), osc::MAX_VIZ_LABEL_BYTES);
-        // Truncation lands on a char boundary, never mid-UTF-8.
+        assert!(clean_label(&long).len() <= osc::MAX_VIZ_LABEL_BYTES);
         let accents = "é".repeat(100); // 2 bytes per char
         let cleaned = clean_label(&accents);
-        assert_eq!(cleaned.len(), osc::MAX_VIZ_LABEL_BYTES);
-        assert!(cleaned.chars().all(|c| c == 'é'));
+        assert!(cleaned.len() <= osc::MAX_VIZ_LABEL_BYTES);
+        assert!(cleaned.is_char_boundary(cleaned.len()));
+        assert!(cleaned.starts_with('é'), "the visible prefix survives");
         let wide = "🦀".repeat(50); // 4 bytes per char
         assert!(clean_label(&wide).len() <= osc::MAX_VIZ_LABEL_BYTES);
+    }
+
+    /// Two distinct values sharing a 128-byte prefix must not collapse to
+    /// the same domain key: [`clean_label`] hash-disambiguates on
+    /// truncation, and the same input always maps to the same key
+    /// (regression: F3).
+    #[test]
+    fn truncated_labels_stay_unique_and_stable() {
+        let prefix = "a".repeat(osc::MAX_VIZ_LABEL_BYTES);
+        let one = format!("{prefix}/first/leaf.rs");
+        let two = format!("{prefix}/second/leaf.rs");
+        let key_one = clean_label(&one);
+        let key_two = clean_label(&two);
+        assert_ne!(
+            key_one, key_two,
+            "distinct paths keep distinct keys after truncation"
+        );
+        assert!(key_one.len() <= osc::MAX_VIZ_LABEL_BYTES);
+        assert!(key_two.len() <= osc::MAX_VIZ_LABEL_BYTES);
+        // Stable across refreshes: the same path is always the same key.
+        assert_eq!(key_one, clean_label(&one));
+        // A short path is untouched and never grows a suffix.
+        assert_eq!(clean_label("target/debug"), "target/debug");
+    }
+
+    /// The `fs` provenance declares path truncation so `capture.source`
+    /// never implies its keys are verbatim paths (regression: F3).
+    #[test]
+    fn fs_snapshot_declares_path_truncation() {
+        let long = "z".repeat(osc::MAX_VIZ_LABEL_BYTES + 40);
+        let walk = FsWalk {
+            entries: vec![
+                FsSample {
+                    path: format!("{long}/a"),
+                    dir: false,
+                    size: 10,
+                    depth: 1,
+                },
+                FsSample {
+                    path: format!("{long}/b"),
+                    dir: false,
+                    size: 9,
+                    depth: 1,
+                },
+                FsSample {
+                    path: "short.txt".into(),
+                    dir: false,
+                    size: 8,
+                    depth: 1,
+                },
+            ],
+            skipped: 0,
+            capped: false,
+        };
+        let snapshot = fs_snapshot("/root", walk, 8);
+        let source = snapshot["capture"]["source"].as_str().expect("source");
+        assert!(
+            source.contains("2 paths truncated"),
+            "truncation declared: {source}"
+        );
+        let paths: Vec<&str> = snapshot["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .map(|item| item["path"].as_str().expect("path"))
+            .collect();
+        // The two truncated paths keep distinct keys under the byte bound.
+        assert_ne!(paths[0], paths[1]);
+        assert!(paths.iter().all(|p| p.len() <= osc::MAX_VIZ_LABEL_BYTES));
+    }
+
+    /// The collector-side defaults protocols/viz.md commits to, pinned so
+    /// a silent drift is a failed test rather than a doc that lies
+    /// (regression: F7). The terminal-side render defaults are pinned by
+    /// `viz::tests::render_defaults_are_pinned`.
+    #[test]
+    fn collector_defaults_are_pinned() {
+        // The four stable default slots documented in viz.md, contiguous
+        // in namespace 0 of the AI partition.
+        assert_eq!(DEFAULT_PS_VIZ_ID, 0x8000_0100);
+        assert_eq!(DEFAULT_FS_VIZ_ID, 0x8000_0101);
+        assert_eq!(DEFAULT_GIT_VIZ_ID, 0x8000_0102);
+        assert_eq!(DEFAULT_NET_VIZ_ID, 0x8000_0103);
+        assert_eq!(MAX_COLLECTOR_TOP, 64, "viz.md: --top hard cap");
+        assert_eq!(MAX_FS_WALK_ENTRIES, 4096, "viz.md: fs walk cap");
+        assert_eq!(MAX_STATE_BYTES, 32);
     }
 
     fn ps_sample(pid: u32, cpu: f32, mem: u64) -> PsSample {
