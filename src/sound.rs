@@ -23,10 +23,13 @@
 //! there are no later events (`t=e` is reserved). Audio-unlock status and
 //! the ambient slot are polled through `state.scene`.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
+use std::path::Path;
 
 use bevy::ecs::message::{MessageReader, MessageWriter};
 use bevy::prelude::*;
+use rust_embed::RustEmbed;
 
 use crate::ai::AiCommand;
 use crate::config::AppConfig;
@@ -121,11 +124,33 @@ pub fn sound_spec(kind: &str) -> Option<&'static SoundSpec> {
     SOUND_REGISTRY.iter().find(|spec| spec.kind == kind)
 }
 
+/// The embedded sound assets, the audio sibling of `EmbeddedObjects`
+/// (model.rs). Budgets are enforced by build.rs: 192 KiB per asset,
+/// 512 KiB for the set.
+#[derive(RustEmbed)]
+#[folder = "assets/sounds/"]
+struct EmbeddedSounds;
+
+/// Returns the embedded ogg bytes for a registry file name.
+///
+/// Only the bare `file_name()` is honored — path components (`..`,
+/// absolute roots) cannot escape the registry, mirroring
+/// [`crate::model::load_embedded_object_source`]. The wire never reaches
+/// this directly: registered kinds resolve through [`SOUND_REGISTRY`]
+/// first, and paths/URLs do not exist on the wire at all.
+pub fn embedded_sound_bytes(name: &str) -> Option<Cow<'static, [u8]>> {
+    let file_name = Path::new(name).file_name()?.to_str()?;
+    EmbeddedSounds::get(file_name).map(|file| file.data)
+}
+
 /// A committed one-shot voice, counted against the voice caps from the
 /// frame its `sound.play` commits until the playback layer observes the
 /// instance end and removes it.
 #[derive(Debug, Clone, Copy)]
 pub struct SoundVoice {
+    /// Monotonic voice id, unique for the session. The playback layer keys
+    /// its kira instance bookkeeping on it so ends free the right slot.
+    pub id: u64,
     /// The namespace that requested the play (for the per-namespace cap).
     pub namespace: u8,
     /// The registered kind (canonical registry string).
@@ -239,6 +264,8 @@ pub struct SoundState {
     /// layer pushes committed plays; the playback layer starts them and
     /// removes them when their instances end.
     pub(crate) voices: Vec<SoundVoice>,
+    /// The next [`SoundVoice::id`] to assign (monotonic, never reused).
+    pub(crate) next_voice_id: u64,
 }
 
 impl Default for SoundState {
@@ -249,6 +276,7 @@ impl Default for SoundState {
             ambient: AmbientSlot::default(),
             play_buckets: HashMap::new(),
             voices: Vec::new(),
+            next_voice_id: 0,
         }
     }
 }
@@ -343,6 +371,22 @@ impl Plugin for SoundPlugin {
                 Update,
                 apply_sound_commands.after(crate::systems::pump_pty_output),
             );
+        #[cfg(feature = "sound")]
+        {
+            // The playback layer: kira behind the decision layer. Its
+            // systems run after the applier so a committed play sounds the
+            // same frame (bevy_kira_audio processes commands in PostUpdate).
+            app.add_plugins(bevy_kira_audio::AudioPlugin)
+                .init_resource::<playback::SoundAssets>()
+                .init_resource::<playback::SoundPlayback>()
+                .add_systems(Startup, playback::load_sound_assets)
+                .add_systems(
+                    Update,
+                    (playback::drive_one_shot_voices, playback::drive_ambient_bed)
+                        .chain()
+                        .after(apply_sound_commands),
+                );
+        }
     }
 }
 
@@ -459,7 +503,10 @@ pub fn apply_sound_commands(
                 }
                 // Server-side clamp: the wire requests, the registry rules.
                 let gain = gain.unwrap_or(spec.default_gain).clamp(0.0, spec.max_gain);
+                let id = state.next_voice_id;
+                state.next_voice_id += 1;
                 state.voices.push(SoundVoice {
+                    id,
                     namespace,
                     kind: spec.kind,
                     gain,
@@ -552,6 +599,313 @@ pub fn apply_sound_commands(
                 state.reset();
             }
             _ => {}
+        }
+    }
+}
+
+/// The kira playback layer: the only code that touches an audio device.
+///
+/// It strictly *follows* [`SoundState`] — the decision layer commits
+/// voices and ambient phases, and these systems realize them: starting
+/// one-shot instances, freeing voice caps when instances end, and driving
+/// the ambient bed's crossfade/fade-out tweens (advancing
+/// [`AmbientPhase::Crossfading`] to `Playing` and `FadingOut` to `Idle`).
+/// It never acks anything — every ack was fired at decision time.
+///
+/// Master gain and mute from `[audio]` config are applied here, at
+/// playback time, so trusted config stays authoritative over the mixer.
+/// The layer is headless-tolerant: without an audio device bevy_kira_audio
+/// keeps a `None` backend and queues channel commands, instances never
+/// materialize, and un-started voices stay counted — the voice caps then
+/// bound the queue instead of a timeout lying about playback.
+#[cfg(feature = "sound")]
+mod playback {
+    use std::collections::HashMap;
+    use std::io::Cursor;
+    use std::time::Duration;
+
+    use bevy::prelude::*;
+    use bevy_kira_audio::prelude::{
+        Audio, AudioControl, AudioInstance, AudioSource, AudioTween, Decibels, PlaybackState,
+        StaticSoundData,
+    };
+
+    use super::{AmbientPhase, SOUND_REGISTRY, SoundState, embedded_sound_bytes};
+    use crate::config::{AppConfig, AudioConfig};
+
+    /// Handles for the decoded embedded sound registry, keyed by kind.
+    #[derive(Resource, Default)]
+    pub struct SoundAssets {
+        handles: HashMap<&'static str, Handle<AudioSource>>,
+    }
+
+    /// One live one-shot's kira bookkeeping.
+    struct OneShotPlayback {
+        /// The instance handle returned when the play was issued.
+        handle: Handle<AudioInstance>,
+        /// Whether the instance has been observed in [`Assets`] yet. The
+        /// asset appears once the channel processes the play command and
+        /// is cleaned up again after the instance stops; this flag tells
+        /// "not started yet" apart from "ended and cleaned up".
+        observed: bool,
+    }
+
+    /// The live ambient bed's kira bookkeeping.
+    struct AmbientPlayback {
+        /// The registered kind the instance loops.
+        kind: &'static str,
+        /// The looping instance's handle.
+        handle: Handle<AudioInstance>,
+        /// The volume (dB) the bed currently targets, for retune detection.
+        target_db: f32,
+        /// When (in [`Time`] seconds) the running fade tween completes.
+        deadline: f64,
+        /// Whether a stop tween has been issued for this instance.
+        stopping: bool,
+    }
+
+    /// Playback-side bookkeeping, keyed by [`super::SoundVoice::id`].
+    #[derive(Resource, Default)]
+    pub struct SoundPlayback {
+        one_shots: HashMap<u64, OneShotPlayback>,
+        ambient: Option<AmbientPlayback>,
+    }
+
+    /// Converts a post-registry-clamp amplitude gain into kira decibels
+    /// under the trusted config master: mute floors to silence, master
+    /// gain scales multiplicatively. Applied at playback time only, so
+    /// `[audio]` config stays authoritative over the mixer.
+    pub(super) fn effective_db(gain: f32, audio: &AudioConfig) -> Decibels {
+        if audio.muted {
+            return Decibels::SILENCE;
+        }
+        let amplitude = (gain * audio.master_gain).clamp(0.0, 1.0);
+        if amplitude <= 0.0 {
+            return Decibels::SILENCE;
+        }
+        Decibels((20.0 * amplitude.log10()).max(Decibels::SILENCE.0))
+    }
+
+    /// Decodes every registry ogg out of the embedded set into kira sound
+    /// data at startup. A failure is a build defect (the assets ship inside
+    /// the binary): it is logged loudly and the kind stays unplayable.
+    pub fn load_sound_assets(
+        mut sources: ResMut<Assets<AudioSource>>,
+        mut assets: ResMut<SoundAssets>,
+    ) {
+        for spec in SOUND_REGISTRY {
+            let Some(bytes) = embedded_sound_bytes(spec.file) else {
+                error!(
+                    "sound: embedded asset '{}' for kind '{}' is missing",
+                    spec.file, spec.kind
+                );
+                continue;
+            };
+            match StaticSoundData::from_cursor(Cursor::new(bytes.into_owned())) {
+                Ok(sound) => {
+                    let handle = sources.add(AudioSource { sound });
+                    assets.handles.insert(spec.kind, handle);
+                }
+                Err(error) => error!(
+                    "sound: embedded asset '{}' for kind '{}' failed to decode: {error}",
+                    spec.file, spec.kind
+                ),
+            }
+        }
+    }
+
+    /// Starts committed one-shot voices and frees their cap slots when
+    /// their kira instances end.
+    pub fn drive_one_shot_voices(
+        mut state: ResMut<SoundState>,
+        mut playback: ResMut<SoundPlayback>,
+        assets: Res<SoundAssets>,
+        audio: Res<Audio>,
+        instances: Res<Assets<AudioInstance>>,
+        config: Res<AppConfig>,
+    ) {
+        let mut ended: Vec<u64> = Vec::new();
+        for voice in state.voices.iter_mut().filter(|voice| !voice.started) {
+            voice.started = true;
+            let Some(source) = assets.handles.get(voice.kind) else {
+                // Decode failed at startup (already logged); free the slot
+                // so a broken asset cannot pin the voice caps.
+                ended.push(voice.id);
+                continue;
+            };
+            let volume = effective_db(voice.gain, &config.audio);
+            let handle = audio.play(source.clone()).with_volume(volume).handle();
+            playback.one_shots.insert(
+                voice.id,
+                OneShotPlayback {
+                    handle,
+                    observed: false,
+                },
+            );
+        }
+        for (id, one_shot) in playback.one_shots.iter_mut() {
+            match instances.get(&one_shot.handle) {
+                Some(instance) => {
+                    if matches!(instance.state(), PlaybackState::Stopped) {
+                        ended.push(*id);
+                    } else {
+                        one_shot.observed = true;
+                    }
+                }
+                // Missing asset: either still queued (never observed — leave
+                // it) or ended and cleaned up in PreUpdate (observed — free
+                // the voice).
+                None => {
+                    if one_shot.observed {
+                        ended.push(*id);
+                    }
+                }
+            }
+        }
+        if !ended.is_empty() {
+            for id in &ended {
+                playback.one_shots.remove(id);
+            }
+            state.voices.retain(|voice| !ended.contains(&voice.id));
+        }
+    }
+
+    /// Retunes a live bed toward a new target volume (a config master or
+    /// mute change) with a short tween; a no-op while the target holds.
+    fn retune_bed(
+        ambient: &mut AmbientPlayback,
+        target: Decibels,
+        instances: &mut Assets<AudioInstance>,
+    ) {
+        if (ambient.target_db - target.0).abs() < f32::EPSILON {
+            return;
+        }
+        if let Some(mut instance) = instances.get_mut(&ambient.handle) {
+            instance.set_decibels(target, AudioTween::default());
+            ambient.target_db = target.0;
+        }
+    }
+
+    /// Drives the scene ambient bed: starts and crossfades instances per
+    /// the slot's phase, advances `Crossfading` to `Playing` and
+    /// `FadingOut` to `Idle` when their tweens complete, and applies
+    /// config master changes live.
+    pub fn drive_ambient_bed(
+        time: Res<Time>,
+        mut state: ResMut<SoundState>,
+        mut playback: ResMut<SoundPlayback>,
+        assets: Res<SoundAssets>,
+        audio: Res<Audio>,
+        mut instances: ResMut<Assets<AudioInstance>>,
+        config: Res<AppConfig>,
+    ) {
+        let now = time.elapsed_secs_f64();
+        match state.ambient.phase {
+            AmbientPhase::Idle => {
+                // Defensive: a live instance under an idle slot should not
+                // exist; silence it if it ever does.
+                if let Some(orphan) = playback.ambient.take()
+                    && let Some(mut instance) = instances.get_mut(&orphan.handle)
+                {
+                    instance.stop(AudioTween::default());
+                }
+            }
+            AmbientPhase::Crossfading => {
+                let Some(track) = state.ambient.current else {
+                    // Defensive: crossfading toward nothing — clear.
+                    state.ambient.phase = AmbientPhase::Idle;
+                    return;
+                };
+                let xfade = Duration::from_millis(u64::from(state.ambient.xfade_ms));
+                let target = effective_db(track.gain, &config.audio);
+                let same_bed = playback
+                    .ambient
+                    .as_ref()
+                    .is_some_and(|ambient| ambient.kind == track.kind && !ambient.stopping);
+                if same_bed {
+                    if let Some(ambient) = playback.ambient.as_mut() {
+                        retune_bed(ambient, target, &mut instances);
+                        if now >= ambient.deadline {
+                            state.ambient.phase = AmbientPhase::Playing;
+                        }
+                    }
+                    return;
+                }
+                // A new bed (or a resurrected same-kind bed whose stop
+                // tween already started): fade the old instance out and a
+                // fresh loop in — the two overlap as the crossfade.
+                if let Some(old) = playback.ambient.take()
+                    && let Some(mut instance) = instances.get_mut(&old.handle)
+                {
+                    instance.stop(AudioTween::linear(xfade));
+                }
+                let Some(source) = assets.handles.get(track.kind) else {
+                    error!(
+                        "sound: no decoded asset for ambient kind '{}'; clearing the bed",
+                        track.kind
+                    );
+                    state.ambient.current = None;
+                    state.ambient.phase = AmbientPhase::Idle;
+                    return;
+                };
+                let handle = audio
+                    .play(source.clone())
+                    .looped()
+                    .fade_in(AudioTween::linear(xfade))
+                    .with_volume(target)
+                    .handle();
+                playback.ambient = Some(AmbientPlayback {
+                    kind: track.kind,
+                    handle,
+                    target_db: target.0,
+                    deadline: now + f64::from(state.ambient.xfade_ms) / 1000.0,
+                    stopping: false,
+                });
+            }
+            AmbientPhase::Playing => {
+                let Some(track) = state.ambient.current else {
+                    // Defensive: playing nothing — clear.
+                    state.ambient.phase = AmbientPhase::Idle;
+                    return;
+                };
+                let target = effective_db(track.gain, &config.audio);
+                if let Some(ambient) = playback.ambient.as_mut() {
+                    retune_bed(ambient, target, &mut instances);
+                }
+            }
+            AmbientPhase::FadingOut => {
+                let fade_ms = state.ambient.xfade_ms;
+                match playback.ambient.as_mut() {
+                    Some(ambient) => {
+                        if !ambient.stopping {
+                            if let Some(mut instance) = instances.get_mut(&ambient.handle) {
+                                instance.stop(AudioTween::linear(Duration::from_millis(
+                                    u64::from(fade_ms),
+                                )));
+                            }
+                            ambient.stopping = true;
+                            ambient.deadline = now + f64::from(fade_ms) / 1000.0;
+                        }
+                        if now >= ambient.deadline {
+                            // Belt and braces: the tween should be done —
+                            // make the stop unconditional before dropping
+                            // the handle.
+                            if let Some(mut instance) = instances.get_mut(&ambient.handle) {
+                                instance.stop(AudioTween::default());
+                            }
+                            playback.ambient = None;
+                            state.ambient.current = None;
+                            state.ambient.phase = AmbientPhase::Idle;
+                        }
+                    }
+                    None => {
+                        // Nothing audible ever existed (asset failure or a
+                        // backend-less run): the fade completes at once.
+                        state.ambient.current = None;
+                        state.ambient.phase = AmbientPhase::Idle;
+                    }
+                }
+            }
         }
     }
 }
@@ -742,8 +1096,9 @@ mod tests {
         // tokens (voices seeded directly; the caps are the subject here).
         {
             let mut state = app.world_mut().resource_mut::<SoundState>();
-            for _ in 0..MAX_SOUND_VOICES_PER_NAMESPACE {
+            for index in 0..MAX_SOUND_VOICES_PER_NAMESPACE {
                 state.voices.push(SoundVoice {
+                    id: index as u64,
                     namespace: 0,
                     kind: "click",
                     gain: 0.5,
@@ -762,6 +1117,7 @@ mod tests {
             state.voices.clear();
             for index in 0..MAX_SOUND_VOICES {
                 state.voices.push(SoundVoice {
+                    id: 100 + index as u64,
                     namespace: 1 + (index % 2) as u8,
                     kind: "click",
                     gain: 0.5,
@@ -979,5 +1335,130 @@ mod tests {
             RattyAiCommand::SoundAmbientStop { fade: None },
         );
         assert_eq!(last_ack(&app).code, Some(codes::UNSUPPORTED));
+    }
+
+    #[test]
+    fn voice_ids_are_monotonic_and_never_reused() {
+        let mut app = test_app();
+        play(&mut app, "t1", "chime", None);
+        play(&mut app, "t2", "click", None);
+        let voices = &state(&app).voices;
+        assert_eq!(voices[0].id, 0);
+        assert_eq!(voices[1].id, 1);
+        assert_eq!(state(&app).next_voice_id, 2);
+    }
+
+    #[test]
+    fn every_registry_kind_resolves_to_embedded_bytes() {
+        for spec in SOUND_REGISTRY {
+            let bytes = embedded_sound_bytes(spec.file)
+                .unwrap_or_else(|| panic!("'{}' is embedded", spec.file));
+            assert!(!bytes.is_empty(), "'{}' has content", spec.file);
+            assert!(
+                bytes.starts_with(b"OggS"),
+                "'{}' is an ogg container",
+                spec.file
+            );
+        }
+    }
+
+    #[test]
+    fn embedded_sound_resolution_honors_the_file_name_only() {
+        let direct = embedded_sound_bytes("chime.ogg").expect("direct name resolves");
+        let traversal = embedded_sound_bytes("../../secrets/chime.ogg").expect("file_name() only");
+        assert_eq!(direct, traversal, "path components are ignored");
+        assert!(embedded_sound_bytes("kazoo.ogg").is_none());
+        assert!(embedded_sound_bytes("").is_none());
+        assert!(embedded_sound_bytes("..").is_none());
+    }
+
+    #[test]
+    fn embedded_sounds_match_the_registry_and_stay_within_budgets() {
+        // The same budgets build.rs enforces, re-checked here so the
+        // no-default-features matrix guards them too.
+        const PER_ASSET_BUDGET: usize = 192 * 1024;
+        const PACKAGE_BUDGET: usize = 512 * 1024;
+        let mut embedded: Vec<String> = EmbeddedSounds::iter().map(|f| f.to_string()).collect();
+        embedded.sort();
+        let mut registry: Vec<String> = SOUND_REGISTRY.iter().map(|s| s.file.to_string()).collect();
+        registry.sort();
+        assert_eq!(
+            embedded, registry,
+            "the embedded set and the registry name the same files"
+        );
+        let mut total = 0;
+        for spec in SOUND_REGISTRY {
+            let len = embedded_sound_bytes(spec.file)
+                .map(|bytes| bytes.len())
+                .unwrap_or_default();
+            assert!(
+                len <= PER_ASSET_BUDGET,
+                "'{}' is {len} bytes, within the per-asset budget",
+                spec.file
+            );
+            total += len;
+        }
+        assert!(total <= PACKAGE_BUDGET, "{total} bytes within the package");
+    }
+
+    #[cfg(feature = "sound")]
+    #[test]
+    fn every_registry_ogg_decodes_for_kira() {
+        use bevy_kira_audio::prelude::StaticSoundData;
+
+        for spec in SOUND_REGISTRY {
+            let bytes = embedded_sound_bytes(spec.file).expect("embedded");
+            let sound = StaticSoundData::from_cursor(std::io::Cursor::new(bytes.into_owned()))
+                .unwrap_or_else(|error| panic!("'{}' decodes: {error}", spec.file));
+            let seconds = sound.duration().as_secs_f64();
+            match spec.class {
+                SoundKindClass::OneShot => assert!(
+                    (0.03..1.0).contains(&seconds),
+                    "one-shot '{}' is {seconds}s",
+                    spec.kind
+                ),
+                SoundKindClass::Ambient => assert!(
+                    (4.0..=6.5).contains(&seconds),
+                    "ambient '{}' is {seconds}s",
+                    spec.kind
+                ),
+            }
+        }
+    }
+
+    #[cfg(feature = "sound")]
+    #[test]
+    fn effective_db_honors_master_gain_and_mute() {
+        use bevy_kira_audio::prelude::Decibels;
+
+        use super::playback::effective_db;
+        use crate::config::AudioConfig;
+
+        let audio = AudioConfig {
+            master_gain: 1.0,
+            ..Default::default()
+        };
+        assert!(
+            effective_db(1.0, &audio).0.abs() < 1e-4,
+            "full gain under a unity master is 0 dB"
+        );
+        let attenuated = effective_db(0.5, &audio).0;
+        assert!(
+            (attenuated - -6.02).abs() < 0.01,
+            "half amplitude is about -6 dB, got {attenuated}"
+        );
+
+        let default_master = AudioConfig::default();
+        assert!(
+            effective_db(1.0, &default_master).0 < 0.0,
+            "the default 0.8 master attenuates"
+        );
+
+        let muted = AudioConfig {
+            muted: true,
+            ..Default::default()
+        };
+        assert_eq!(effective_db(1.0, &muted), Decibels::SILENCE);
+        assert_eq!(effective_db(0.0, &default_master), Decibels::SILENCE);
     }
 }
