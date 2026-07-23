@@ -24,7 +24,7 @@
 //! The redraw path updates the terminal texture and presentation state first, then the inline
 //! object systems rebuild or reposition scene entities that depend on the terminal grid.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::TryRecvError;
 
 use crate::config::{AppConfig, CURSOR_DEPTH, CursorAnimationConfig};
@@ -1837,6 +1837,11 @@ pub(crate) fn rebuild_viz_objects(mut params: VizRebuildParams) {
     // deferred until the next command flush, so same-frame effect
     // resolution reads these instead of the root query.
     let mut fresh: HashMap<u32, HashMap<String, VizChildRecord>> = HashMap::new();
+    // Children whose `died` animation a same-pass snapshot re-assert just
+    // cancelled (F5). Consulted in the effect loop below so an effect
+    // landing in the same pass sees the child as alive again (data wins),
+    // while the `VizEffectAnim` removal is still a deferred command.
+    let mut restored_from_died: HashSet<Entity> = HashSet::new();
 
     for id in rebuilds {
         let Some(entry) = registry.get(id) else {
@@ -1851,7 +1856,7 @@ pub(crate) fn rebuild_viz_objects(mut params: VizRebuildParams) {
         let specs = viz_child_specs(&entry.payload);
         if let Some(&root_entity) = root_index.get(&id) {
             if let Ok((_, mut root)) = roots.get_mut(root_entity) {
-                diff_viz_children(
+                let restored = diff_viz_children(
                     &mut root,
                     root_entity,
                     &specs,
@@ -1860,6 +1865,7 @@ pub(crate) fn rebuild_viz_objects(mut params: VizRebuildParams) {
                     materials,
                     &unit_mesh,
                 );
+                restored_from_died.extend(restored);
             }
         } else {
             let (root_entity, ledger) = spawn_viz_tree(commands, id, &specs, materials, &unit_mesh);
@@ -1891,6 +1897,21 @@ pub(crate) fn rebuild_viz_objects(mut params: VizRebuildParams) {
             let Some(record) = target else {
                 continue;
             };
+            // A running `died` animation is terminal for presentation: the
+            // child is confirmed gone and is shrinking away. A later effect
+            // must NOT replace that animation and resurrect the bar (F4) —
+            // only a snapshot (data) may undo a death, and when it does so
+            // this same pass it records the child in `restored_from_died`,
+            // so an effect landing alongside that snapshot still applies.
+            let running_died = !restored_from_died.contains(&record.entity)
+                && children
+                    .get(record.entity)
+                    .ok()
+                    .and_then(|(_, anim)| anim)
+                    .is_some_and(|anim| anim.effect == VizEffectKind::Died);
+            if running_died {
+                continue;
+            }
             // Insert-or-replace: a newer effect on the same child restarts
             // the animation from the ledger's base pose, never from a
             // mid-animation pose, so repeated effects cannot drift.
@@ -2005,9 +2026,12 @@ fn diff_viz_children(
     children: &mut VizChildPoseQuery<'_, '_>,
     materials: &mut Assets<StandardMaterial>,
     unit_mesh: &Handle<Mesh>,
-) {
+) -> Vec<Entity> {
     let count = specs.len();
     let mut retained: HashMap<String, VizChildRecord> = HashMap::with_capacity(count);
+    // Children whose running `died` animation this re-assert just cancelled
+    // (F5); returned so the caller's effect loop treats them as alive.
+    let mut restored_from_died: Vec<Entity> = Vec::new();
     for (index, spec) in specs.iter().enumerate() {
         if retained.contains_key(&spec.key) {
             // Hostile duplicate key: first occurrence wins.
@@ -2024,14 +2048,37 @@ fn diff_viz_children(
             record.base_translation = translation;
             record.base_scale = scale;
             if let Ok((mut transform, anim)) = children.get_mut(record.entity) {
-                if let Some(mut anim) = anim {
-                    // Mid-animation: move the restore target; the
-                    // animation keeps writing the transform from it.
-                    anim.base_translation = translation;
-                    anim.base_scale = scale;
-                } else if transform.translation != translation || transform.scale != scale {
-                    transform.translation = translation;
-                    transform.scale = scale;
+                match anim {
+                    // Data wins over presentation: a snapshot that
+                    // re-asserts a key mid-`died` cancels the death
+                    // animation and restores the child at its fresh rest
+                    // pose and palette color. Without this the child stays
+                    // gone until the *next* snapshot even though the data
+                    // already brought it back (F5). Pairs with the effect
+                    // loop treating a running `died` as terminal for later
+                    // effects (F4): the snapshot is the one thing that may
+                    // undo a death, and it undoes it now.
+                    Some(anim) if anim.effect == VizEffectKind::Died => {
+                        transform.translation = translation;
+                        transform.scale = scale;
+                        if let Some(mut material) = materials.get_mut(&record.material) {
+                            material.base_color = spec.palette.color();
+                        }
+                        commands.entity(record.entity).remove::<VizEffectAnim>();
+                        restored_from_died.push(record.entity);
+                    }
+                    // A non-terminal animation in flight: move its restore
+                    // target so expiry lands on the fresh pose.
+                    Some(mut anim) => {
+                        anim.base_translation = translation;
+                        anim.base_scale = scale;
+                    }
+                    None => {
+                        if transform.translation != translation || transform.scale != scale {
+                            transform.translation = translation;
+                            transform.scale = scale;
+                        }
+                    }
                 }
             }
             retained.insert(spec.key.clone(), record);
@@ -2053,6 +2100,7 @@ fn diff_viz_children(
         commands.entity(record.entity).despawn();
     }
     root.children = retained;
+    restored_from_died
 }
 
 /// The [`InlineAnchor`] a viz root lays out with, or `None` when the
@@ -2958,6 +3006,61 @@ mod viz_render_tests {
         assert_eq!(material_count(&app), 1, "recolored, not reallocated");
     }
 
+    /// F6: a hostile snapshot may repeat a domain key. The renderer is
+    /// first-occurrence-wins, so the tree and ledger hold exactly one child
+    /// per distinct key, and repeated refreshes stay stable — while the
+    /// registry payload's `item_count` still reports the raw count (the
+    /// read-back never hides that the wire carried duplicates).
+    #[test]
+    fn duplicate_keys_render_first_wins_with_a_stable_ledger() {
+        let mut app = test_app();
+        registry_mut(&mut app).upsert(
+            ID,
+            ps_payload(&[
+                (1, 50.0, "running"),
+                (1, 10.0, "sleeping"),
+                (2, 5.0, "sleeping"),
+            ]),
+            None,
+        );
+        app.update();
+        let children = keyed_children(&mut app);
+        assert_eq!(children.len(), 2, "one child per distinct key");
+        assert!(children.contains_key("1") && children.contains_key("2"));
+        assert_eq!(
+            ledger(&mut app, ID).len(),
+            2,
+            "the ledger matches the tree, no divergence"
+        );
+        assert_eq!(
+            registry_mut(&mut app)
+                .get(ID)
+                .expect("live")
+                .payload
+                .item_count(),
+            3,
+            "item_count is the raw payload count, duplicates included"
+        );
+
+        // A refresh keeping the duplicate is a stable no-op on the tree:
+        // the same first-occurrence keys map to the same entities.
+        registry_mut(&mut app).upsert(
+            ID,
+            ps_payload(&[
+                (1, 50.0, "running"),
+                (1, 99.0, "zombie"),
+                (2, 5.0, "sleeping"),
+            ]),
+            None,
+        );
+        app.update();
+        assert_eq!(
+            keyed_children(&mut app),
+            children,
+            "keys stay stable across a duplicate-bearing refresh"
+        );
+    }
+
     #[test]
     fn removal_and_reset_despawn_whole_trees() {
         let mut app = test_app();
@@ -3108,6 +3211,111 @@ mod viz_render_tests {
         assert!(
             app.world().get::<VizEffectAnim>(child).is_some(),
             "the effect resolved against the just-spawned ledger"
+        );
+    }
+
+    /// F4: a running `died` animation is terminal for presentation — a
+    /// later effect on the same key must not replace it and resurrect the
+    /// confirmed-dead bar. The death runs to completion.
+    #[test]
+    fn a_later_effect_cannot_resurrect_a_dying_child() {
+        let mut app = test_app();
+        registry_mut(&mut app).upsert(ID, ps_payload(&[(1, 50.0, "running")]), None);
+        app.update();
+        let child = keyed_children(&mut app)["1"];
+
+        // The kill watcher confirms the death.
+        assert!(registry_mut(&mut app).queue_effect(ID, "1".to_string(), VizEffectKind::Died));
+        app.update();
+        let anim = app
+            .world()
+            .get::<VizEffectAnim>(child)
+            .expect("the death is animating");
+        assert_eq!(anim.effect, VizEffectKind::Died);
+
+        // A later effect on the same key must be dropped, not applied.
+        assert!(registry_mut(&mut app).queue_effect(ID, "1".to_string(), VizEffectKind::Highlight));
+        app.update();
+        let anim = app
+            .world()
+            .get::<VizEffectAnim>(child)
+            .expect("the child is still dying");
+        assert_eq!(
+            anim.effect,
+            VizEffectKind::Died,
+            "a later effect never cancels a confirmed death"
+        );
+        assert!(
+            registry_mut(&mut app)
+                .get(ID)
+                .expect("live")
+                .pending_effects
+                .is_empty(),
+            "the dropped effect drained from the queue"
+        );
+
+        // The confirmed death still lands at its own expiry.
+        advance(&mut app, VIZ_EFFECT_SECONDS);
+        assert!(
+            app.world().get_entity(child).is_err(),
+            "the death completes despite the intervening effect"
+        );
+    }
+
+    /// F5: data wins over presentation — a snapshot that re-asserts a key
+    /// mid-`died` cancels the death animation and restores the child now,
+    /// rather than waiting for the following snapshot. Coherent with F4:
+    /// only a snapshot may undo a death.
+    #[test]
+    fn a_snapshot_reassert_cancels_a_running_died_animation() {
+        let mut app = test_app();
+        registry_mut(&mut app).upsert(ID, ps_payload(&[(1, 50.0, "running")]), None);
+        app.update();
+        let child = keyed_children(&mut app)["1"];
+        let base = ledger(&mut app, ID)["1"].clone();
+
+        assert!(registry_mut(&mut app).queue_effect(ID, "1".to_string(), VizEffectKind::Died));
+        app.update();
+        advance(&mut app, VIZ_EFFECT_SECONDS * 0.5);
+        assert!(
+            app.world().get::<VizEffectAnim>(child).is_some(),
+            "the child is mid-death"
+        );
+
+        // A fresh snapshot re-asserts the key. Advance by zero so the death
+        // cannot expire on its own: only the re-assert may end it.
+        registry_mut(&mut app).upsert(ID, ps_payload(&[(1, 50.0, "running")]), None);
+        advance(&mut app, 0.0);
+        assert!(
+            app.world().get::<VizEffectAnim>(child).is_none(),
+            "the re-assert cancelled the death animation"
+        );
+        assert_eq!(
+            keyed_children(&mut app).get("1"),
+            Some(&child),
+            "the same child is kept, not respawned"
+        );
+        let transform = app
+            .world()
+            .get::<Transform>(child)
+            .expect("restored, alive");
+        assert_eq!(
+            transform.scale, base.base_scale,
+            "the rest scale is restored"
+        );
+        let materials = app.world().resource::<Assets<StandardMaterial>>();
+        let color = materials.get(&base.material).expect("lives").base_color;
+        assert_eq!(
+            color,
+            VizPaletteSlot::Active.color(),
+            "the palette color is restored — the death darkening is undone"
+        );
+
+        // It does not despawn at the original death's would-be expiry.
+        advance(&mut app, VIZ_EFFECT_SECONDS);
+        assert!(
+            keyed_children(&mut app).contains_key("1"),
+            "the restored child survives"
         );
     }
 

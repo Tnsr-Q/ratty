@@ -243,14 +243,18 @@ pub enum RattyAiCommand {
         /// this module stays dependency-free — and decoded terminal-side
         /// under hard size limits.
         data: String,
-        /// Anchor column (top-left), when the snapshot places itself.
-        x: Option<u16>,
-        /// Anchor row (top-left), when the snapshot places itself.
-        y: Option<u16>,
-        /// Footprint width in cells, when supplied.
-        cols: Option<u16>,
-        /// Footprint height in cells, when supplied.
-        rows: Option<u16>,
+        /// Raw anchor column (top-left) when the snapshot places itself.
+        /// Carried unparsed off this std-only module and parsed as a `u16`
+        /// terminal-side, so a *present* but malformed value rejects
+        /// `bad-payload` instead of silently coercing to absent (which
+        /// would drop the placement the caller asked for and still ack ok).
+        x: Option<String>,
+        /// Raw anchor row (top-left); parsed terminal-side, like `x`.
+        y: Option<String>,
+        /// Raw footprint width in cells; parsed terminal-side, like `x`.
+        cols: Option<String>,
+        /// Raw footprint height in cells; parsed terminal-side, like `x`.
+        rows: Option<String>,
         /// Allow replacing a live visualization of a *different* kind under
         /// the same id (same-kind sets are always atomic upserts).
         replace: bool,
@@ -580,10 +584,13 @@ fn parse_action(action: &str, p: &Payload) -> Option<RattyAiCommand> {
             id: p.parse_req("id")?,
             kind: p.string("kind")?,
             data: p.string("data")?,
-            x: p.opt("x"),
-            y: p.opt("y"),
-            cols: p.opt("cols"),
-            rows: p.opt("rows"),
+            // Placement params ride raw (like `data`) and are parsed
+            // terminal-side so a malformed present value is an explicit
+            // reject, not a silent unplacement.
+            x: p.string("x"),
+            y: p.string("y"),
+            cols: p.string("cols"),
+            rows: p.string("rows"),
             replace: p.flag("replace"),
         },
         "viz.effect" => RattyAiCommand::VizEffect {
@@ -920,10 +927,25 @@ mod tests {
                 id: 0x8000_0000,
                 kind: "ps.v1".to_string(),
                 data: "e30".to_string(),
-                x: Some(10),
-                y: Some(5),
-                cols: Some(24),
-                rows: Some(8),
+                x: Some("10".to_string()),
+                y: Some("5".to_string()),
+                cols: Some("24".to_string()),
+                rows: Some("8".to_string()),
+                replace: false,
+            })
+        );
+        // Placement values ride raw: parse never validates them (that is
+        // the terminal's job), so even a nonsense value still parses here.
+        assert_eq!(
+            parse_command("ratty:viz.set;id=2147483648&kind=ps.v1&data=e30&x=abc&y=5"),
+            Some(RattyAiCommand::VizSet {
+                id: 0x8000_0000,
+                kind: "ps.v1".to_string(),
+                data: "e30".to_string(),
+                x: Some("abc".to_string()),
+                y: Some("5".to_string()),
+                cols: None,
+                rows: None,
                 replace: false,
             })
         );

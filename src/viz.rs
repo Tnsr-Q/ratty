@@ -300,6 +300,21 @@ impl VizPayload {
                 for item in &payload.items {
                     check_label("name", &item.name)?;
                     check_label("state", &item.state)?;
+                    // A hostile `cpu` such as `3.5e38` (valid JSON, above
+                    // f32::MAX) decodes to a non-finite f32; left unchecked
+                    // it produces NaN magnitudes that poison child
+                    // transforms and every later effect animation. The
+                    // terminal does not trust the emitter — reject here
+                    // rather than sanitize silently.
+                    if !item.cpu.is_finite() {
+                        return Err(VizDecodeError {
+                            code: codes::BAD_PAYLOAD,
+                            message: format!(
+                                "pid {} carries a non-finite cpu; magnitudes must be finite",
+                                item.pid
+                            ),
+                        });
+                    }
                 }
             }
             VizPayload::Fs(payload) => {
@@ -998,7 +1013,40 @@ pub fn apply_viz_commands(
                 replace,
             } => {
                 let id = *id;
-                let (x, y, cols, rows, replace) = (*x, *y, *cols, *rows, *replace);
+                let replace = *replace;
+                // Placement params arrive raw off the std-only wire module.
+                // Parse each here; a *present* value that is not a u16 cell
+                // coordinate is an explicit `bad-payload` (naming the param)
+                // rather than a silent unplacement that would ack ok while
+                // dropping the placement the caller asked for.
+                macro_rules! cell_param {
+                    ($raw:expr, $name:literal) => {
+                        match $raw {
+                            Some(text) => match text.parse::<u16>() {
+                                Ok(value) => Some(value),
+                                Err(_) => {
+                                    warn!(
+                                        "ratty-ai: viz.set rejected: {}={text:?} is not a u16 \
+                                         cell coordinate",
+                                        $name
+                                    );
+                                    reject!(
+                                        "viz.set",
+                                        codes::BAD_PAYLOAD,
+                                        "{}= must be a u16 cell coordinate; got '{text}'",
+                                        $name
+                                    );
+                                    continue;
+                                }
+                            },
+                            None => None,
+                        }
+                    };
+                }
+                let x = cell_param!(x, "x");
+                let y = cell_param!(y, "y");
+                let cols = cell_param!(cols, "cols");
+                let rows = cell_param!(rows, "rows");
                 if ai_object_namespace(id) != Some(source.namespace()) {
                     warn!(
                         "ratty-ai: viz.set rejected: id {id:#010x} is outside the caller's \
@@ -1242,6 +1290,17 @@ mod tests {
         assert_eq!(MAX_VIZ_PENDING_EFFECTS, 16);
     }
 
+    /// The render defaults protocols/viz.md commits to, drift-guarded
+    /// alongside the size caps (regression: F7). The collector-side
+    /// defaults (slot ids, `--top` cap, walk cap) are pinned by a sibling
+    /// test in `tools/ratty-ai`.
+    #[test]
+    fn render_defaults_are_pinned() {
+        assert_eq!(VIZ_EFFECT_SECONDS, 0.8, "viz.md: effects expire in 0.8s");
+        assert_eq!(DEFAULT_VIZ_COLUMNS, 24, "viz.md: default footprint 24×8");
+        assert_eq!(DEFAULT_VIZ_ROWS, 8, "viz.md: default footprint 24×8");
+    }
+
     #[test]
     fn registered_kinds_list_matches_the_decoder() {
         // "e30" is base64url for "{}": every registered kind must reach
@@ -1312,6 +1371,35 @@ mod tests {
         });
         let error = decode_viz_payload("ps.v1", &encode(payload)).expect_err("over the label cap");
         assert_eq!(error.code, codes::TOO_LARGE);
+    }
+
+    #[test]
+    fn non_finite_cpu_rejects_bad_payload() {
+        // `3.5e38` is valid JSON but exceeds f32::MAX, decoding to +inf;
+        // inf/inf then yields NaN magnitudes. The terminal must reject the
+        // payload, not render NaN child transforms (regression: F1).
+        for hostile in [3.5e38_f64, f64::MAX, 1e39] {
+            let payload = json!({
+                "capture": { "source": "test", "ts": "now" },
+                "items": [{ "pid": 1, "name": "greedy", "cpu": hostile }],
+            });
+            let error = decode_viz_payload("ps.v1", &encode(payload))
+                .expect_err("a non-finite cpu is rejected");
+            assert_eq!(error.code, codes::BAD_PAYLOAD, "cpu {hostile} rejects");
+        }
+        // The sanity floor: a finite cpu still decodes and lowers to a
+        // finite magnitude.
+        let ok = json!({
+            "capture": { "source": "test", "ts": "now" },
+            "items": [{ "pid": 1, "name": "calm", "cpu": 12.5 }],
+        });
+        let decoded = decode_viz_payload("ps.v1", &encode(ok)).expect("finite cpu decodes");
+        assert!(
+            viz_child_specs(&decoded)
+                .iter()
+                .all(|spec| spec.magnitude.is_finite()),
+            "finite cpu yields finite magnitudes"
+        );
     }
 
     #[test]
@@ -1496,8 +1584,8 @@ mod tests {
                 id: ID,
                 kind: "ps.v1".to_string(),
                 data: encode(ps_payload(&[1, 2])),
-                x: Some(10),
-                y: Some(5),
+                x: Some("10".to_string()),
+                y: Some("5".to_string()),
                 cols: None,
                 rows: None,
                 replace: false,
@@ -1669,10 +1757,10 @@ mod tests {
                 id: ID,
                 kind: "ps.v1".to_string(),
                 data: encode(ps_payload(&[1])),
-                x,
-                y,
-                cols,
-                rows,
+                x: x.map(|v| v.to_string()),
+                y: y.map(|v| v.to_string()),
+                cols: cols.map(|v| v.to_string()),
+                rows: rows.map(|v| v.to_string()),
                 replace: false,
             }
         };
@@ -1686,6 +1774,33 @@ mod tests {
         assert!(!ok, "a footprint needs an anchor");
         assert_eq!(code, Some(codes::BAD_PAYLOAD));
         assert!(!registry(&app).contains(ID), "rejected sets insert nothing");
+        // A *present* placement value that is not a u16 rejects rather than
+        // silently coercing to absent (regression: F2) — the cell parse
+        // rejects at the first present-but-invalid param, before the
+        // pairing check, so setting only the target param exercises it.
+        let malformed = |name: &str, value: &str| RattyAiCommand::VizSet {
+            id: ID,
+            kind: "ps.v1".to_string(),
+            data: encode(ps_payload(&[1])),
+            x: (name == "x").then(|| value.to_string()),
+            y: (name == "y").then(|| value.to_string()),
+            cols: (name == "cols").then(|| value.to_string()),
+            rows: (name == "rows").then(|| value.to_string()),
+            replace: false,
+        };
+        for param in ["x", "y", "cols", "rows"] {
+            let (ok, code) = send_tok(&mut app, malformed(param, "abc"));
+            assert!(!ok, "{param}=abc is rejected, not silently dropped");
+            assert_eq!(code, Some(codes::BAD_PAYLOAD));
+            assert!(
+                !registry(&app).contains(ID),
+                "a malformed {param} inserts nothing"
+            );
+        }
+        // 70000 overflows a u16 and rejects like any other non-u16.
+        let (ok, code) = send_tok(&mut app, malformed("x", "70000"));
+        assert!(!ok, "an out-of-range coordinate rejects");
+        assert_eq!(code, Some(codes::BAD_PAYLOAD));
         let (ok, _) = send_tok(&mut app, base(Some(3), Some(4), Some(10), Some(2)));
         assert!(ok);
         assert_eq!(
