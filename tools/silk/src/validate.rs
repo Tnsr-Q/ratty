@@ -421,19 +421,25 @@ fn scan_osc_777(line: usize, bytes: &[u8], report: &mut Report) {
 }
 
 fn check_osc_777(line: usize, content: &[u8], report: &mut Report) {
+    // Only `ratty:`-namespace frames are ours to validate. Check the raw
+    // byte prefix *first* so a foreign 777 frame carrying a non-UTF-8
+    // payload passes untouched (the pass-through contract) instead of
+    // being reported as invalid UTF-8.
+    if !content.starts_with(osc::RATTY_AI_PREFIX.as_bytes()) {
+        return;
+    }
     let Ok(content) = std::str::from_utf8(content) else {
         report.errors.push(format!(
-            "line {line}: OSC 777 frame content is not UTF-8"
+            "line {line}: ratty OSC 777 frame content is not UTF-8 (ratty silently drops it)"
         ));
         return;
     };
-    if !content.starts_with(osc::RATTY_AI_PREFIX) {
-        return;
-    }
     let Some(command) = osc::parse_command(content) else {
+        // Take the debug snippet on a char boundary: a fixed byte offset
+        // would panic when a multibyte UTF-8 char straddles it.
+        let snippet: String = content.chars().take(60).collect();
         report.errors.push(format!(
-            "line {line}: unparseable ratty OSC 777 command {:?} (ratty silently drops it)",
-            &content[..content.len().min(60)]
+            "line {line}: unparseable ratty OSC 777 command {snippet:?} (ratty silently drops it)"
         ));
         return;
     };
@@ -741,6 +747,49 @@ mod tests {
         let cast = cast_with_events(&[(0.0, "o", "\x1b]777;notify;hello world\x07")]);
         let report = validate(&cast);
         assert!(report.errors.is_empty(), "{:?}", report.errors);
+    }
+
+    #[test]
+    fn unparseable_ratty_osc_777_with_multibyte_content_does_not_panic() {
+        // A ratty-namespace frame that fails to parse, long enough that its
+        // 60th byte lands inside a multibyte char. Slicing the debug snippet
+        // on a fixed byte offset would panic; the validator must report it.
+        let payload = format!("ratty:x{}", "é".repeat(40));
+        let data = format!("\x1b]777;{payload}\x07");
+        let cast = cast_with_events(&[(0.0, "o", data.as_str())]);
+        let report = validate(&cast);
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|e| e.contains("unparseable ratty OSC 777")),
+            "{:?}",
+            report.errors
+        );
+    }
+
+    #[test]
+    fn foreign_non_utf8_osc_777_frame_passes_untouched() {
+        // A non-`ratty:` 777 frame carrying non-UTF-8 bytes belongs to
+        // another 777 user; the validator must not report it at all — the
+        // namespace check happens on the raw bytes, before UTF-8 decoding.
+        let mut report = Report::default();
+        check_osc_777(1, b"notify;body \xff\xfe\x00", &mut report);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+    }
+
+    #[test]
+    fn ratty_namespace_non_utf8_osc_777_frame_errors() {
+        // A `ratty:`-namespace frame that is not valid UTF-8 cannot be a
+        // real ratty command (the terminal only ever parses UTF-8); surface
+        // it rather than pass it through.
+        let mut report = Report::default();
+        check_osc_777(1, b"ratty:mood;mood=\xff\xfe", &mut report);
+        assert!(
+            report.errors.iter().any(|e| e.contains("not UTF-8")),
+            "{:?}",
+            report.errors
+        );
     }
 
     #[test]
