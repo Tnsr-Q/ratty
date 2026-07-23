@@ -7,6 +7,7 @@
 #![warn(clippy::unwrap_used)]
 
 pub mod ai;
+pub mod bookmarks;
 pub mod cli;
 pub mod config;
 mod direct_render;

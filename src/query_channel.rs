@@ -64,6 +64,7 @@ pub const SUPPORTED_OPS: &[&str] = &[
     "state.executions",
     "state.errors",
     "state.viz",
+    "state.bookmarks",
 ];
 
 /// One OSC 778 item drained from the parser, delivered to the Bevy world.
@@ -270,6 +271,7 @@ pub fn answer_queries(
     effects: Res<AiEffects>,
     viz: Res<crate::viz::VizRegistry>,
     sound: Res<SoundState>,
+    bookmarks: Res<crate::bookmarks::BookmarkRegistry>,
 ) {
     // Acks first: a same-chunk "command with tok= then query" reads its
     // ack before the query reply, in mutation order.
@@ -309,6 +311,7 @@ pub fn answer_queries(
                     effects: &effects,
                     viz: &viz,
                     sound: &sound,
+                    bookmarks: &bookmarks,
                     grid: runtime.parser.screen().size(),
                 };
                 match answer(envelope, *source, &ctx) {
@@ -392,6 +395,7 @@ struct QueryCtx<'a> {
     effects: &'a AiEffects,
     viz: &'a crate::viz::VizRegistry,
     sound: &'a SoundState,
+    bookmarks: &'a crate::bookmarks::BookmarkRegistry,
     /// Live grid size as `(rows, cols)`, from the parser screen.
     grid: (u16, u16),
 }
@@ -420,6 +424,7 @@ fn answer(
         "state.macros" | "state.executions" => Ok(json!({ "items": [] })),
         "state.errors" => errors(ctx, source, &data),
         "state.viz" => viz_state(ctx, source, &data),
+        "state.bookmarks" => Ok(bookmarks_state(ctx, source)),
         _ => Err(codes::UNSUPPORTED_OP),
     }
 }
@@ -444,7 +449,13 @@ fn caps(ctx: &QueryCtx<'_>) -> Value {
             "viz_items": crate::viz::MAX_VIZ_ITEMS_PER_SNAPSHOT,
             "sound_voices": crate::sound::MAX_SOUND_VOICES,
             "sound_plays_per_sec": crate::sound::SOUND_PLAYS_PER_SEC,
+            "viz_series": crate::viz::MAX_VIZ_SERIES_PER_SNAPSHOT,
+            "viz_points_per_series": crate::viz::MAX_VIZ_POINTS_PER_SERIES,
+            "viz_points": crate::viz::MAX_VIZ_POINTS_PER_SNAPSHOT,
+            "bookmarks_per_namespace": crate::bookmarks::MAX_BOOKMARKS_PER_NAMESPACE,
+            "bookmark_name_bytes": crate::bookmarks::MAX_BOOKMARK_NAME_BYTES,
         },
+        "viz_kinds": crate::viz::REGISTERED_VIZ_KINDS,
     })
 }
 
@@ -810,6 +821,30 @@ fn viz_state(
     paginate(ctx, items, data)
 }
 
+/// `state.bookmarks`: the caller's own view bookmarks, by name. Bookmarks
+/// live in the caller's session namespace and are never projected to
+/// other callers — there is no foreign-visibility tier and no pagination
+/// (the per-namespace cap keeps the reply pages under budget).
+fn bookmarks_state(ctx: &QueryCtx<'_>, source: IngressSource) -> Value {
+    let mut items: Vec<(&str, Value)> = ctx
+        .bookmarks
+        .iter_namespace(source.namespace())
+        .map(|(name, bookmark)| {
+            (
+                name,
+                json!({
+                    "name": name,
+                    "v": bookmark.v,
+                    "mode": bookmark.mode,
+                    "warp": bookmark.warp,
+                }),
+            )
+        })
+        .collect();
+    items.sort_by_key(|(name, _)| *name);
+    json!({ "items": items.into_iter().map(|(_, value)| value).collect::<Vec<_>>() })
+}
+
 fn encode_cursor(session: &QuerySession, after: u64) -> String {
     query::b64url_encode(format!("{}:{after}", session.nonce_hex()).as_bytes())
 }
@@ -875,6 +910,7 @@ mod tests {
 
     use crate::ai::{AiCommand, AiObjectRegistry, AiObjectRemoved, apply_ai_object_commands};
     use crate::config::AppConfig;
+    use crate::osc::RattyAiCommand;
     use crate::inline::InlineStyle;
     use crate::query::{ParsedReply, ReplyScanner, parse_reply_body, query_sequence};
     use crate::runtime::VirtualTerminalHost;
@@ -901,6 +937,7 @@ mod tests {
         app.init_resource::<AiEffects>();
         app.init_resource::<crate::viz::VizRegistry>();
         app.init_resource::<SoundState>();
+        app.init_resource::<crate::bookmarks::BookmarkRegistry>();
         app.init_resource::<Time>();
         app.insert_resource(TerminalPresentation {
             mode: TerminalPresentationMode::Flat2d,
@@ -913,6 +950,7 @@ mod tests {
         app.add_message::<AiObjectRemoved>();
         app.add_message::<QueryRequest>();
         app.add_message::<AckOutcome>();
+        app.init_resource::<crate::bookmarks::PendingBookmarkJumps>();
         app.add_systems(
             Update,
             (
@@ -920,6 +958,8 @@ mod tests {
                 apply_ai_object_commands,
                 crate::viz::apply_viz_commands,
                 apply_sound_commands,
+                crate::bookmarks::apply_bookmark_commands,
+                crate::bookmarks::drain_bookmark_jumps,
                 answer_queries,
             )
                 .chain(),
@@ -1421,6 +1461,70 @@ mod tests {
         assert!(replies[0].ok);
         let reply = run_query(&mut app, &host, "q3", "state.viz", None);
         assert_eq!(payload(&reply)["items"], json!([]));
+    }
+
+    /// The bookmark closed loop over the wire: store with `tok=`, read
+    /// back through `state.bookmarks`, collide without `mode=replace`,
+    /// and jump — whose relowered `SetMode`/`SetWarp` ride the normal
+    /// command stream.
+    #[test]
+    fn closed_loop_bookmark_store_read_jump_over_777_and_778() {
+        let (mut app, host) = test_app();
+        // Warp the view so the stored snapshot has something to remember.
+        app.world_mut()
+            .resource_mut::<TerminalPlaneWarp>()
+            .amount = 0.5;
+        host.feed_tx
+            .send(b"\x1b]777;ratty:bookmark;name=dock&tok=b1\x07".to_vec())
+            .expect("virtual feed accepts bytes");
+        app.update();
+        let replies = drain_replies(&host);
+        assert_eq!(replies.len(), 1);
+        assert!(replies[0].ok, "the bookmark stored");
+
+        let reply = run_query(&mut app, &host, "q1", "state.bookmarks", None);
+        assert_eq!(
+            payload(&reply)["items"],
+            json!([{ "name": "dock", "v": 1, "mode": "2d", "warp": 0.5 }]),
+            "the caller reads back exactly what it stored"
+        );
+
+        // A colliding store without mode=replace rejects already-exists.
+        host.feed_tx
+            .send(b"\x1b]777;ratty:bookmark;name=dock&tok=b2\x07".to_vec())
+            .expect("virtual feed accepts bytes");
+        app.update();
+        let replies = drain_replies(&host);
+        assert_eq!(replies.len(), 1);
+        assert!(!replies[0].ok);
+        assert_eq!(replies[0].code.as_deref(), Some(codes::ALREADY_EXISTS));
+
+        // Change the live view, then jump back: the relowered commands
+        // land on the normal AiCommand stream (the mode/warp appliers are
+        // exercised by their own tests; here the loop pins the plumbing).
+        app.world_mut()
+            .resource_mut::<TerminalPlaneWarp>()
+            .amount = 0.75;
+        app.world_mut()
+            .resource_mut::<Messages<AiCommand>>()
+            .clear();
+        host.feed_tx
+            .send(b"\x1b]777;ratty:bookmark.jump;name=dock&tok=j1\x07".to_vec())
+            .expect("virtual feed accepts bytes");
+        app.update();
+        let replies = drain_replies(&host);
+        assert_eq!(replies.len(), 1);
+        assert!(replies[0].ok, "the jump validated and relowered");
+        let mut messages = app.world_mut().resource_mut::<Messages<AiCommand>>();
+        let relowered: Vec<String> = messages
+            .drain()
+            .filter_map(|message| match message.command {
+                RattyAiCommand::SetMode { mode } => Some(format!("mode={mode}")),
+                RattyAiCommand::SetWarp { intensity } => Some(format!("warp={intensity}")),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(relowered, vec!["mode=2d", "warp=0.5"]);
     }
 
     #[test]
