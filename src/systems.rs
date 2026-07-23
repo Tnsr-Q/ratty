@@ -51,7 +51,8 @@ use crate::terminal::{
 };
 use crate::viz::{
     QueuedVizEffect, VIZ_EFFECT_SECONDS, VizChildRecord, VizChildSpec, VizEffectAnim,
-    VizEffectKind, VizKeyedItem, VizObjectRoot, VizPaletteSlot, VizRegistry, viz_child_specs,
+    VizEffectKind, VizKeyedItem, VizObjectRoot, VizPaletteSlot, VizRegistry, VizSlot,
+    viz_child_specs,
 };
 use bevy::app::AppExit;
 use bevy::asset::AssetMut;
@@ -395,6 +396,7 @@ pub(crate) struct RenderWidgetParams<'w, 's> {
     direct_render: Res<'w, DirectTerminalSceneExchange>,
     model_load_state: Res<'w, ModelLoadState>,
     frame_dirty: ResMut<'w, TerminalFrameDirty>,
+    viz_registry: Res<'w, VizRegistry>,
     blink_phase: Local<'s, u64>,
 }
 
@@ -416,6 +418,7 @@ pub(crate) fn render_terminal_widget(mut params: RenderWidgetParams) {
         direct_render,
         model_load_state,
         frame_dirty,
+        viz_registry,
         blink_phase,
     } = &mut params;
     let needs_redraw = redraw.take();
@@ -451,7 +454,7 @@ pub(crate) fn render_terminal_widget(mut params: RenderWidgetParams) {
         }
     });
 
-    let _ = terminal.sync_image(images, direct_render, time.elapsed_secs());
+    let _ = terminal.sync_image(images, direct_render, time.elapsed_secs(), viz_registry);
 }
 
 #[derive(SystemParam)]
@@ -1666,13 +1669,24 @@ pub(crate) fn viz_grid_dims(count: usize) -> (usize, usize) {
     (cols, count.div_ceil(cols))
 }
 
-/// Root-local rest pose for the child at `index` of `count`: a unit cube
-/// translated and scaled into its grid cell within the root's normalized
-/// `[-0.5, 0.5]` footprint. Bars rise from the cell bottom with height
-/// proportional to the clamped magnitude, so the layout is resolution
-/// independent — the root's per-frame scale is the anchored footprint in
-/// pixels.
-pub(crate) fn viz_child_pose(index: usize, count: usize, magnitude: f32) -> (Vec3, Vec3) {
+/// Root-local rest pose for the child at `index` of `count`: grid slots
+/// keep the M3.5 near-square math below; chart slots (bars, markers,
+/// needles, spans) place from their data coordinates via
+/// [`crate::viz_draw::chart_child_pose`], which shares its plot insets
+/// with the vello underlay so meshes and paths can never drift apart.
+pub(crate) fn viz_child_pose(index: usize, count: usize, spec: &VizChildSpec) -> (Vec3, Vec3) {
+    match spec.slot {
+        VizSlot::Grid => viz_grid_child_pose(index, count, spec.magnitude),
+        slot => crate::viz_draw::chart_child_pose(slot, index, count, spec.magnitude),
+    }
+}
+
+/// The M3.5 grid pose: a unit cube translated and scaled into its grid
+/// cell within the root's normalized `[-0.5, 0.5]` footprint. Bars rise
+/// from the cell bottom with height proportional to the clamped
+/// magnitude, so the layout is resolution independent — the root's
+/// per-frame scale is the anchored footprint in pixels.
+pub(crate) fn viz_grid_child_pose(index: usize, count: usize, magnitude: f32) -> (Vec3, Vec3) {
     let (grid_cols, grid_rows) = viz_grid_dims(count);
     let cell_width = 1.0 / grid_cols as f32;
     let cell_height = 1.0 / grid_rows as f32;
@@ -1954,7 +1968,7 @@ fn spawn_viz_tree(
         if ledger.contains_key(&spec.key) {
             continue;
         }
-        let (translation, scale) = viz_child_pose(index, count, spec.magnitude);
+        let (translation, scale) = viz_child_pose(index, count, spec);
         let record = spawn_viz_child(
             commands,
             root_entity,
@@ -2037,7 +2051,7 @@ fn diff_viz_children(
             // Hostile duplicate key: first occurrence wins.
             continue;
         }
-        let (translation, scale) = viz_child_pose(index, count, spec.magnitude);
+        let (translation, scale) = viz_child_pose(index, count, spec);
         if let Some(mut record) = root.children.remove(&spec.key) {
             if record.palette != spec.palette {
                 record.palette = spec.palette;
@@ -3363,15 +3377,15 @@ mod viz_render_tests {
             assert!(cols * rows >= count, "{count} items fit");
             assert!(cols >= rows, "wider than tall");
             for index in 0..count {
-                let (translation, scale) = viz_child_pose(index, count, 0.7);
+                let (translation, scale) = viz_grid_child_pose(index, count, 0.7);
                 assert!(translation.x - scale.x * 0.5 >= -0.5 - 1e-4);
                 assert!(translation.x + scale.x * 0.5 <= 0.5 + 1e-4);
                 assert!(translation.y - scale.y * 0.5 >= -0.5 - 1e-4);
                 assert!(translation.y + scale.y * 0.5 <= 0.5 + 1e-4);
             }
         }
-        let (_, low) = viz_child_pose(0, 4, 0.0);
-        let (_, high) = viz_child_pose(0, 4, 1.0);
+        let (_, low) = viz_grid_child_pose(0, 4, 0.0);
+        let (_, high) = viz_grid_child_pose(0, 4, 1.0);
         assert!(high.y > low.y, "magnitude drives bar height");
         assert!(low.y > 0.0, "zero magnitude keeps a visible sliver");
     }

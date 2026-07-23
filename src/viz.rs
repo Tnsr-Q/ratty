@@ -843,7 +843,12 @@ impl Plugin for VizPlugin {
         app.init_resource::<VizRegistry>()
             .add_systems(
                 Update,
-                apply_viz_commands.after(crate::systems::pump_pty_output),
+                // Before the redraw set as well: a chart-kind mutation
+                // requests a terminal redraw, and the vello underlay must
+                // reflect it the same frame.
+                apply_viz_commands
+                    .after(crate::systems::pump_pty_output)
+                    .before(crate::systems::TerminalRedrawSet),
             )
             .add_systems(
                 Update,
@@ -880,7 +885,20 @@ pub fn apply_viz_commands(
     mut registry: ResMut<VizRegistry>,
     mut acks: MessageWriter<AckOutcome>,
     mut diagnostics: ResMut<AiDiagnostics>,
+    mut redraw: ResMut<crate::terminal::TerminalRedrawState>,
 ) {
+    // Chart-family kinds carry a vello underlay inside the terminal
+    // texture, so any mutation that adds, replaces, or removes one must
+    // redraw the texture. Grid kinds are mesh-only and skip it.
+    fn has_underlay(payload: &VizPayload) -> bool {
+        matches!(
+            payload,
+            VizPayload::ChartBar(_)
+                | VizPayload::ChartLine(_)
+                | VizPayload::ChartGauge(_)
+                | VizPayload::Timeline(_)
+        )
+    }
     for AiCommand {
         source,
         ack_token,
@@ -1061,6 +1079,10 @@ pub fn apply_viz_commands(
                     }
                     None
                 };
+                let replaced_underlay = live.is_some_and(|entry| has_underlay(&entry.payload));
+                if replaced_underlay || has_underlay(&payload) {
+                    redraw.request();
+                }
                 registry.upsert(id, payload, anchor);
                 ack_commit(&mut acks, *source, ack_token);
             }
@@ -1130,7 +1152,13 @@ pub fn apply_viz_commands(
                     );
                     continue;
                 }
+                let removed_underlay = registry
+                    .get(id)
+                    .is_some_and(|entry| has_underlay(&entry.payload));
                 if registry.remove(id) {
+                    if removed_underlay {
+                        redraw.request();
+                    }
                     ack_commit(&mut acks, *source, ack_token);
                 } else {
                     warn!("ratty-ai: viz.remove rejected: no visualization with id {id:#010x}");
@@ -1145,6 +1173,12 @@ pub fn apply_viz_commands(
                 // Reset's single ack belongs to apply_ai_commands; the viz
                 // registry clears silently, like the object and effect
                 // handlers.
+                if registry
+                    .iter()
+                    .any(|(_, entry)| has_underlay(&entry.payload))
+                {
+                    redraw.request();
+                }
                 registry.clear_all();
             }
             _ => {}
@@ -1438,6 +1472,7 @@ mod tests {
         let mut app = App::new();
         app.init_resource::<VizRegistry>();
         app.init_resource::<AiDiagnostics>();
+        app.init_resource::<crate::terminal::TerminalRedrawState>();
         app.add_message::<AiCommand>();
         app.add_message::<AckOutcome>();
         app.add_systems(Update, apply_viz_commands);

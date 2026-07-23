@@ -236,6 +236,12 @@ impl TerminalSurface {
 
     /// Synchronizes the rendered terminal image.
     ///
+    /// Anchored chart-family visualizations contribute a vello underlay
+    /// (axes, labels, arcs, tracks) drawn into the terminal texture at
+    /// their footprint's pixel rect — computed here, where the physical
+    /// cell metrics live. Ids are drawn in ascending order so overlapping
+    /// charts stack deterministically.
+    ///
     /// # Errors
     ///
     /// Returns an error if the offscreen renderer cannot be initialized or rendered.
@@ -244,6 +250,7 @@ impl TerminalSurface {
         images: &mut Assets<Image>,
         exchange: &DirectTerminalSceneExchange,
         elapsed_secs: f32,
+        viz: &crate::viz::VizRegistry,
     ) -> anyhow::Result<()> {
         let (Some(render_handle), Some(present_handle)) =
             (self.render_image_handle.clone(), self.image_handle.clone())
@@ -269,6 +276,36 @@ impl TerminalSurface {
             }
         }
 
+        let metrics = self.renderer.metrics();
+        let mut viz_ids: Vec<u32> = viz
+            .iter()
+            .filter(|(_, entry)| entry.anchor.is_some())
+            .map(|(id, _)| id)
+            .collect();
+        viz_ids.sort_unstable();
+        let mut underlays: Vec<(crate::viz_draw::UnderlayRect, Vec<crate::viz_draw::VizDrawOp>)> =
+            Vec::new();
+        for id in viz_ids {
+            let Some(entry) = viz.get(id) else {
+                continue;
+            };
+            let Some(anchor) = entry.anchor else {
+                continue;
+            };
+            let Some(ops) = crate::viz_draw::viz_underlay_ops(&entry.payload) else {
+                continue;
+            };
+            underlays.push((
+                crate::viz_draw::UnderlayRect {
+                    x: f32::from(anchor.col) * metrics.cell_width,
+                    y: f32::from(anchor.row) * metrics.cell_height,
+                    width: f32::from(anchor.cols) * metrics.cell_width,
+                    height: f32::from(anchor.rows) * metrics.cell_height,
+                },
+                ops,
+            ));
+        }
+
         let buffer = self.tui.backend().buffer();
         let cursor = Some(self.tui.backend().cursor_position());
         let cursor_visible = self.tui.backend().cursor_visible();
@@ -283,6 +320,7 @@ impl TerminalSurface {
             cursor,
             cursor_visible,
             elapsed_secs,
+            &underlays,
         );
 
         Ok(())
