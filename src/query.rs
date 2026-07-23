@@ -90,6 +90,25 @@ pub mod codes {
     pub const BAD_ASSET: &str = "bad-asset";
     /// The mode string is not a known presentation mode.
     pub const BAD_MODE: &str = "bad-mode";
+    /// The kind is not a registered semantic kind for the requested op.
+    /// NOTE: the M3.5 viz lane appends an identical `bad-kind` constant —
+    /// keep the name and value byte-identical so the branches merge
+    /// trivially.
+    pub const BAD_KIND: &str = "bad-kind";
+    /// A one-shot was requested while audio is locked (browser autoplay
+    /// policy, pre-gesture); the sound did not and will not play.
+    pub const AUDIO_LOCKED: &str = "audio-locked";
+    /// Qualifier on an `ok=1` ack: the ambient request committed as
+    /// retained state and fades in after the first user gesture unlocks
+    /// audio. There is no later notification — clients poll `state.scene`.
+    pub const DEFERRED: &str = "deferred";
+    /// The caller exceeded its per-namespace one-shot rate limit.
+    pub const RATE_LIMITED: &str = "rate-limited";
+    /// The one-shot voice caps (global or per-namespace) are full.
+    pub const VOICE_CAP: &str = "voice-cap";
+    /// The caller's ingress tier does not carry the required capability
+    /// (e.g. scene ambient audio is disabled by trusted config).
+    pub const NOT_PERMITTED: &str = "not-permitted";
     /// The query timed out client-side (never emitted by the terminal).
     pub const TIMEOUT: &str = "timeout";
     /// The session was disposed with the query outstanding.
