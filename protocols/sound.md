@@ -168,9 +168,12 @@ leaves the running fade untouched.
 
 `ratty:reset` resets the sound organ silently (its single ack belongs to
 the scene applier): the bed fades out, the retained pre-unlock request
-and the rate buckets clear, and in-flight one-shots finish. Unlock
-status is a user-gesture fact, not scene state — reset never re-locks
-(or unlocks) audio.
+clears, and in-flight one-shots finish. The per-namespace rate buckets
+are deliberately left untouched — they are an anti-abuse accumulator, not
+scene state, and refilling them on reset would let a script interleave
+`ratty:reset` with `sound.play` to sustain far above the advertised rate.
+Unlock status is a user-gesture fact, not scene state — reset never
+re-locks (or unlocks) audio.
 
 ## Unlock gating (browser autoplay)
 
@@ -207,6 +210,25 @@ authoritative over the mixer at every moment; per-play gains and the
 decision table are unaffected by them. All fields are optional
 (`#[serde(default)]` — additive-safe).
 
+## Degradation without an audio device
+
+`enabled` reports whether the playback backend is *compiled in*, not
+whether an audio device is *present*. On a host with no output device (a
+headless server, some CI), the backend keeps no audio manager and never
+processes play commands, so a one-shot's backing instance never
+materializes — the playback layer's normal "voice ends, free its slot"
+signal never arrives.
+
+So the decision layer reaps a committed voice a bounded time after it
+commits (`VOICE_MAX_LIFETIME_SECS`, two seconds — every one-shot is well
+under a second) rather than waiting for an instance end that will never
+come. The caps therefore self-heal: plays keep acking per the decision
+table instead of the 16-voice cap wedging shut and rejecting every later
+play with `voice-cap`. `state.scene` still reports `enabled=true` (the
+backend is built) and, once unlocked, `unlocked=true`, even though nothing
+is audible — the honest bit an ack ever promises is that the *decision*
+committed, not that a speaker moved.
+
 ## Queryable state and caps
 
 `state.scene` (OSC 778) carries the sound organ's public state under the
@@ -220,7 +242,8 @@ append-only `audio` key:
 
 - `enabled` — whether the playback backend is compiled into this binary;
   feature-off builds report `false` honestly (the key shape is
-  feature-independent).
+  feature-independent). It does not promise an audio device is present —
+  see [Degradation without an audio device](#degradation-without-an-audio-device).
 - `unlocked` — the autoplay gate; poll this after issuing a deferred
   ambient request.
 - `ambient.kind` / `ambient.phase` — the bed's registered kind (or

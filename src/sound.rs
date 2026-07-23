@@ -63,6 +63,18 @@ pub const AMBIENT_XFADE_MAX_MS: u32 = 5000;
 /// Default ambient crossfade/fade duration, in milliseconds.
 pub const AMBIENT_XFADE_DEFAULT_MS: u32 = 1500;
 
+/// Backstop lifetime, in seconds, after which the decision layer reaps a
+/// committed one-shot voice from the caps unconditionally.
+///
+/// The playback layer normally frees a voice when it observes its instance
+/// end, but a device-less backend never materializes an instance (kira
+/// drops the play command when it has no output manager), so that path
+/// would never fire and the caps would wedge shut, rejecting every later
+/// play with `voice-cap` while `state.scene` still reports `enabled=true`.
+/// Every registered one-shot is well under a second (a decode test pins
+/// this), so this generous bound never touches a genuinely audible voice.
+pub const VOICE_MAX_LIFETIME_SECS: f64 = 2.0;
+
 /// One entry of the terminal-side sound registry: how a registered
 /// semantic kind resolves to an embedded asset and its gain envelope.
 #[derive(Debug, Clone, Copy)]
@@ -161,6 +173,11 @@ pub struct SoundVoice {
     pub gain: f32,
     /// Whether the playback layer has started the backing instance yet.
     pub started: bool,
+    /// The [`Time`] second (elapsed) the play committed. The decision layer
+    /// reaps the voice [`VOICE_MAX_LIFETIME_SECS`] after this as a backstop
+    /// for backends that never report the instance ending (a device-less
+    /// host), so the caps cannot wedge shut.
+    pub committed_at: f64,
 }
 
 /// Phase of the scene ambient bed.
@@ -326,16 +343,32 @@ impl SoundState {
     }
 
     /// The `ratty:reset` semantics: fade the ambient bed out, clear the
-    /// retained pre-unlock request and the rate-limit buckets, and let
-    /// in-flight one-shots finish. `unlocked` is a user-gesture fact, not
-    /// scene state, so reset never re-locks audio.
+    /// retained pre-unlock request, and let in-flight one-shots finish.
+    /// `unlocked` is a user-gesture fact, not scene state, so reset never
+    /// re-locks audio.
+    ///
+    /// The rate-limit buckets are deliberately left untouched: they are an
+    /// anti-abuse accumulator, not scene state. Refilling them on reset
+    /// would let a script interleave `ratty:reset` with `sound.play` to
+    /// sustain far above the advertised rate. They are already bounded
+    /// (at most 128, one per 7-bit namespace) and self-refill over time.
     pub fn reset(&mut self) {
         if self.ambient.current.is_some() {
             self.ambient.phase = AmbientPhase::FadingOut;
             self.ambient.xfade_ms = AMBIENT_XFADE_DEFAULT_MS;
         }
         self.ambient.retained_pre_unlock = None;
-        self.play_buckets.clear();
+    }
+
+    /// Reaps one-shot voices whose backstop lifetime has elapsed (see
+    /// [`VOICE_MAX_LIFETIME_SECS`]). The playback layer frees voices as
+    /// their instances end; this is the safety net for a backend that
+    /// never ends one (a device-less host), so the caps self-heal instead
+    /// of pinning shut. It fires no ack — the play was decided and acked at
+    /// commit time; freeing its slot is silent bookkeeping.
+    fn expire_voices(&mut self, now: f64) {
+        self.voices
+            .retain(|voice| now - voice.committed_at < VOICE_MAX_LIFETIME_SECS);
     }
 
     /// Takes one rate-limit token for `namespace` at time `now` (seconds).
@@ -416,6 +449,11 @@ pub fn apply_sound_commands(
     mut diagnostics: ResMut<AiDiagnostics>,
 ) {
     let now = time.elapsed_secs_f64();
+    // Backstop for a device-less backend: the playback layer never observes
+    // an instance end when there is no audio device, so reap over-age
+    // voices here (every frame, whether or not commands arrived) to keep
+    // the caps honest. See [`SoundState::expire_voices`].
+    state.expire_voices(now);
     for AiCommand {
         source,
         ack_token,
@@ -512,7 +550,14 @@ pub fn apply_sound_commands(
                     continue;
                 }
                 // Server-side clamp: the wire requests, the registry rules.
-                let gain = gain.unwrap_or(spec.default_gain).clamp(0.0, spec.max_gain);
+                // A non-finite gain (`NaN`/`inf` survives `clamp`) falls back
+                // to the registry default, matching the wire's permissive
+                // "malformed numeric → default" stance rather than acking a
+                // silent voice.
+                let gain = gain
+                    .filter(|value| value.is_finite())
+                    .unwrap_or(spec.default_gain)
+                    .clamp(0.0, spec.max_gain);
                 let id = state.next_voice_id;
                 state.next_voice_id += 1;
                 state.voices.push(SoundVoice {
@@ -521,6 +566,7 @@ pub fn apply_sound_commands(
                     kind: spec.kind,
                     gain,
                     started: false,
+                    committed_at: now,
                 });
                 ack_commit(&mut acks, *source, ack_token);
             }
@@ -553,7 +599,12 @@ pub fn apply_sound_commands(
                     );
                     continue;
                 }
-                let gain = gain.unwrap_or(spec.default_gain).clamp(0.0, spec.max_gain);
+                // Non-finite gain falls back to the registry default (as on
+                // sound.play), so a bed never commits at `NaN`.
+                let gain = gain
+                    .filter(|value| value.is_finite())
+                    .unwrap_or(spec.default_gain)
+                    .clamp(0.0, spec.max_gain);
                 if !state.unlocked {
                     // A bed is stateful, not evental: retain the LATEST
                     // request; it fades in after the first user gesture.
@@ -574,7 +625,15 @@ pub fn apply_sound_commands(
                         state.ambient.phase,
                         AmbientPhase::Playing | AmbientPhase::Crossfading
                     );
-                if !same_kind_live {
+                if same_kind_live {
+                    // Same bed already live: no restart (loop-replay
+                    // friendly), but a *changed* gain must still take effect
+                    // — update the live track so the playback layer retunes
+                    // it with a short tween. Phase and xfade stay untouched.
+                    if let Some(track) = state.ambient.current.as_mut() {
+                        track.gain = gain;
+                    }
+                } else {
                     // Crossfade to the new bed (or fade in from silence /
                     // resurrect a fading-out bed).
                     state.ambient.current = Some(AmbientTrack {
@@ -586,8 +645,6 @@ pub fn apply_sound_commands(
                         .unwrap_or(AMBIENT_XFADE_DEFAULT_MS)
                         .clamp(AMBIENT_XFADE_MIN_MS, AMBIENT_XFADE_MAX_MS);
                 }
-                // Same-kind set on a live bed is an idempotent commit (no
-                // restart) so loop replays are clean.
                 ack_commit(&mut acks, *source, ack_token);
             }
             RattyAiCommand::SoundAmbientStop { fade } => {
@@ -640,10 +697,18 @@ fn unlock_on_keyboard_input(mut keys: MessageReader<KeyboardInput>, mut state: R
 ///
 /// Master gain and mute from `[audio]` config are applied here, at
 /// playback time, so trusted config stays authoritative over the mixer.
+///
+/// The layer reaps its own assets: kira keys every instance on a
+/// `Handle::Uuid` and never removes it from `Assets<AudioInstance>`
+/// (dropping such a handle does not drop its asset), so this layer calls
+/// `instances.remove` for every ended one-shot and every faded-out bed —
+/// otherwise the asset store grows unbounded over a session.
+///
 /// The layer is headless-tolerant: without an audio device bevy_kira_audio
-/// keeps a `None` backend and queues channel commands, instances never
-/// materialize, and un-started voices stay counted — the voice caps then
-/// bound the queue instead of a timeout lying about playback.
+/// keeps a `None` backend and never processes play commands, so instances
+/// never materialize. A one-shot's slot is then freed by the decision
+/// layer's lifetime backstop ([`VOICE_MAX_LIFETIME_SECS`]); this layer
+/// drops its matching bookkeeping when the voice leaves [`SoundState`].
 #[cfg(feature = "sound")]
 mod playback {
     use std::collections::HashMap;
@@ -695,7 +760,19 @@ mod playback {
     pub struct SoundPlayback {
         one_shots: HashMap<u64, OneShotPlayback>,
         ambient: Option<AmbientPlayback>,
+        /// Faded-out ambient instances awaiting asset reaping, each paired
+        /// with the [`Time`] second at which its fade completes. kira keys
+        /// every instance on a `Handle::Uuid` and never removes it from
+        /// `Assets<AudioInstance>` itself, so a bed that is replaced would
+        /// otherwise leak one asset per crossfade; the asset is held only
+        /// until the fade finishes, then reaped. Bounded by the fade
+        /// duration (in practice at most one or two at a time).
+        retiring_ambient: Vec<(Handle<AudioInstance>, f64)>,
     }
+
+    /// Grace, in seconds, added to a fade's duration before its instance
+    /// asset is reaped, so the audible fade tail is never cut short.
+    const AMBIENT_REAP_MARGIN_SECS: f64 = 0.25;
 
     /// Converts a post-registry-clamp amplitude gain into kira decibels
     /// under the trusted config master: mute floors to silence, master
@@ -741,13 +818,14 @@ mod playback {
     }
 
     /// Starts committed one-shot voices and frees their cap slots when
-    /// their kira instances end.
+    /// their kira instances end, reaping each ended instance's asset (kira
+    /// leaves `Handle::Uuid` instances in `Assets<AudioInstance>` forever).
     pub fn drive_one_shot_voices(
         mut state: ResMut<SoundState>,
         mut playback: ResMut<SoundPlayback>,
         assets: Res<SoundAssets>,
         audio: Res<Audio>,
-        instances: Res<Assets<AudioInstance>>,
+        mut instances: ResMut<Assets<AudioInstance>>,
         config: Res<AppConfig>,
     ) {
         let mut ended: Vec<u64> = Vec::new();
@@ -769,28 +847,40 @@ mod playback {
                 },
             );
         }
+        // A missing asset means the instance is still queued (never
+        // observed — leave it); we reap the asset ourselves on end, so an
+        // observed-then-missing entry only arises after our own removal.
         for (id, one_shot) in playback.one_shots.iter_mut() {
-            match instances.get(&one_shot.handle) {
-                Some(instance) => {
-                    if matches!(instance.state(), PlaybackState::Stopped) {
-                        ended.push(*id);
-                    } else {
-                        one_shot.observed = true;
-                    }
-                }
-                // Missing asset: either still queued (never observed — leave
-                // it) or ended and cleaned up in PreUpdate (observed — free
-                // the voice).
-                None => {
+            if let Some(instance) = instances.get(&one_shot.handle) {
+                if matches!(instance.state(), PlaybackState::Stopped) {
+                    // A freshly queued instance also reports Stopped, so
+                    // only end one we have seen actually playing.
                     if one_shot.observed {
                         ended.push(*id);
                     }
+                } else {
+                    one_shot.observed = true;
                 }
             }
         }
+        // Drop bookkeeping for any voice the decision layer already retired
+        // via its lifetime backstop (a device-less backend never lets an
+        // instance end, so the observe-end path above never fires); its
+        // asset, if one ever materialized, is reaped below.
+        for id in playback.one_shots.keys().copied().collect::<Vec<_>>() {
+            if !state.voices.iter().any(|voice| voice.id == id) {
+                ended.push(id);
+            }
+        }
         if !ended.is_empty() {
+            ended.sort_unstable();
+            ended.dedup();
             for id in &ended {
-                playback.one_shots.remove(id);
+                if let Some(one_shot) = playback.one_shots.remove(id) {
+                    // kira never removes a `Handle::Uuid` instance from
+                    // `Assets<AudioInstance>`; reaping it is ours to do.
+                    instances.remove(&one_shot.handle);
+                }
             }
             state.voices.retain(|voice| !ended.contains(&voice.id));
         }
@@ -826,14 +916,28 @@ mod playback {
         config: Res<AppConfig>,
     ) {
         let now = time.elapsed_secs_f64();
+        // Reap faded-out ambient instances whose hold time has elapsed. kira
+        // keys each instance on a `Handle::Uuid` and never removes it from
+        // `Assets<AudioInstance>` itself, so a bed that is replaced would
+        // otherwise leak one asset per crossfade.
+        playback.retiring_ambient.retain(|(handle, deadline)| {
+            let expired = now >= *deadline;
+            if expired {
+                instances.remove(handle);
+            }
+            !expired
+        });
         match state.ambient.phase {
             AmbientPhase::Idle => {
                 // Defensive: a live instance under an idle slot should not
                 // exist; silence it if it ever does.
-                if let Some(orphan) = playback.ambient.take()
-                    && let Some(mut instance) = instances.get_mut(&orphan.handle)
-                {
-                    instance.stop(AudioTween::default());
+                if let Some(orphan) = playback.ambient.take() {
+                    if let Some(mut instance) = instances.get_mut(&orphan.handle) {
+                        instance.stop(AudioTween::default());
+                    }
+                    playback
+                        .retiring_ambient
+                        .push((orphan.handle, now + AMBIENT_REAP_MARGIN_SECS));
                 }
             }
             AmbientPhase::Crossfading => {
@@ -859,11 +963,16 @@ mod playback {
                 }
                 // A new bed (or a resurrected same-kind bed whose stop
                 // tween already started): fade the old instance out and a
-                // fresh loop in — the two overlap as the crossfade.
-                if let Some(old) = playback.ambient.take()
-                    && let Some(mut instance) = instances.get_mut(&old.handle)
-                {
-                    instance.stop(AudioTween::linear(xfade));
+                // fresh loop in — the two overlap as the crossfade. Hold the
+                // old instance's asset until its fade completes, then reap it.
+                if let Some(old) = playback.ambient.take() {
+                    if let Some(mut instance) = instances.get_mut(&old.handle) {
+                        instance.stop(AudioTween::linear(xfade));
+                    }
+                    playback.retiring_ambient.push((
+                        old.handle,
+                        now + f64::from(state.ambient.xfade_ms) / 1000.0 + AMBIENT_REAP_MARGIN_SECS,
+                    ));
                 }
                 let Some(source) = assets.handles.get(track.kind) else {
                     error!(
@@ -914,12 +1023,14 @@ mod playback {
                         }
                         if now >= ambient.deadline {
                             // Belt and braces: the tween should be done —
-                            // make the stop unconditional before dropping
-                            // the handle.
+                            // make the stop unconditional, then reap the
+                            // asset (the fade is over, so removal is safe).
                             if let Some(mut instance) = instances.get_mut(&ambient.handle) {
                                 instance.stop(AudioTween::default());
                             }
+                            let handle = ambient.handle.clone();
                             playback.ambient = None;
+                            instances.remove(&handle);
                             state.ambient.current = None;
                             state.ambient.phase = AmbientPhase::Idle;
                         }
@@ -1083,6 +1194,43 @@ mod tests {
     }
 
     #[test]
+    fn non_finite_gain_falls_back_to_the_registry_default() {
+        // NaN survives `clamp` (`NaN.clamp(lo, hi) == NaN`), so without the
+        // finiteness guard a NaN/inf gain would commit an ok-acked voice
+        // that plays silence. It must fall back to the registry default.
+        let mut app = test_app();
+        play(&mut app, "t1", "chime", Some(f32::NAN));
+        let ack = last_ack(&app);
+        assert!(ack.ok, "the play still commits");
+        let voice = state(&app).voices.last().copied().expect("a voice");
+        assert_eq!(voice.gain, 0.8, "NaN gain uses chime's default 0.8");
+        assert!(voice.gain.is_finite());
+
+        play(&mut app, "t2", "chime", Some(f32::INFINITY));
+        assert_eq!(
+            state(&app).voices.last().expect("a voice").gain,
+            0.8,
+            "inf gain also falls back to the default"
+        );
+
+        // The ambient arm applies the same guard.
+        send(
+            &mut app,
+            "t3",
+            RattyAiCommand::SoundAmbientSet {
+                kind: "ambient.hum".into(),
+                gain: Some(f32::NAN),
+                xfade: None,
+            },
+        );
+        assert_eq!(
+            state(&app).ambient.current.map(|track| track.gain),
+            Some(0.5),
+            "NaN ambient gain uses ambient.hum's default 0.5"
+        );
+    }
+
+    #[test]
     fn the_play_burst_rate_limits_within_one_frame() {
         let mut app = test_app();
         for index in 0..SOUND_PLAY_BURST {
@@ -1129,6 +1277,7 @@ mod tests {
                     kind: "click",
                     gain: 0.5,
                     started: true,
+                    committed_at: 0.0,
                 });
             }
         }
@@ -1148,6 +1297,7 @@ mod tests {
                     kind: "click",
                     gain: 0.5,
                     started: true,
+                    committed_at: 0.0,
                 });
             }
         }
@@ -1155,6 +1305,47 @@ mod tests {
         let ack = last_ack(&app);
         assert!(!ack.ok);
         assert_eq!(ack.code, Some(codes::VOICE_CAP), "global cap");
+    }
+
+    #[test]
+    fn voices_expire_at_the_backstop_deadline() {
+        // The pure reaping rule: a voice within its lifetime stays; one past
+        // it is dropped. This is the device-less safety net — without it a
+        // backend that never ends an instance would pin the caps forever.
+        let mut state = SoundState::default();
+        state.voices.push(SoundVoice {
+            id: 0,
+            namespace: 0,
+            kind: "chime",
+            gain: 0.5,
+            started: true,
+            committed_at: 1.0,
+        });
+        state.expire_voices(1.0 + VOICE_MAX_LIFETIME_SECS - 0.1);
+        assert_eq!(state.voices.len(), 1, "still within its lifetime");
+        state.expire_voices(1.0 + VOICE_MAX_LIFETIME_SECS + 0.1);
+        assert!(state.voices.is_empty(), "reaped past the deadline");
+    }
+
+    #[test]
+    fn the_decision_layer_reaps_stale_voices_so_a_deviceless_cap_self_heals() {
+        let mut app = test_app();
+        play(&mut app, "t1", "chime", None);
+        assert_eq!(state(&app).voices.len(), 1);
+        // No playback layer runs here — the device-less shape, where the
+        // instance never materializes and the observe-end path never fires.
+        // Advance past the backstop and pump a bare frame:
+        // apply_sound_commands reaps the voice so the cap cannot wedge shut.
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(std::time::Duration::from_secs_f64(
+                VOICE_MAX_LIFETIME_SECS + 0.5,
+            ));
+        app.update();
+        assert!(
+            state(&app).voices.is_empty(),
+            "the stale voice expired at its deadline"
+        );
     }
 
     #[test]
@@ -1305,6 +1496,50 @@ mod tests {
     }
 
     #[test]
+    fn same_kind_ambient_set_applies_a_changed_gain_without_restarting() {
+        let mut app = test_app();
+        send(
+            &mut app,
+            "t1",
+            RattyAiCommand::SoundAmbientSet {
+                kind: "ambient.hum".into(),
+                gain: Some(0.3),
+                xfade: Some(50),
+            },
+        );
+        assert_eq!(
+            state(&app).ambient.current.map(|track| track.gain),
+            Some(0.3)
+        );
+        // Same kind, new gain: no restart (phase/xfade untouched) but the
+        // live track's gain must update so the playback layer retunes it —
+        // a bed's gain was previously unchangeable without a stop/start dip.
+        send(
+            &mut app,
+            "t2",
+            RattyAiCommand::SoundAmbientSet {
+                kind: "ambient.hum".into(),
+                gain: Some(0.7),
+                xfade: Some(4000),
+            },
+        );
+        let ack = last_ack(&app);
+        assert!(ack.ok);
+        assert_eq!(ack.code, None, "still a plain same-kind commit");
+        let state = state(&app);
+        assert_eq!(
+            state.ambient.current.map(|track| track.gain),
+            Some(0.7),
+            "the changed gain took effect on the live bed"
+        );
+        assert_eq!(state.ambient.phase, AmbientPhase::Crossfading, "no restart");
+        assert_eq!(
+            state.ambient.xfade_ms, AMBIENT_XFADE_MIN_MS,
+            "the running fade duration is left untouched"
+        );
+    }
+
+    #[test]
     fn ambient_stop_is_idempotent_and_resurrectable() {
         let mut app = test_app();
         // Stopping silence commits.
@@ -1352,7 +1587,7 @@ mod tests {
     }
 
     #[test]
-    fn reset_is_silent_and_clears_retained_state_and_buckets() {
+    fn reset_is_silent_clears_retained_state_and_never_refills_buckets() {
         let mut app = test_app();
         // An unlocked play seeds a rate bucket and a voice.
         play(&mut app, "t0", "chime", None);
@@ -1380,7 +1615,18 @@ mod tests {
         );
         let state = state(&app);
         assert!(state.ambient.retained_pre_unlock.is_none());
-        assert!(state.play_buckets.is_empty(), "buckets clear on reset");
+        // The rate bucket is an anti-abuse accumulator, not scene state:
+        // reset must NOT refill it, or interleaving reset with sound.play
+        // would sustain far above the advertised rate. It persists, spent.
+        let bucket = state
+            .play_buckets
+            .get(&0)
+            .expect("the play bucket survives reset");
+        assert!(
+            bucket.tokens < f64::from(SOUND_PLAY_BURST),
+            "reset did not refill the bucket to a fresh burst (tokens = {})",
+            bucket.tokens
+        );
         assert_eq!(state.voices.len(), 1, "in-flight one-shots finish");
         assert!(!state.unlocked, "reset never re-locks or unlocks audio");
     }
