@@ -128,6 +128,7 @@ impl Plugin for RattyAiPlugin {
                     .after(apply_ai_commands)
                     .after(apply_ai_object_commands)
                     .after(crate::effects::apply_ai_effect_commands)
+                    .after(crate::viz::apply_viz_commands)
                     .after(crate::sound::apply_sound_commands),
             );
     }
@@ -217,6 +218,12 @@ pub fn apply_ai_commands(
             | RattyAiCommand::ClearObjects
             | RattyAiCommand::UpdateObject { .. }
             | RattyAiCommand::UpdateCursor { .. } => {}
+            // Data visualizations are handled by crate::viz::apply_viz_commands,
+            // which reads the same AiCommand messages independently and owns
+            // their acks.
+            RattyAiCommand::VizSet { .. }
+            | RattyAiCommand::VizEffect { .. }
+            | RattyAiCommand::VizRemove { .. } => {}
             // The sound organ (crate::sound::apply_sound_commands) reads the
             // same AiCommand messages independently and owns the sound.*
             // acks — in every build: feature-off it rejects `unsupported`
@@ -604,6 +611,7 @@ mod tests {
         app.init_resource::<CursorSettings>();
         app.init_resource::<crate::terminal::TerminalRedrawState>();
         app.init_resource::<crate::query_channel::AiDiagnostics>();
+        app.init_resource::<crate::viz::VizRegistry>();
         app.init_resource::<RemovedLog>();
         app.add_message::<AiCommand>();
         app.add_message::<AiObjectRemoved>();

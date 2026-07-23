@@ -90,11 +90,13 @@ pub mod codes {
     pub const BAD_ASSET: &str = "bad-asset";
     /// The mode string is not a known presentation mode.
     pub const BAD_MODE: &str = "bad-mode";
-    /// The kind is not a registered semantic kind for the requested op.
-    /// NOTE: the M3.5 viz lane appends an identical `bad-kind` constant —
-    /// keep the name and value byte-identical so the branches merge
-    /// trivially.
+    /// The viz payload kind is not a registered, versioned kind. An
+    /// unknown schema version is the same case: the version is part of
+    /// the kind name (`ps.v1`).
     pub const BAD_KIND: &str = "bad-kind";
+    /// A live visualization under the id has a different kind and
+    /// `replace=true` was not set.
+    pub const KIND_MISMATCH: &str = "kind-mismatch";
     /// A one-shot was requested while audio is locked (browser autoplay
     /// policy, pre-gesture); the sound did not and will not play.
     pub const AUDIO_LOCKED: &str = "audio-locked";

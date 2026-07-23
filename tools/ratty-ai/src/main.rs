@@ -213,63 +213,130 @@ enum Commands {
         #[arg(short, long, default_value = "1.0")]
         scale: f32,
     },
-    /// Visualize running processes.
+    /// Collect a process snapshot and publish it as a `ps.v1` viz.
+    ///
+    /// Gathers locally via sysinfo under the invoking user's own
+    /// permissions, keeps the top N processes by CPU, and lowers the
+    /// snapshot onto `viz.set` — the terminal only renders what it is
+    /// handed. Bare invocations upsert the stable ps slot; `--watch`
+    /// republishes fresh snapshots under the same id.
     Ps {
-        /// Draw the visualization.
-        #[arg(short, long)]
-        visualize: bool,
-        /// PID to highlight.
+        /// Visualization id (decimal, AI-owned range). Defaults to the
+        /// stable ps slot 2147483904 (0x8000_0100).
         #[arg(long)]
-        highlight: Option<u32>,
-        /// Highlight color.
-        #[arg(long)]
-        color: Option<String>,
+        id: Option<u32>,
+        /// Keep the top N processes by CPU.
+        #[arg(long, default_value_t = 32,
+              value_parser = clap::value_parser!(u64).range(1..=MAX_COLLECTOR_TOP))]
+        top: u64,
+        /// Republish a fresh snapshot every N seconds (min 1) under the
+        /// same id until interrupted. Only the first snapshot places the
+        /// anchor — refreshes never move the view.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        watch: Option<u64>,
+        #[command(flatten)]
+        anchor: AnchorArgs,
     },
-    /// Kill a process with a visual effect.
-    Kill {
-        /// PID.
-        pid: u32,
-        /// Effect (`explode`/`shrink`/`dissolve`).
-        #[arg(short, long, default_value = "explode")]
-        effect: String,
-    },
-    /// Enter a directory as a 3D space.
-    Cd {
-        /// Target path.
-        path: String,
-        /// Draw the visualization.
-        #[arg(short, long)]
-        visualize: bool,
-    },
-    /// List a directory as floating icons.
-    Ls {
-        /// Target path.
-        #[arg(short, long, default_value = ".")]
-        path: String,
-        /// Draw the visualization.
-        #[arg(short, long)]
-        visualize: bool,
-    },
-    /// Render a directory tree as branching 3D structure.
-    Tree {
-        /// Recursion depth.
-        #[arg(short, long, default_value = "3")]
+    /// Collect a bounded filesystem walk and publish it as an `fs.v1` viz.
+    ///
+    /// Walks breadth-first under the invoking user's own permissions:
+    /// never follows symlinks, skips unreadable directories (counted in
+    /// the capture provenance), and stops at a hard entry cap. Keeps the
+    /// top N entries by size.
+    Fs {
+        /// Root path to walk.
+        #[arg(default_value = ".")]
+        path: std::path::PathBuf,
+        /// Maximum depth below the root (direct children are depth 1).
+        #[arg(long, default_value_t = 3,
+              value_parser = clap::value_parser!(u8).range(1..))]
         depth: u8,
-        /// Draw the visualization.
-        #[arg(short, long)]
-        visualize: bool,
-    },
-    /// Git visualizations.
-    #[command(subcommand)]
-    Git(GitAction),
-    /// Visualize network connections.
-    Net {
-        /// Draw the visualization.
-        #[arg(short, long)]
-        visualize: bool,
-        /// Specific host.
+        /// Keep the top N entries by size.
+        #[arg(long, default_value_t = 64,
+              value_parser = clap::value_parser!(u64).range(1..=MAX_COLLECTOR_TOP))]
+        top: u64,
+        /// Visualization id (decimal, AI-owned range). Defaults to the
+        /// stable fs slot 2147483905 (0x8000_0101).
         #[arg(long)]
-        host: Option<String>,
+        id: Option<u32>,
+        /// Republish a fresh snapshot every N seconds (min 1) under the
+        /// same id until interrupted.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        watch: Option<u64>,
+        #[command(flatten)]
+        anchor: AnchorArgs,
+    },
+    /// Collect a repository snapshot and publish it as a `git.v1` viz.
+    ///
+    /// Shells out to `git` (branch list, porcelain status counts,
+    /// ahead/behind from rev-list) under the invoking user's own
+    /// permissions. A missing repo or git binary exits 2.
+    Git {
+        /// Repository path.
+        #[arg(long, default_value = ".")]
+        repo: std::path::PathBuf,
+        /// Visualization id (decimal, AI-owned range). Defaults to the
+        /// stable git slot 2147483906 (0x8000_0102).
+        #[arg(long)]
+        id: Option<u32>,
+        /// Republish a fresh snapshot every N seconds (min 1) under the
+        /// same id until interrupted.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        watch: Option<u64>,
+        #[command(flatten)]
+        anchor: AnchorArgs,
+    },
+    /// Collect interface counters and publish them as a `net.v1` viz.
+    ///
+    /// Interface byte counters via sysinfo (interfaces, not sockets — an
+    /// honest portable v1), link state from IFF_UP on Unix. Keeps the top
+    /// N interfaces by total traffic.
+    Net {
+        /// Visualization id (decimal, AI-owned range). Defaults to the
+        /// stable net slot 2147483907 (0x8000_0103).
+        #[arg(long)]
+        id: Option<u32>,
+        /// Keep the top N interfaces by total traffic.
+        #[arg(long, default_value_t = 64,
+              value_parser = clap::value_parser!(u64).range(1..=MAX_COLLECTOR_TOP))]
+        top: u64,
+        /// Republish a fresh snapshot every N seconds (min 1) under the
+        /// same id until interrupted.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        watch: Option<u64>,
+        #[command(flatten)]
+        anchor: AnchorArgs,
+    },
+    /// Signal a process, watch the outcome, and report it honestly as a
+    /// `viz.effect` on the ps visualization.
+    ///
+    /// Identity is pinned to (pid, start time) before signaling and
+    /// re-verified afterwards, so PID reuse can never claim a death that
+    /// did not happen; the wire only ever carries the *observed* outcome
+    /// as the effect name (`died`, `survived`, `denied`, `missing`,
+    /// `timeout`) — there is no `kill` verb on the wire. SIGTERM by
+    /// default; `--sigkill` opts into SIGKILL. No confirmation prompt:
+    /// the invoking user already holds /bin/kill authority.
+    ///
+    /// Exit codes: 0 the signal was delivered and the exit was observed
+    /// (died — a reused pid counts, the original is gone) · 10 the
+    /// process survived SIGTERM · 11 permission denied · 12 no such
+    /// process · 13 outcome unobserved within the timeout. `--dry-run`
+    /// signals nothing and prints the sequence a confirmed death would
+    /// emit.
+    Kill {
+        /// PID to signal.
+        pid: u32,
+        /// Send SIGKILL instead of the default SIGTERM.
+        #[arg(long)]
+        sigkill: bool,
+        /// How long to watch for the outcome, in milliseconds.
+        #[arg(long, default_value_t = 5000)]
+        timeout_ms: u64,
+        /// Visualization id whose keyed child receives the effect.
+        /// Defaults to the stable ps slot 2147483904 (0x8000_0100).
+        #[arg(long)]
+        id: Option<u32>,
     },
     /// Show the AI is thinking.
     Think {
@@ -445,32 +512,25 @@ enum ObjectAction {
     },
 }
 
-#[derive(Subcommand)]
-enum GitAction {
-    /// Branches as 3D rivers.
-    Branch {
-        /// Draw the visualization.
-        #[arg(short, long)]
-        visualize: bool,
-    },
-    /// Diff as before/after.
-    Diff {
-        /// Draw the visualization.
-        #[arg(short, long)]
-        visualize: bool,
-    },
-    /// Merge visualization.
-    Merge {
-        /// Draw the visualization.
-        #[arg(short, long)]
-        visualize: bool,
-    },
-    /// Stash as a compressed cube.
-    Stash {
-        /// Draw the visualization.
-        #[arg(short, long)]
-        visualize: bool,
-    },
+/// Anchor placement shared by the collector subcommands. `x`/`y` place the
+/// visualization's *top-left* cell (unlike `object.add`'s centered anchor)
+/// and must arrive together; a brand-new visualization without them stays
+/// hidden until placed. Only the first snapshot of a `--watch` loop sends
+/// the anchor — refreshes omit it so a scrolled view is never snapped back.
+#[derive(clap::Args)]
+struct AnchorArgs {
+    /// Anchor column of the top-left cell (place with --y).
+    #[arg(short, long, requires = "y")]
+    x: Option<u16>,
+    /// Anchor row of the top-left cell (place with --x).
+    #[arg(short, long, requires = "x")]
+    y: Option<u16>,
+    /// Footprint width in cells (needs an anchor placed or already live).
+    #[arg(long)]
+    cols: Option<u16>,
+    /// Footprint height in cells (needs an anchor placed or already live).
+    #[arg(long)]
+    rows: Option<u16>,
 }
 
 #[derive(Subcommand)]
@@ -757,62 +817,13 @@ fn command_to_osc(command: &Commands, stdin: &str) -> (String, String) {
                 .field("input", stdin)
                 .build(),
         ),
-        Commands::Ps {
-            visualize,
-            highlight,
-            color,
-        } => (
-            "ps".into(),
-            p().field("visualize", visualize)
-                .opt("highlight", *highlight)
-                .opt("color", color.as_ref())
-                .build(),
-        ),
-        Commands::Kill { pid, effect } => (
-            "kill".into(),
-            p().field("pid", pid).field("effect", effect).build(),
-        ),
-        Commands::Cd { path, visualize } => (
-            "cd".into(),
-            p().field("path", path)
-                .field("visualize", visualize)
-                .build(),
-        ),
-        Commands::Ls { path, visualize } => (
-            "ls".into(),
-            p().field("path", path)
-                .field("visualize", visualize)
-                .build(),
-        ),
-        Commands::Tree { depth, visualize } => (
-            "tree".into(),
-            p().field("depth", depth)
-                .field("visualize", visualize)
-                .build(),
-        ),
-        Commands::Git(action) => match action {
-            GitAction::Branch { visualize } => (
-                "git.branch".into(),
-                p().field("visualize", visualize).build(),
-            ),
-            GitAction::Diff { visualize } => {
-                ("git.diff".into(), p().field("visualize", visualize).build())
-            }
-            GitAction::Merge { visualize } => (
-                "git.merge".into(),
-                p().field("visualize", visualize).build(),
-            ),
-            GitAction::Stash { visualize } => (
-                "git.stash".into(),
-                p().field("visualize", visualize).build(),
-            ),
-        },
-        Commands::Net { visualize, host } => (
-            "net".into(),
-            p().field("visualize", visualize)
-                .opt("host", host.as_ref())
-                .build(),
-        ),
+        Commands::Ps { .. }
+        | Commands::Fs { .. }
+        | Commands::Git { .. }
+        | Commands::Net { .. }
+        | Commands::Kill { .. } => {
+            unreachable!("collectors gather locally and are handled before command_to_osc")
+        }
         Commands::Think { start, end } => {
             let state = if *start {
                 "start"
@@ -968,6 +979,965 @@ fn reads_stdin(command: &Commands) -> bool {
     )
 }
 
+// ── Collectors ──
+//
+// The `ps`/`fs`/`git`/`net` subcommands and the `kill` watcher gather
+// locally, under the invoking user's own permissions, then lower the
+// result onto the `viz.*` wire — the terminal never executes, reads, or
+// enumerates anything in response to the bytes. Snapshots are normalized
+// and bounded here so a worst-case payload provably encodes under the
+// shared wire limit (`osc::MAX_VIZ_PAYLOAD_BYTES`, pinned by tests), and
+// every snapshot carries capture provenance: ratty never implies liveness
+// it was not given.
+
+/// Default `ps` viz id: a fixed, documented slot in the AI id partition's
+/// namespace 0, so bare invocations upsert one stable visualization
+/// instead of scattering new ids. `--id` overrides.
+const DEFAULT_PS_VIZ_ID: u32 = 0x8000_0100;
+/// Default `fs` viz id (see [`DEFAULT_PS_VIZ_ID`]).
+const DEFAULT_FS_VIZ_ID: u32 = 0x8000_0101;
+/// Default `git` viz id (see [`DEFAULT_PS_VIZ_ID`]).
+const DEFAULT_GIT_VIZ_ID: u32 = 0x8000_0102;
+/// Default `net` viz id (see [`DEFAULT_PS_VIZ_ID`]).
+const DEFAULT_NET_VIZ_ID: u32 = 0x8000_0103;
+
+/// Hard cap on every collector's `--top`: with worst-case labels (128
+/// bytes of `"` escaping to 256 in JSON) a snapshot of this many items
+/// stays under `osc::MAX_VIZ_PAYLOAD_BYTES` for every kind — pinned by
+/// `worst_case_snapshots_fit_the_wire_budget`.
+const MAX_COLLECTOR_TOP: u64 = 64;
+
+/// Byte cap on normalized scheduler-state strings — a small fixed
+/// vocabulary, bounded tighter than free-form labels so the worst-case
+/// payload math stays comfortable.
+const MAX_STATE_BYTES: usize = 32;
+
+/// Hard cap on directory entries recorded by the `fs` walk before top-N
+/// selection: bounds memory and wall time on huge trees. Hitting it is
+/// declared in the capture provenance.
+const MAX_FS_WALK_ENTRIES: usize = 4096;
+
+/// Poll cadence while `kill` watches for the outcome.
+#[cfg(unix)]
+const KILL_POLL: Duration = Duration::from_millis(100);
+
+/// Replaces control characters (never legitimate in a label, potentially
+/// hostile in terminal-bound data), returning the cleaned-but-unbounded
+/// string.
+fn clean_control(value: &str) -> String {
+    value
+        .chars()
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect()
+}
+
+/// Bytes reserved for the disambiguating suffix on a truncated label:
+/// `#` plus eight hex digits of an FNV-1a hash of the full cleaned value.
+const LABEL_HASH_SUFFIX_BYTES: usize = 9;
+
+/// Whether [`clean_label`] would truncate (and thus hash-disambiguate)
+/// this value — i.e. its control-cleaned byte length exceeds the wire
+/// label bound. Used to declare path truncation in `fs` provenance.
+fn label_would_truncate(value: &str) -> bool {
+    clean_control(value).len() > osc::MAX_VIZ_LABEL_BYTES
+}
+
+/// Replaces control characters and bounds the result to `max` bytes on a
+/// char boundary. Plain truncation would collapse two distinct values
+/// that share a `max`-byte prefix into one string — and paths, branch
+/// names, and interface names are *domain keys*, so a collision makes the
+/// renderer first-wins-drop one item while the payload still counts both,
+/// and a `viz.effect` on the shared key is ambiguous. When truncation is
+/// needed, reserve [`LABEL_HASH_SUFFIX_BYTES`] for a stable hash of the
+/// full cleaned value so truncated keys stay unique and stable across
+/// refreshes.
+fn clean_label_to(value: &str, max: usize) -> String {
+    let cleaned = clean_control(value);
+    if cleaned.len() <= max {
+        return cleaned;
+    }
+    let suffix = format!("#{:08x}", fnv1a32(cleaned.as_bytes()));
+    debug_assert_eq!(suffix.len(), LABEL_HASH_SUFFIX_BYTES);
+    // Leave room for the suffix (max is always far larger than it here).
+    let budget = max.saturating_sub(suffix.len());
+    let mut end = budget.min(cleaned.len());
+    while end > 0 && !cleaned.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut disambiguated = cleaned[..end].to_string();
+    disambiguated.push_str(&suffix);
+    disambiguated
+}
+
+/// FNV-1a (32-bit), std-only, fully deterministic: a truncated label's
+/// suffix is stable across snapshot refreshes so a domain key does not
+/// churn between watches.
+fn fnv1a32(bytes: &[u8]) -> u32 {
+    let mut hash = 0x811c_9dc5_u32;
+    for &byte in bytes {
+        hash ^= u32::from(byte);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    hash
+}
+
+/// [`clean_label_to`] at the shared wire label bound.
+fn clean_label(value: &str) -> String {
+    clean_label_to(value, osc::MAX_VIZ_LABEL_BYTES)
+}
+
+/// Current UTC time in RFC 3339 (`2026-07-22T12:34:56Z`), std-only. A
+/// pre-epoch clock honestly reports the epoch rather than panicking.
+fn rfc3339_utc_now() -> String {
+    let seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0);
+    rfc3339_utc(seconds)
+}
+
+/// Formats Unix seconds as RFC 3339 UTC (no chrono: the days-to-civil
+/// conversion below is exact).
+fn rfc3339_utc(unix_seconds: u64) -> String {
+    let (year, month, day) = civil_from_days((unix_seconds / 86_400) as i64);
+    let rem = unix_seconds % 86_400;
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        rem / 3600,
+        (rem % 3600) / 60,
+        rem % 60
+    )
+}
+
+/// Converts days since 1970-01-01 to a (year, month, day) civil date —
+/// Howard Hinnant's days-to-civil algorithm.
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let month = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
+    (if month <= 2 { year + 1 } else { year }, month, day)
+}
+
+/// The `capture` provenance object every snapshot carries: a cleaned,
+/// bounded source description plus an RFC 3339 timestamp.
+fn capture_json(source: &str) -> serde_json::Value {
+    serde_json::json!({ "source": clean_label(source), "ts": rfc3339_utc_now() })
+}
+
+/// Builds a `viz.set` payload. `anchor` is only supplied for the first
+/// emission of a watch loop: an upsert without `x`/`y` keeps the live
+/// anchor, so refreshes never move (or un-scroll) the view.
+fn viz_set_wire(id: u32, kind: &str, data: &str, anchor: Option<&AnchorArgs>) -> String {
+    let mut payload = Payload::default()
+        .field("id", id)
+        .field("kind", kind)
+        .field("data", data);
+    if let Some(anchor) = anchor {
+        payload = payload
+            .opt("x", anchor.x)
+            .opt("y", anchor.y)
+            .opt("cols", anchor.cols)
+            .opt("rows", anchor.rows);
+    }
+    payload.build()
+}
+
+/// Builds a `viz.effect` payload targeting a stable domain key.
+fn viz_effect_wire(id: u32, key: &str, effect: &str) -> String {
+    Payload::default()
+        .field("id", id)
+        .field("key", key)
+        .field("effect", effect)
+        .build()
+}
+
+/// Dispatches the four snapshot collectors: build the gatherer for the
+/// subcommand, then run the shared emit-and-watch loop.
+fn run_collector(cli: &Cli) -> ExitCode {
+    match &cli.command {
+        Commands::Ps {
+            id,
+            top,
+            watch,
+            anchor,
+        } => {
+            let mut sys = sysinfo::System::new();
+            let mut warmed = false;
+            let top = *top as usize;
+            emit_snapshots(
+                cli,
+                id.unwrap_or(DEFAULT_PS_VIZ_ID),
+                "ps.v1",
+                *watch,
+                anchor,
+                move || Ok(gather_ps(&mut sys, &mut warmed, top)),
+            )
+        }
+        Commands::Fs {
+            path,
+            depth,
+            top,
+            id,
+            watch,
+            anchor,
+        } => {
+            let path = path.clone();
+            let (depth, top) = (*depth, *top as usize);
+            emit_snapshots(
+                cli,
+                id.unwrap_or(DEFAULT_FS_VIZ_ID),
+                "fs.v1",
+                *watch,
+                anchor,
+                move || gather_fs(&path, depth, top),
+            )
+        }
+        Commands::Git {
+            repo,
+            id,
+            watch,
+            anchor,
+        } => {
+            let repo = repo.clone();
+            emit_snapshots(
+                cli,
+                id.unwrap_or(DEFAULT_GIT_VIZ_ID),
+                "git.v1",
+                *watch,
+                anchor,
+                move || gather_git(&repo),
+            )
+        }
+        Commands::Net {
+            id,
+            top,
+            watch,
+            anchor,
+        } => {
+            let mut networks = sysinfo::Networks::new();
+            let top = *top as usize;
+            emit_snapshots(
+                cli,
+                id.unwrap_or(DEFAULT_NET_VIZ_ID),
+                "net.v1",
+                *watch,
+                anchor,
+                move || Ok(gather_net(&mut networks, top)),
+            )
+        }
+        _ => unreachable!("run_collector only handles the collector subcommands"),
+    }
+}
+
+/// The shared collector loop: gather → bound-check → encode → `viz.set`,
+/// then optionally sleep and repeat under `--watch` (Ctrl-C exits; the
+/// tty is only ever raw inside an `--ack` roundtrip, which restores it).
+/// Gather failures report through [`emit_failure`] and exit 2; wire
+/// failures carry their own exit codes.
+fn emit_snapshots(
+    cli: &Cli,
+    id: u32,
+    kind: &str,
+    watch: Option<u64>,
+    anchor: &AnchorArgs,
+    mut gather: impl FnMut() -> Result<serde_json::Value, String>,
+) -> ExitCode {
+    let mut first = true;
+    loop {
+        let snapshot = match gather() {
+            Ok(snapshot) => snapshot,
+            Err(message) => {
+                emit_failure(cli.json, "bad-input", &message);
+                return exit_codes::bad_input();
+            }
+        };
+        let bytes = match serde_json::to_vec(&snapshot) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                emit_failure(
+                    cli.json,
+                    "bad-input",
+                    &format!("could not encode the snapshot: {error}"),
+                );
+                return exit_codes::bad_input();
+            }
+        };
+        if bytes.len() > osc::MAX_VIZ_PAYLOAD_BYTES {
+            // Unreachable while the --top caps hold (pinned by tests); an
+            // honest failure beats a silently truncated wire.
+            emit_failure(
+                cli.json,
+                "too-large",
+                &format!(
+                    "snapshot is {} bytes; the wire caps decoded payloads at {}",
+                    bytes.len(),
+                    osc::MAX_VIZ_PAYLOAD_BYTES
+                ),
+            );
+            return exit_codes::bad_input();
+        }
+        let data = query::b64url_encode(&bytes);
+        let payload = viz_set_wire(id, kind, &data, first.then_some(anchor));
+        if let Err(exit) = emit_command(cli, "viz.set", payload) {
+            return exit;
+        }
+        first = false;
+        match watch {
+            None => return exit_codes::OK,
+            Some(seconds) => std::thread::sleep(Duration::from_secs(seconds)),
+        }
+    }
+}
+
+/// One raw process sample before normalization.
+struct PsSample {
+    pid: u32,
+    name: String,
+    cpu: f32,
+    mem: u64,
+    state: String,
+}
+
+/// Gathers a process snapshot via sysinfo. The first call warms the CPU
+/// counters (two refreshes separated by sysinfo's minimum interval);
+/// watch refreshes measure usage since the previous tick.
+fn gather_ps(sys: &mut sysinfo::System, warmed: &mut bool, top: usize) -> serde_json::Value {
+    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate};
+    let refresh = ProcessRefreshKind::nothing().with_cpu().with_memory();
+    sys.refresh_processes_specifics(ProcessesToUpdate::All, true, refresh);
+    if !*warmed {
+        std::thread::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
+        sys.refresh_processes_specifics(ProcessesToUpdate::All, true, refresh);
+        *warmed = true;
+    }
+    let samples = sys
+        .processes()
+        .values()
+        .map(|process| PsSample {
+            pid: process.pid().as_u32(),
+            name: process.name().to_string_lossy().into_owned(),
+            cpu: process.cpu_usage(),
+            mem: process.memory(),
+            state: process.status().to_string().to_lowercase(),
+        })
+        .collect();
+    ps_snapshot(samples, top)
+}
+
+/// Normalizes raw samples into the `ps.v1` snapshot: top N by CPU (ties:
+/// memory, then pid, for determinism), labels cleaned and bounded,
+/// truncation declared in the capture provenance.
+fn ps_snapshot(mut samples: Vec<PsSample>, top: usize) -> serde_json::Value {
+    let total = samples.len();
+    samples.sort_by(|a, b| {
+        b.cpu
+            .total_cmp(&a.cpu)
+            .then_with(|| b.mem.cmp(&a.mem))
+            .then_with(|| a.pid.cmp(&b.pid))
+    });
+    samples.truncate(top);
+    let mut source = format!("ratty-ai ps/sysinfo {}", std::env::consts::OS);
+    if total > samples.len() {
+        source.push_str(&format!("; top {} of {total} by cpu", samples.len()));
+    }
+    let items: Vec<serde_json::Value> = samples
+        .iter()
+        .map(|sample| {
+            serde_json::json!({
+                "pid": sample.pid,
+                "name": clean_label(&sample.name),
+                "cpu": round_tenth(sample.cpu),
+                "mem": sample.mem,
+                "state": clean_label_to(&sample.state, MAX_STATE_BYTES),
+            })
+        })
+        .collect();
+    serde_json::json!({ "capture": capture_json(&source), "items": items })
+}
+
+/// Rounds a CPU percentage to one decimal for a stable, compact wire form
+/// (a raw f32→f64 conversion prints artifacts like `0.10000000149`).
+/// Non-finite garbage maps to 0 — JSON has no NaN and the terminal would
+/// reject the resulting `null`.
+fn round_tenth(value: f32) -> f64 {
+    if !value.is_finite() {
+        return 0.0;
+    }
+    (f64::from(value) * 10.0).round() / 10.0
+}
+
+/// One filesystem walk entry before normalization.
+struct FsSample {
+    path: String,
+    dir: bool,
+    size: u64,
+    depth: u8,
+}
+
+/// The raw result of a bounded walk.
+#[derive(Default)]
+struct FsWalk {
+    entries: Vec<FsSample>,
+    skipped: usize,
+    capped: bool,
+}
+
+/// Bounded breadth-first walk: depth-limited, entry-capped, never follows
+/// symlinks (they are recorded as plain entries, never traversed), and
+/// unreadable directories are skipped but counted. Breadth-first so the
+/// entry cap favors shallow coverage over one deep subtree.
+fn walk_fs(root: &std::path::Path, max_depth: u8) -> Result<FsWalk, String> {
+    use std::collections::VecDeque;
+    let mut walk = FsWalk::default();
+    if !root.is_dir() {
+        return Err(format!("{} is not a readable directory", root.display()));
+    }
+    let mut queue = VecDeque::from([(root.to_path_buf(), 0_u8)]);
+    while let Some((dir, depth)) = queue.pop_front() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(_) => {
+                walk.skipped += 1;
+                continue;
+            }
+        };
+        for entry in entries {
+            let Ok(entry) = entry else {
+                walk.skipped += 1;
+                continue;
+            };
+            if walk.entries.len() >= MAX_FS_WALK_ENTRIES {
+                walk.capped = true;
+                return Ok(walk);
+            }
+            let Ok(file_type) = entry.file_type() else {
+                walk.skipped += 1;
+                continue;
+            };
+            let child_depth = depth.saturating_add(1);
+            let path = entry.path();
+            let rel = path
+                .strip_prefix(root)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .into_owned();
+            if file_type.is_dir() {
+                walk.entries.push(FsSample {
+                    path: rel,
+                    dir: true,
+                    size: 0,
+                    depth: child_depth,
+                });
+                if child_depth < max_depth {
+                    queue.push_back((path, child_depth));
+                }
+            } else {
+                // Files and symlinks (DirEntry::metadata never traverses a
+                // symlink); an unreadable size records honestly as 0.
+                let size = entry.metadata().map(|meta| meta.len()).unwrap_or(0);
+                walk.entries.push(FsSample {
+                    path: rel,
+                    dir: false,
+                    size,
+                    depth: child_depth,
+                });
+            }
+        }
+    }
+    Ok(walk)
+}
+
+/// Gathers an `fs.v1` snapshot from a bounded walk.
+fn gather_fs(
+    root: &std::path::Path,
+    max_depth: u8,
+    top: usize,
+) -> Result<serde_json::Value, String> {
+    let walk = walk_fs(root, max_depth)?;
+    Ok(fs_snapshot(&root.display().to_string(), walk, top))
+}
+
+/// Normalizes walk results into the `fs.v1` snapshot: top N by size
+/// (ties: path, for determinism); truncation, skips, and the walk cap are
+/// declared in the capture provenance.
+fn fs_snapshot(root: &str, mut walk: FsWalk, top: usize) -> serde_json::Value {
+    let total = walk.entries.len();
+    walk.entries
+        .sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.path.cmp(&b.path)));
+    walk.entries.truncate(top);
+    let mut source = String::from("ratty-ai fs/walk");
+    if total > walk.entries.len() {
+        source.push_str(&format!("; top {} of {total} by size", walk.entries.len()));
+    }
+    if walk.skipped > 0 {
+        source.push_str(&format!("; {} unreadable skipped", walk.skipped));
+    }
+    if walk.capped {
+        source.push_str(&format!("; walk capped at {MAX_FS_WALK_ENTRIES}"));
+    }
+    // Over-long paths are truncated to a hash-disambiguated key
+    // ([`clean_label_to`]); declare how many so the provenance never
+    // implies the keys are verbatim paths.
+    let truncated = walk
+        .entries
+        .iter()
+        .filter(|entry| label_would_truncate(&entry.path))
+        .count();
+    if truncated > 0 {
+        source.push_str(&format!("; {truncated} paths truncated"));
+    }
+    let items: Vec<serde_json::Value> = walk
+        .entries
+        .iter()
+        .map(|entry| {
+            serde_json::json!({
+                "path": clean_label(&entry.path),
+                "kind": if entry.dir { "dir" } else { "file" },
+                "size": entry.size,
+                "depth": entry.depth,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "capture": capture_json(&source),
+        "root": clean_label(root),
+        "items": items,
+    })
+}
+
+/// Runs one git subcommand in `repo`, returning stdout or a message
+/// suitable for [`emit_failure`].
+fn git_output(repo: &std::path::Path, args: &[&str]) -> Result<String, String> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()
+        .map_err(|error| format!("could not run git: {error}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "git {} failed: {}",
+            args.first().copied().unwrap_or("?"),
+            stderr.trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Parses `git branch --format=%(HEAD)%(refname:short)` output into
+/// (name, current) pairs — `%(HEAD)` renders `*` on the checked-out
+/// branch and a space elsewhere.
+fn parse_git_branches(text: &str) -> Vec<(String, bool)> {
+    text.lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            let current = line.starts_with('*');
+            let name = line.trim_start_matches(['*', ' ']).to_string();
+            (name, current)
+        })
+        .filter(|(name, _)| !name.is_empty())
+        .collect()
+}
+
+/// Working-tree counts parsed from `git status --porcelain`.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct GitCounts {
+    staged: u32,
+    unstaged: u32,
+    untracked: u32,
+}
+
+/// Parses porcelain-v1 status lines: `??` is untracked; otherwise a
+/// non-space index column counts staged and a non-space worktree column
+/// counts unstaged (one line can count both).
+fn parse_git_porcelain(text: &str) -> GitCounts {
+    let mut counts = GitCounts::default();
+    for line in text.lines() {
+        let bytes = line.as_bytes();
+        if bytes.len() < 2 {
+            continue;
+        }
+        if &bytes[..2] == b"??" {
+            counts.untracked += 1;
+            continue;
+        }
+        if bytes[0] != b' ' {
+            counts.staged += 1;
+        }
+        if bytes[1] != b' ' {
+            counts.unstaged += 1;
+        }
+    }
+    counts
+}
+
+/// Parses `git rev-list --left-right --count @{upstream}...HEAD` output:
+/// left = commits only upstream (behind), right = commits only local
+/// (ahead). Returns `(ahead, behind)`.
+fn parse_ahead_behind(text: &str) -> (u32, u32) {
+    let mut numbers = text.split_whitespace();
+    let behind = numbers.next().and_then(|n| n.parse().ok()).unwrap_or(0);
+    let ahead = numbers.next().and_then(|n| n.parse().ok()).unwrap_or(0);
+    (ahead, behind)
+}
+
+/// Gathers a `git.v1` snapshot by shelling out to `git` under the
+/// invoking user's permissions. Not-a-repo (or a missing git binary) is
+/// an error; a missing upstream honestly reports ahead/behind as 0.
+fn gather_git(repo: &std::path::Path) -> Result<serde_json::Value, String> {
+    git_output(repo, &["rev-parse", "--is-inside-work-tree"])?;
+    let branches = parse_git_branches(&git_output(
+        repo,
+        &["branch", "--list", "--format=%(HEAD)%(refname:short)"],
+    )?);
+    let counts = parse_git_porcelain(&git_output(repo, &["status", "--porcelain"])?);
+    // No upstream is a normal state, not an error.
+    let (ahead, behind) = git_output(
+        repo,
+        &["rev-list", "--left-right", "--count", "@{upstream}...HEAD"],
+    )
+    .map(|text| parse_ahead_behind(&text))
+    .unwrap_or((0, 0));
+    Ok(git_snapshot(
+        &repo.display().to_string(),
+        branches,
+        counts,
+        ahead,
+        behind,
+    ))
+}
+
+/// Normalizes into the `git.v1` snapshot: the current branch first, then
+/// alphabetical, bounded to the collector cap (declared when it bites).
+fn git_snapshot(
+    repo: &str,
+    mut branches: Vec<(String, bool)>,
+    counts: GitCounts,
+    ahead: u32,
+    behind: u32,
+) -> serde_json::Value {
+    let total = branches.len();
+    branches.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    branches.truncate(MAX_COLLECTOR_TOP as usize);
+    let mut source = String::from("ratty-ai git/git");
+    if total > branches.len() {
+        source.push_str(&format!("; top {} of {total} branches", branches.len()));
+    }
+    let branches: Vec<serde_json::Value> = branches
+        .iter()
+        .map(|(name, current)| serde_json::json!({ "name": clean_label(name), "current": current }))
+        .collect();
+    serde_json::json!({
+        "capture": capture_json(&source),
+        "repo": clean_label(repo),
+        "branches": branches,
+        "status": {
+            "staged": counts.staged,
+            "unstaged": counts.unstaged,
+            "untracked": counts.untracked,
+        },
+        "ahead": ahead,
+        "behind": behind,
+    })
+}
+
+/// One interface sample before normalization.
+struct NetSample {
+    iface: String,
+    rx: u64,
+    tx: u64,
+    up: bool,
+}
+
+/// Gathers a `net.v1` snapshot: interface byte counters from sysinfo,
+/// link state from IFF_UP via getifaddrs on Unix (address presence
+/// elsewhere — the heuristic is declared in the capture provenance).
+fn gather_net(networks: &mut sysinfo::Networks, top: usize) -> serde_json::Value {
+    networks.refresh(true);
+    #[cfg(unix)]
+    let up_map = unix_iff_up_map();
+    let samples: Vec<NetSample> = networks
+        .iter()
+        .map(|(name, data)| {
+            #[cfg(unix)]
+            let up = up_map.get(name.as_str()).copied().unwrap_or(false);
+            #[cfg(not(unix))]
+            let up = !data.ip_networks().is_empty();
+            NetSample {
+                iface: name.clone(),
+                rx: data.total_received(),
+                tx: data.total_transmitted(),
+                up,
+            }
+        })
+        .collect();
+    net_snapshot(samples, top)
+}
+
+/// Link state per interface from `getifaddrs`: an interface is up when
+/// any of its address entries carries IFF_UP. Interfaces sysinfo lists
+/// but getifaddrs does not are reported down — never guessed up.
+#[cfg(unix)]
+fn unix_iff_up_map() -> std::collections::HashMap<String, bool> {
+    let mut map = std::collections::HashMap::new();
+    let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: getifaddrs allocates a list we walk read-only and free
+    // exactly once below; a non-zero return means nothing was allocated.
+    if unsafe { libc::getifaddrs(&mut ifap) } != 0 {
+        return map;
+    }
+    let mut cursor = ifap;
+    while !cursor.is_null() {
+        // SAFETY: cursor is a valid node of the list getifaddrs returned.
+        let entry = unsafe { &*cursor };
+        if !entry.ifa_name.is_null() {
+            // SAFETY: ifa_name is a NUL-terminated C string per contract.
+            let name = unsafe { std::ffi::CStr::from_ptr(entry.ifa_name) }
+                .to_string_lossy()
+                .into_owned();
+            let up = entry.ifa_flags & (libc::IFF_UP as libc::c_uint) != 0;
+            let slot = map.entry(name).or_insert(false);
+            *slot = *slot || up;
+        }
+        cursor = entry.ifa_next;
+    }
+    // SAFETY: ifap came from a successful getifaddrs and is freed once.
+    unsafe { libc::freeifaddrs(ifap) };
+    map
+}
+
+/// Normalizes into the `net.v1` snapshot: top N by total traffic (ties:
+/// name), truncation and the link-state source declared in the capture
+/// provenance.
+fn net_snapshot(mut samples: Vec<NetSample>, top: usize) -> serde_json::Value {
+    let total = samples.len();
+    samples.sort_by(|a, b| {
+        let (a_total, b_total) = (a.rx.saturating_add(a.tx), b.rx.saturating_add(b.tx));
+        b_total.cmp(&a_total).then_with(|| a.iface.cmp(&b.iface))
+    });
+    samples.truncate(top);
+    let link = if cfg!(unix) {
+        "up=IFF_UP"
+    } else {
+        "up=has-address"
+    };
+    let mut source = format!("ratty-ai net/sysinfo {}; {link}", std::env::consts::OS);
+    if total > samples.len() {
+        source.push_str(&format!("; top {} of {total} by traffic", samples.len()));
+    }
+    let items: Vec<serde_json::Value> = samples
+        .iter()
+        .map(|sample| {
+            serde_json::json!({
+                "iface": clean_label(&sample.iface),
+                "rx_bytes": sample.rx,
+                "tx_bytes": sample.tx,
+                "up": sample.up,
+            })
+        })
+        .collect();
+    serde_json::json!({ "capture": capture_json(&source), "items": items })
+}
+
+/// The observed outcome of a kill watch — the only thing the wire, the
+/// exit code, and the user ever hear. The animation never claims a death
+/// that was not observed.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KillOutcome {
+    /// The signal was delivered and the process's exit was observed
+    /// (including its pid resurfacing under a different start time).
+    Died,
+    /// Still alive with the same identity when the SIGTERM watch ended —
+    /// the process ignored or survived the signal.
+    Survived,
+    /// The kernel refused the signal (EPERM).
+    Denied,
+    /// No process with that pid — a stale pid is never signaled blind.
+    Missing,
+    /// The outcome could not be observed within the timeout (a SIGKILLed
+    /// process still listed is stuck beyond userspace, e.g. D-state).
+    Timeout,
+}
+
+#[cfg(unix)]
+impl KillOutcome {
+    /// The registered `viz.effect` name for this outcome.
+    fn effect(self) -> &'static str {
+        match self {
+            KillOutcome::Died => "died",
+            KillOutcome::Survived => "survived",
+            KillOutcome::Denied => "denied",
+            KillOutcome::Missing => "missing",
+            KillOutcome::Timeout => "timeout",
+        }
+    }
+
+    /// The documented kill exit code, grouped at 10+ so it can never
+    /// collide with the transport/reply codes 2-6 an `--ack` can produce.
+    fn exit(self) -> ExitCode {
+        match self {
+            KillOutcome::Died => exit_codes::OK,
+            KillOutcome::Survived => ExitCode::from(10),
+            KillOutcome::Denied => ExitCode::from(11),
+            KillOutcome::Missing => ExitCode::from(12),
+            KillOutcome::Timeout => ExitCode::from(13),
+        }
+    }
+
+    /// Human-readable report for stderr / `--json`.
+    fn describe(self, pid: u32, signal: &str) -> String {
+        match self {
+            KillOutcome::Died => format!("pid {pid} exited after {signal}"),
+            KillOutcome::Survived => format!("pid {pid} survived {signal}"),
+            KillOutcome::Denied => format!("{signal} to pid {pid} was denied (EPERM)"),
+            KillOutcome::Missing => format!("no process with pid {pid}"),
+            KillOutcome::Timeout => {
+                format!("outcome of {signal} to pid {pid} unobserved within the timeout")
+            }
+        }
+    }
+}
+
+/// `ratty-ai kill`: signal, watch, and report the observed outcome as a
+/// `viz.effect` on the ps visualization's pid key. The wire never carries
+/// a kill verb — only the observed outcome.
+fn run_kill(cli: &Cli) -> ExitCode {
+    let Commands::Kill {
+        pid,
+        sigkill,
+        timeout_ms,
+        id,
+    } = &cli.command
+    else {
+        unreachable!("run_kill only handles the kill subcommand");
+    };
+    let (pid, sigkill) = (*pid, *sigkill);
+    let viz_id = id.unwrap_or(DEFAULT_PS_VIZ_ID);
+    // pid 0 signals the whole process group and pids beyond i32 would
+    // wrap negative (kill(2) group semantics) — refused, never
+    // reinterpreted.
+    if pid == 0 || pid > i32::MAX as u32 {
+        emit_failure(
+            cli.json,
+            "bad-input",
+            "pid must be between 1 and 2147483647",
+        );
+        return exit_codes::bad_input();
+    }
+    if cli.dry_run {
+        // Signals nothing: prints the sequence a confirmed death would
+        // emit (documented in --help).
+        return match emit_command(
+            cli,
+            "viz.effect",
+            viz_effect_wire(viz_id, &pid.to_string(), "died"),
+        ) {
+            Ok(()) => exit_codes::OK,
+            Err(exit) => exit,
+        };
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (sigkill, timeout_ms);
+        emit_failure(
+            cli.json,
+            "unsupported",
+            "kill needs a Unix platform (signals and process identity)",
+        );
+        exit_codes::bad_input()
+    }
+    #[cfg(unix)]
+    {
+        let signal = if sigkill { "SIGKILL" } else { "SIGTERM" };
+        let outcome = watch_kill(pid, sigkill, Duration::from_millis(*timeout_ms));
+        let wire = emit_command(
+            cli,
+            "viz.effect",
+            viz_effect_wire(viz_id, &pid.to_string(), outcome.effect()),
+        );
+        match outcome {
+            KillOutcome::Died => {
+                if cli.json {
+                    println!(
+                        "{}",
+                        serde_json::json!({ "ok": true, "outcome": "died", "pid": pid })
+                    );
+                }
+            }
+            other => emit_failure(cli.json, other.effect(), &other.describe(pid, signal)),
+        }
+        // A wire failure only overrides a would-be success: exit 0 never
+        // lies about either the process outcome or the effect delivery.
+        match (outcome, wire) {
+            (KillOutcome::Died, Err(exit)) => exit,
+            (outcome, _) => outcome.exit(),
+        }
+    }
+}
+
+/// Signals `pid` and watches for the outcome. Identity is (pid, start
+/// time): captured immediately before signaling and re-verified while
+/// watching, so a reused pid is evidence the original died — never
+/// grounds to claim it survived.
+#[cfg(unix)]
+fn watch_kill(pid: u32, sigkill: bool, timeout: Duration) -> KillOutcome {
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+    let target = Pid::from_u32(pid);
+    let refresh = ProcessRefreshKind::nothing();
+    let mut sys = System::new();
+    sys.refresh_processes_specifics(ProcessesToUpdate::Some(&[target]), true, refresh);
+    let Some(process) = sys.process(target) else {
+        return KillOutcome::Missing;
+    };
+    let start_time = process.start_time();
+    let signal = if sigkill {
+        libc::SIGKILL
+    } else {
+        libc::SIGTERM
+    };
+    // The identity check above sits as close to the syscall as userspace
+    // gets; the residual reuse window is why identity is re-verified
+    // after signaling too.
+    // SAFETY: plain kill(2); pid was bounds-checked to a positive i32.
+    if unsafe { libc::kill(pid as libc::pid_t, signal) } != 0 {
+        return match std::io::Error::last_os_error().raw_os_error() {
+            Some(libc::ESRCH) => KillOutcome::Missing,
+            // EPERM, or anything unexpected: the signal was refused.
+            _ => KillOutcome::Denied,
+        };
+    }
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        std::thread::sleep(KILL_POLL);
+        sys.refresh_processes_specifics(ProcessesToUpdate::Some(&[target]), true, refresh);
+        match sys.process(target) {
+            None => return KillOutcome::Died,
+            Some(live) if live.start_time() != start_time => return KillOutcome::Died,
+            Some(live) if live.status() == sysinfo::ProcessStatus::Zombie => {
+                // Exited but unreaped: the process is dead; only the
+                // table entry remains.
+                return KillOutcome::Died;
+            }
+            Some(_) if std::time::Instant::now() >= deadline => {
+                return if sigkill {
+                    KillOutcome::Timeout
+                } else {
+                    KillOutcome::Survived
+                };
+            }
+            Some(_) => {}
+        }
+    }
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match &cli.command {
@@ -981,6 +1951,10 @@ fn main() -> ExitCode {
             let op = format!("state.{}", path.as_deref().unwrap_or("scene"));
             run_query(&cli, &op, None, None, *pretty)
         }
+        Commands::Ps { .. } | Commands::Fs { .. } | Commands::Git { .. } | Commands::Net { .. } => {
+            run_collector(&cli)
+        }
+        Commands::Kill { .. } => run_kill(&cli),
         _ => run_command(&cli),
     }
 }
@@ -995,9 +1969,19 @@ fn run_command(cli: &Cli) -> ExitCode {
         String::new()
     };
     let (action, payload) = command_to_osc(&cli.command, &stdin);
+    match emit_command(cli, &action, payload) {
+        Ok(()) => exit_codes::OK,
+        Err(exit) => exit,
+    }
+}
 
+/// Emits one `(action, payload)` command: fire-and-forget on stdout (or
+/// readable form under `--dry-run`), or — with `--ack` — over the tty with
+/// a correlation token, waiting for the `kind=ack` reply. `Err` carries
+/// the failure's exit code so loops (collector `--watch`) can stop on it.
+fn emit_command(cli: &Cli, action: &str, payload: String) -> Result<(), ExitCode> {
     if !cli.ack {
-        let sequence = osc::osc_sequence(&action, &payload);
+        let sequence = osc::osc_sequence(action, &payload);
         if cli.dry_run {
             // Readable form for testing and inspection.
             println!("{}", readable(&sequence));
@@ -1005,7 +1989,7 @@ fn run_command(cli: &Cli) -> ExitCode {
             print!("{sequence}");
             let _ = std::io::stdout().flush();
         }
-        return exit_codes::OK;
+        return Ok(());
     }
 
     // --ack: opt in with a correlation token and wait for the kind=ack
@@ -1017,10 +2001,10 @@ fn run_command(cli: &Cli) -> ExitCode {
     } else {
         format!("{payload}&{}={token}", osc::ACK_TOKEN_KEY)
     };
-    let sequence = osc::osc_sequence(&action, &payload);
+    let sequence = osc::osc_sequence(action, &payload);
     if cli.dry_run {
         println!("{}", readable(&sequence));
-        return exit_codes::OK;
+        return Ok(());
     }
 
     match roundtrip(cli, sequence.as_bytes(), &token) {
@@ -1028,14 +2012,14 @@ fn run_command(cli: &Cli) -> ExitCode {
             if cli.json {
                 println!("{}", serde_json::json!({ "ok": true }));
             }
-            exit_codes::OK
+            Ok(())
         }
         Ok(reply) => {
             let code = reply.code.unwrap_or_else(|| "error".to_string());
             emit_failure(cli.json, &code, "the terminal rejected the command");
-            exit_codes::reply_error()
+            Err(exit_codes::reply_error())
         }
-        Err(exit) => exit,
+        Err(exit) => Err(exit),
     }
 }
 
@@ -1591,6 +2575,513 @@ mod tests {
                 assert_eq!(envelope.data, b"{\"a\":1}");
             }
             other => panic!("expected a query, got {other:?}"),
+        }
+    }
+
+    // ── Collector wire round-trips ──
+
+    /// Frames an `(action, payload)` pair and runs it through the
+    /// terminal's parser, like [`round_trip`] but for wires built outside
+    /// `command_to_osc` (the collectors gather first).
+    fn parse_wire(action: &str, payload: &str) -> RattyAiCommand {
+        let sequence = osc::osc_sequence(action, payload);
+        let inner = sequence
+            .strip_prefix("\x1b]777;")
+            .and_then(|s| s.strip_suffix('\x07'))
+            .expect("well-framed sequence");
+        osc::parse_command(inner).expect("terminal parses what the collector emits")
+    }
+
+    #[test]
+    fn viz_set_wire_round_trips_and_decodes() {
+        let snapshot = serde_json::json!({
+            "capture": { "source": "test", "ts": "2026-01-01T00:00:00Z" },
+            "items": [
+                { "pid": 42, "name": "cargo", "cpu": 1.5, "mem": 1024, "state": "running" },
+            ],
+        });
+        let bytes = serde_json::to_vec(&snapshot).expect("snapshot encodes");
+        let data = query::b64url_encode(&bytes);
+        let anchor = AnchorArgs {
+            x: Some(4),
+            y: Some(2),
+            cols: Some(24),
+            rows: Some(8),
+        };
+        let payload = viz_set_wire(DEFAULT_PS_VIZ_ID, "ps.v1", &data, Some(&anchor));
+        assert_eq!(
+            parse_wire("viz.set", &payload),
+            RattyAiCommand::VizSet {
+                id: DEFAULT_PS_VIZ_ID,
+                kind: "ps.v1".into(),
+                data: data.clone(),
+                x: Some("4".into()),
+                y: Some("2".into()),
+                cols: Some("24".into()),
+                rows: Some("8".into()),
+                replace: false,
+            }
+        );
+        // What the terminal decodes is byte-identical to what was
+        // gathered.
+        let decoded = query::b64url_decode(&data, osc::MAX_VIZ_PAYLOAD_BYTES).expect("decodes");
+        assert_eq!(decoded, bytes);
+    }
+
+    /// Watch refreshes omit the anchor so an upsert never moves (or
+    /// un-scrolls) a live view.
+    #[test]
+    fn watch_refresh_omits_the_anchor() {
+        let payload = viz_set_wire(DEFAULT_FS_VIZ_ID, "fs.v1", "e30", None);
+        let RattyAiCommand::VizSet {
+            x, y, cols, rows, ..
+        } = parse_wire("viz.set", &payload)
+        else {
+            panic!("expected VizSet");
+        };
+        assert_eq!((x, y, cols, rows), (None, None, None, None));
+    }
+
+    #[test]
+    fn kill_effect_wire_round_trips() {
+        assert_eq!(
+            parse_wire(
+                "viz.effect",
+                &viz_effect_wire(DEFAULT_PS_VIZ_ID, "1234", "died")
+            ),
+            RattyAiCommand::VizEffect {
+                id: DEFAULT_PS_VIZ_ID,
+                key: "1234".into(),
+                effect: "died".into(),
+            }
+        );
+    }
+
+    /// The five kill outcomes map exactly onto the terminal's registered
+    /// effect names — drift here means invisible effects.
+    #[cfg(unix)]
+    #[test]
+    fn kill_outcomes_map_to_registered_effects() {
+        assert_eq!(KillOutcome::Died.effect(), "died");
+        assert_eq!(KillOutcome::Survived.effect(), "survived");
+        assert_eq!(KillOutcome::Denied.effect(), "denied");
+        assert_eq!(KillOutcome::Missing.effect(), "missing");
+        assert_eq!(KillOutcome::Timeout.effect(), "timeout");
+    }
+
+    // ── Collector normalization ──
+
+    #[test]
+    fn labels_are_cleaned_and_bounded() {
+        assert_eq!(clean_label("plain"), "plain");
+        assert_eq!(clean_label("tab\tbell\x07esc\x1b"), "tab?bell?esc?");
+        // Truncated labels stay within the wire bound, on a char boundary.
+        let long = "x".repeat(300);
+        assert!(clean_label(&long).len() <= osc::MAX_VIZ_LABEL_BYTES);
+        let accents = "é".repeat(100); // 2 bytes per char
+        let cleaned = clean_label(&accents);
+        assert!(cleaned.len() <= osc::MAX_VIZ_LABEL_BYTES);
+        assert!(cleaned.is_char_boundary(cleaned.len()));
+        assert!(cleaned.starts_with('é'), "the visible prefix survives");
+        let wide = "🦀".repeat(50); // 4 bytes per char
+        assert!(clean_label(&wide).len() <= osc::MAX_VIZ_LABEL_BYTES);
+    }
+
+    /// Two distinct values sharing a 128-byte prefix must not collapse to
+    /// the same domain key: [`clean_label`] hash-disambiguates on
+    /// truncation, and the same input always maps to the same key
+    /// (regression: F3).
+    #[test]
+    fn truncated_labels_stay_unique_and_stable() {
+        let prefix = "a".repeat(osc::MAX_VIZ_LABEL_BYTES);
+        let one = format!("{prefix}/first/leaf.rs");
+        let two = format!("{prefix}/second/leaf.rs");
+        let key_one = clean_label(&one);
+        let key_two = clean_label(&two);
+        assert_ne!(
+            key_one, key_two,
+            "distinct paths keep distinct keys after truncation"
+        );
+        assert!(key_one.len() <= osc::MAX_VIZ_LABEL_BYTES);
+        assert!(key_two.len() <= osc::MAX_VIZ_LABEL_BYTES);
+        // Stable across refreshes: the same path is always the same key.
+        assert_eq!(key_one, clean_label(&one));
+        // A short path is untouched and never grows a suffix.
+        assert_eq!(clean_label("target/debug"), "target/debug");
+    }
+
+    /// The `fs` provenance declares path truncation so `capture.source`
+    /// never implies its keys are verbatim paths (regression: F3).
+    #[test]
+    fn fs_snapshot_declares_path_truncation() {
+        let long = "z".repeat(osc::MAX_VIZ_LABEL_BYTES + 40);
+        let walk = FsWalk {
+            entries: vec![
+                FsSample {
+                    path: format!("{long}/a"),
+                    dir: false,
+                    size: 10,
+                    depth: 1,
+                },
+                FsSample {
+                    path: format!("{long}/b"),
+                    dir: false,
+                    size: 9,
+                    depth: 1,
+                },
+                FsSample {
+                    path: "short.txt".into(),
+                    dir: false,
+                    size: 8,
+                    depth: 1,
+                },
+            ],
+            skipped: 0,
+            capped: false,
+        };
+        let snapshot = fs_snapshot("/root", walk, 8);
+        let source = snapshot["capture"]["source"].as_str().expect("source");
+        assert!(
+            source.contains("2 paths truncated"),
+            "truncation declared: {source}"
+        );
+        let paths: Vec<&str> = snapshot["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .map(|item| item["path"].as_str().expect("path"))
+            .collect();
+        // The two truncated paths keep distinct keys under the byte bound.
+        assert_ne!(paths[0], paths[1]);
+        assert!(paths.iter().all(|p| p.len() <= osc::MAX_VIZ_LABEL_BYTES));
+    }
+
+    /// The collector-side defaults protocols/viz.md commits to, pinned so
+    /// a silent drift is a failed test rather than a doc that lies
+    /// (regression: F7). The terminal-side render defaults are pinned by
+    /// `viz::tests::render_defaults_are_pinned`.
+    #[test]
+    fn collector_defaults_are_pinned() {
+        // The four stable default slots documented in viz.md, contiguous
+        // in namespace 0 of the AI partition.
+        assert_eq!(DEFAULT_PS_VIZ_ID, 0x8000_0100);
+        assert_eq!(DEFAULT_FS_VIZ_ID, 0x8000_0101);
+        assert_eq!(DEFAULT_GIT_VIZ_ID, 0x8000_0102);
+        assert_eq!(DEFAULT_NET_VIZ_ID, 0x8000_0103);
+        assert_eq!(MAX_COLLECTOR_TOP, 64, "viz.md: --top hard cap");
+        assert_eq!(MAX_FS_WALK_ENTRIES, 4096, "viz.md: fs walk cap");
+        assert_eq!(MAX_STATE_BYTES, 32);
+    }
+
+    fn ps_sample(pid: u32, cpu: f32, mem: u64) -> PsSample {
+        PsSample {
+            pid,
+            name: format!("proc{pid}"),
+            cpu,
+            mem,
+            state: "running".into(),
+        }
+    }
+
+    #[test]
+    fn ps_snapshot_keeps_the_top_by_cpu_and_declares_truncation() {
+        let samples = vec![
+            ps_sample(1, 1.0, 10),
+            ps_sample(2, 9.0, 10),
+            ps_sample(3, 5.0, 10),
+        ];
+        let snapshot = ps_snapshot(samples, 2);
+        let items = snapshot["items"].as_array().expect("items");
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0]["pid"], 2);
+        assert_eq!(items[1]["pid"], 3);
+        let source = snapshot["capture"]["source"].as_str().expect("source");
+        assert!(
+            source.contains("top 2 of 3"),
+            "source declares truncation: {source}"
+        );
+        assert!(
+            snapshot["capture"]["ts"]
+                .as_str()
+                .expect("ts")
+                .ends_with('Z')
+        );
+    }
+
+    #[test]
+    fn ps_snapshot_ties_break_deterministically() {
+        let samples = vec![
+            ps_sample(9, 1.0, 5),
+            ps_sample(3, 1.0, 5),
+            ps_sample(7, 1.0, 9),
+        ];
+        let snapshot = ps_snapshot(samples, 3);
+        let pids: Vec<u64> = snapshot["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .map(|item| item["pid"].as_u64().expect("pid"))
+            .collect();
+        // Memory descending breaks the cpu tie, then pid ascending.
+        assert_eq!(pids, vec![7, 3, 9]);
+    }
+
+    #[test]
+    fn cpu_rounds_to_a_tenth_and_never_nan() {
+        assert_eq!(round_tenth(1.25), 1.3);
+        assert_eq!(round_tenth(0.1), 0.1);
+        assert_eq!(round_tenth(f32::NAN), 0.0);
+        assert_eq!(round_tenth(f32::INFINITY), 0.0);
+    }
+
+    #[test]
+    fn rfc3339_formats_known_instants() {
+        assert_eq!(rfc3339_utc(0), "1970-01-01T00:00:00Z");
+        assert_eq!(rfc3339_utc(951_782_400), "2000-02-29T00:00:00Z");
+        assert_eq!(rfc3339_utc(1_000_000_000), "2001-09-09T01:46:40Z");
+        assert_eq!(rfc3339_utc(4_102_444_799), "2099-12-31T23:59:59Z");
+    }
+
+    #[test]
+    fn fs_walk_bounds_depth_and_never_follows_symlinks() {
+        // Per-process temp dir so parallel test runs never collide.
+        let root = std::env::temp_dir().join(format!("ratty-ai-fs-walk-{}", std::process::id()));
+        let deep = root.join("a").join("b").join("c");
+        std::fs::create_dir_all(&deep).expect("create test tree");
+        std::fs::write(root.join("top.txt"), b"12345").expect("write");
+        std::fs::write(root.join("a").join("mid.txt"), b"123").expect("write");
+        std::fs::write(deep.join("deep.txt"), b"1").expect("write");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&root, root.join("loop")).expect("symlink");
+
+        let walk = walk_fs(&root, 2).expect("walk succeeds");
+        let paths: Vec<&str> = walk.entries.iter().map(|e| e.path.as_str()).collect();
+        assert!(paths.contains(&"top.txt"), "missing top.txt: {paths:?}");
+        assert!(paths.iter().any(|p| p.ends_with("mid.txt")));
+        assert!(paths.iter().any(|p| p.ends_with("b")));
+        // Depth 2 never reaches a/b/c or its contents.
+        assert!(
+            !paths
+                .iter()
+                .any(|p| p.contains("deep.txt") || p.ends_with("c")),
+            "depth bound leaked: {paths:?}"
+        );
+        assert!(walk.entries.iter().all(|e| e.depth <= 2));
+        #[cfg(unix)]
+        {
+            let link = walk
+                .entries
+                .iter()
+                .find(|e| e.path.ends_with("loop"))
+                .expect("symlink listed as a plain entry");
+            assert!(!link.dir, "symlinks are never traversed as directories");
+        }
+        std::fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn fs_snapshot_ranks_by_size_and_declares_the_walk_story() {
+        let walk = FsWalk {
+            entries: vec![
+                FsSample {
+                    path: "small".into(),
+                    dir: false,
+                    size: 1,
+                    depth: 1,
+                },
+                FsSample {
+                    path: "big".into(),
+                    dir: false,
+                    size: 100,
+                    depth: 1,
+                },
+                FsSample {
+                    path: "dir".into(),
+                    dir: true,
+                    size: 0,
+                    depth: 1,
+                },
+            ],
+            skipped: 2,
+            capped: true,
+        };
+        let snapshot = fs_snapshot("/tmp/x", walk, 2);
+        let items = snapshot["items"].as_array().expect("items");
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0]["path"], "big");
+        assert_eq!(items[0]["kind"], "file");
+        let source = snapshot["capture"]["source"].as_str().expect("source");
+        assert!(source.contains("top 2 of 3"), "{source}");
+        assert!(source.contains("2 unreadable skipped"), "{source}");
+        assert!(source.contains("walk capped"), "{source}");
+        assert_eq!(snapshot["root"], "/tmp/x");
+    }
+
+    #[test]
+    fn git_porcelain_counts_staged_unstaged_untracked() {
+        let text = " M unstaged.rs\nM  staged.rs\nMM both.rs\n?? new.rs\nA  added.rs\n";
+        assert_eq!(
+            parse_git_porcelain(text),
+            GitCounts {
+                staged: 3,
+                unstaged: 2,
+                untracked: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn git_branches_parse_and_current_sorts_first() {
+        let branches = parse_git_branches("*main\n dev\n feature/x\n");
+        assert_eq!(
+            branches,
+            vec![
+                ("main".to_string(), true),
+                ("dev".to_string(), false),
+                ("feature/x".to_string(), false),
+            ]
+        );
+        let snapshot = git_snapshot(
+            "repo",
+            vec![
+                ("zeta".into(), false),
+                ("main".into(), true),
+                ("alpha".into(), false),
+            ],
+            GitCounts::default(),
+            1,
+            2,
+        );
+        let names: Vec<&str> = snapshot["branches"]
+            .as_array()
+            .expect("branches")
+            .iter()
+            .map(|branch| branch["name"].as_str().expect("name"))
+            .collect();
+        assert_eq!(names, vec!["main", "alpha", "zeta"]);
+        assert_eq!(snapshot["branches"][0]["current"], true);
+        assert_eq!(snapshot["ahead"], 1);
+        assert_eq!(snapshot["behind"], 2);
+    }
+
+    #[test]
+    fn ahead_behind_parses_left_right_order() {
+        // @{upstream}...HEAD: left = behind, right = ahead.
+        assert_eq!(parse_ahead_behind("2\t5\n"), (5, 2));
+        assert_eq!(parse_ahead_behind(""), (0, 0));
+    }
+
+    #[test]
+    fn net_snapshot_ranks_by_total_traffic() {
+        let samples = vec![
+            NetSample {
+                iface: "lo0".into(),
+                rx: 10,
+                tx: 10,
+                up: true,
+            },
+            NetSample {
+                iface: "en0".into(),
+                rx: 1000,
+                tx: 500,
+                up: true,
+            },
+            NetSample {
+                iface: "awdl0".into(),
+                rx: 0,
+                tx: 0,
+                up: false,
+            },
+        ];
+        let snapshot = net_snapshot(samples, 2);
+        let items = snapshot["items"].as_array().expect("items");
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0]["iface"], "en0");
+        assert_eq!(items[1]["iface"], "lo0");
+        assert_eq!(items[0]["up"], true);
+        let source = snapshot["capture"]["source"].as_str().expect("source");
+        assert!(
+            source.contains("up="),
+            "link-state source declared: {source}"
+        );
+    }
+
+    /// The provable-fit contract behind `--top`'s hard cap: snapshots of
+    /// [`MAX_COLLECTOR_TOP`] items with worst-case labels (128 bytes of
+    /// `"`, escaping to 256 in JSON) and maximal numbers must encode
+    /// under the shared decoded-payload limit for every kind. If this
+    /// fails, a cap changed incompatibly.
+    #[test]
+    fn worst_case_snapshots_fit_the_wire_budget() {
+        let top = MAX_COLLECTOR_TOP as usize;
+        assert!(top <= osc::MAX_VIZ_ITEMS_PER_SNAPSHOT);
+        let label = "\"".repeat(osc::MAX_VIZ_LABEL_BYTES);
+        let state = "\"".repeat(MAX_STATE_BYTES * 2);
+
+        let ps = ps_snapshot(
+            (0..top as u32 * 2)
+                .map(|i| PsSample {
+                    pid: u32::MAX - i,
+                    name: label.clone(),
+                    cpu: f32::MAX,
+                    mem: u64::MAX,
+                    state: state.clone(),
+                })
+                .collect(),
+            top,
+        );
+        let fs = fs_snapshot(
+            &label,
+            FsWalk {
+                entries: (0..top * 2)
+                    .map(|i| FsSample {
+                        path: format!("{label}{i}"),
+                        dir: i % 2 == 0,
+                        size: u64::MAX - i as u64,
+                        depth: u8::MAX,
+                    })
+                    .collect(),
+                skipped: usize::MAX,
+                capped: true,
+            },
+            top,
+        );
+        let git = git_snapshot(
+            &label,
+            (0..top * 2)
+                .map(|i| (format!("{label}{i}"), i == 0))
+                .collect(),
+            GitCounts {
+                staged: u32::MAX,
+                unstaged: u32::MAX,
+                untracked: u32::MAX,
+            },
+            u32::MAX,
+            u32::MAX,
+        );
+        let net = net_snapshot(
+            (0..top * 2)
+                .map(|i| NetSample {
+                    iface: format!("{label}{i}"),
+                    rx: u64::MAX,
+                    tx: u64::MAX,
+                    up: i % 2 == 0,
+                })
+                .collect(),
+            top,
+        );
+        for (kind, snapshot) in [("ps", ps), ("fs", fs), ("git", git), ("net", net)] {
+            let bytes = serde_json::to_vec(&snapshot).expect("encodes");
+            assert!(
+                bytes.len() <= osc::MAX_VIZ_PAYLOAD_BYTES,
+                "worst-case {kind} snapshot is {} bytes (cap {})",
+                bytes.len(),
+                osc::MAX_VIZ_PAYLOAD_BYTES
+            );
+            // And the framed wire form survives the terminal's OSC
+            // watchdog envelope math (const-asserted terminal-side).
+            let encoded = query::b64url_encode(&bytes);
+            assert!(encoded.len() <= osc::MAX_VIZ_PAYLOAD_BYTES.div_ceil(3) * 4);
         }
     }
 }

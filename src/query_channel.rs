@@ -63,6 +63,7 @@ pub const SUPPORTED_OPS: &[&str] = &[
     "state.macros",
     "state.executions",
     "state.errors",
+    "state.viz",
 ];
 
 /// One OSC 778 item drained from the parser, delivered to the Bevy world.
@@ -267,6 +268,7 @@ pub fn answer_queries(
     stage_tween: Res<StageTween>,
     cursor: Res<CursorSettings>,
     effects: Res<AiEffects>,
+    viz: Res<crate::viz::VizRegistry>,
     sound: Res<SoundState>,
 ) {
     // Acks first: a same-chunk "command with tok= then query" reads its
@@ -305,6 +307,7 @@ pub fn answer_queries(
                     stage_tween: &stage_tween,
                     cursor: &cursor,
                     effects: &effects,
+                    viz: &viz,
                     sound: &sound,
                     grid: runtime.parser.screen().size(),
                 };
@@ -387,6 +390,7 @@ struct QueryCtx<'a> {
     stage_tween: &'a StageTween,
     cursor: &'a CursorSettings,
     effects: &'a AiEffects,
+    viz: &'a crate::viz::VizRegistry,
     sound: &'a SoundState,
     /// Live grid size as `(rows, cols)`, from the parser screen.
     grid: (u16, u16),
@@ -415,6 +419,7 @@ fn answer(
         // no macros and no executions. Never fabricate.
         "state.macros" | "state.executions" => Ok(json!({ "items": [] })),
         "state.errors" => errors(ctx, source, &data),
+        "state.viz" => viz_state(ctx, source, &data),
         _ => Err(codes::UNSUPPORTED_OP),
     }
 }
@@ -434,6 +439,9 @@ fn caps(ctx: &QueryCtx<'_>) -> Value {
             "objects_per_namespace": crate::ai::MAX_AI_OBJECTS_PER_NAMESPACE,
             "ids_per_session": crate::ai::MAX_AI_OBJECT_IDS_PER_SESSION,
             "errors_per_namespace": MAX_DIAGNOSTICS_PER_NAMESPACE,
+            "viz_per_namespace": crate::viz::MAX_VIZ_PER_NAMESPACE,
+            "viz_payload_bytes": crate::viz::MAX_VIZ_PAYLOAD_BYTES,
+            "viz_items": crate::viz::MAX_VIZ_ITEMS_PER_SNAPSHOT,
             "sound_voices": crate::sound::MAX_SOUND_VOICES,
             "sound_plays_per_sec": crate::sound::SOUND_PLAYS_PER_SEC,
         },
@@ -741,6 +749,67 @@ fn errors(ctx: &QueryCtx<'_>, source: IngressSource, data: &Value) -> Result<Val
     paginate(ctx, items, data)
 }
 
+/// The viz visibility rule, mirroring [`anchor_visible`]: anchored and the
+/// footprint's row range intersects the live grid.
+fn viz_anchor_visible(anchor: &crate::viz::VizAnchor, grid_rows: u16) -> bool {
+    let start = i32::from(anchor.row);
+    let end = start + i32::from(anchor.rows);
+    start < i32::from(grid_rows) && end > 0
+}
+
+/// `state.viz`: visualization records under the three-tier read scope —
+/// the caller's own records in full (capture provenance plus effect-queue
+/// length), foreign namespaces' public projections only while visible (a
+/// hidden foreign visualization's existence is not readable). Payload
+/// read-back is deliberately summary-level in v1: `item_count`, never
+/// item dumps or raw payloads. Sorted by id; paginated.
+fn viz_state(
+    ctx: &QueryCtx<'_>,
+    source: IngressSource,
+    data: &Value,
+) -> Result<Value, &'static str> {
+    let (rows, _) = ctx.grid;
+    let namespace = source.namespace();
+    let mut items: Vec<(u64, Value)> = ctx
+        .viz
+        .iter()
+        .filter_map(|(id, entry)| {
+            let owned = ai_object_namespace(id) == Some(namespace);
+            let visible = entry
+                .anchor
+                .is_some_and(|anchor| viz_anchor_visible(&anchor, rows));
+            if !owned && !visible {
+                return None;
+            }
+            let mut value = json!({
+                "id": id,
+                "owner": ai_object_namespace(id),
+                "kind": entry.payload.kind(),
+                "revision": entry.revision,
+                "visible": visible,
+                "anchor": entry.anchor.map_or(Value::Null, |anchor| json!({
+                    "row": anchor.row,
+                    "col": anchor.col,
+                    "cols": anchor.cols,
+                    "rows": anchor.rows,
+                })),
+                "item_count": entry.payload.item_count(),
+            });
+            if owned {
+                let capture = entry.payload.capture();
+                value["capture"] = json!({
+                    "source": capture.source,
+                    "ts": capture.ts,
+                });
+                value["pending_effects"] = json!(entry.pending_effects.len());
+            }
+            Some((u64::from(id), value))
+        })
+        .collect();
+    items.sort_by_key(|(key, _)| *key);
+    paginate(ctx, items, data)
+}
+
 fn encode_cursor(session: &QuerySession, after: u64) -> String {
     query::b64url_encode(format!("{}:{after}", session.nonce_hex()).as_bytes())
 }
@@ -830,6 +899,7 @@ mod tests {
         app.init_resource::<AiDiagnostics>();
         app.init_resource::<QuerySession>();
         app.init_resource::<AiEffects>();
+        app.init_resource::<crate::viz::VizRegistry>();
         app.init_resource::<SoundState>();
         app.init_resource::<Time>();
         app.insert_resource(TerminalPresentation {
@@ -848,6 +918,7 @@ mod tests {
             (
                 pump_pty_output,
                 apply_ai_object_commands,
+                crate::viz::apply_viz_commands,
                 apply_sound_commands,
                 answer_queries,
             )
@@ -982,6 +1053,18 @@ mod tests {
         assert_eq!(
             caps["limits"]["objects_per_namespace"],
             json!(crate::ai::MAX_AI_OBJECTS_PER_NAMESPACE)
+        );
+        assert_eq!(
+            caps["limits"]["viz_per_namespace"],
+            json!(crate::viz::MAX_VIZ_PER_NAMESPACE)
+        );
+        assert_eq!(
+            caps["limits"]["viz_payload_bytes"],
+            json!(crate::viz::MAX_VIZ_PAYLOAD_BYTES)
+        );
+        assert_eq!(
+            caps["limits"]["viz_items"],
+            json!(crate::viz::MAX_VIZ_ITEMS_PER_SNAPSHOT)
         );
     }
 
@@ -1248,6 +1331,144 @@ mod tests {
             assert!(reply.ok);
             assert_eq!(payload(&reply)["items"], json!([]));
         }
+    }
+
+    /// A synthetic `ps.v1` snapshot as its wire `data=` value.
+    fn viz_ps_data(pids: &[u32]) -> String {
+        let payload = json!({
+            "capture": { "source": "test/synthetic", "ts": "2026-07-22T00:00:00Z" },
+            "items": pids
+                .iter()
+                .map(|pid| json!({
+                    "pid": pid,
+                    "name": format!("proc{pid}"),
+                    "cpu": 1.5,
+                    "mem": 1024,
+                    "state": "running",
+                }))
+                .collect::<Vec<_>>(),
+        });
+        query::b64url_encode(payload.to_string().as_bytes())
+    }
+
+    /// The milestone's closed loop: a collector-style `viz.set` with
+    /// `tok=` acks over 778 and its snapshot reads back through
+    /// `state.viz`; a kill-watcher-style `viz.effect` acks and queues; a
+    /// `viz.remove` acks and the record is gone.
+    #[test]
+    fn closed_loop_viz_set_effect_remove_over_777_and_778() {
+        let (mut app, host) = test_app();
+        // One chunk: a tok='d viz.set followed by a state.viz query. The
+        // ack must arrive first and the query must observe the snapshot.
+        let data = viz_ps_data(&[1234, 4321]);
+        let set =
+            format!("\x1b]777;ratty:viz.set;id={ID}&kind=ps.v1&data={data}&x=10&y=5&tok=set1\x07");
+        let query = query_sequence("q1", "state.viz", None);
+        host.feed_tx
+            .send(format!("{set}{query}").into_bytes())
+            .expect("virtual feed accepts bytes");
+        app.update();
+        let replies = drain_replies(&host);
+        assert_eq!(replies.len(), 2, "one ack, one query reply");
+        assert_eq!(replies[0].token, "set1");
+        assert!(replies[0].ack, "the command reply is kind=ack");
+        assert!(replies[0].ok, "the snapshot committed");
+        assert!(replies[1].ok);
+        let page = payload(&replies[1]);
+        let items = page["items"].as_array().expect("items array");
+        assert_eq!(items.len(), 1);
+        let item = &items[0];
+        assert_eq!(item["id"], json!(ID));
+        assert_eq!(item["owner"], json!(0));
+        assert_eq!(item["kind"], json!("ps.v1"));
+        assert_eq!(item["visible"], json!(true));
+        assert_eq!(item["item_count"], json!(2));
+        assert_eq!(item["anchor"]["row"], json!(5));
+        assert_eq!(item["anchor"]["col"], json!(10));
+        assert_eq!(item["capture"]["source"], json!("test/synthetic"));
+        assert_eq!(item["pending_effects"], json!(0));
+        let revision = item["revision"].as_u64().expect("revision");
+        assert!(revision >= 1);
+
+        // The kill watcher reports its observed outcome as an effect on
+        // the pid domain key.
+        host.feed_tx
+            .send(
+                format!("\x1b]777;ratty:viz.effect;id={ID}&key=1234&effect=died&tok=fx1\x07")
+                    .into_bytes(),
+            )
+            .expect("virtual feed accepts bytes");
+        app.update();
+        let replies = drain_replies(&host);
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].token, "fx1");
+        assert!(replies[0].ok, "effects on live ids commit");
+        let reply = run_query(&mut app, &host, "q2", "state.viz", None);
+        let page = payload(&reply);
+        assert_eq!(page["items"][0]["pending_effects"], json!(1));
+        assert!(
+            page["items"][0]["revision"].as_u64().expect("revision") > revision,
+            "the effect bumped the revision"
+        );
+
+        // Remove: acked, and the registry answers honestly empty.
+        host.feed_tx
+            .send(format!("\x1b]777;ratty:viz.remove;id={ID}&tok=rm1\x07").into_bytes())
+            .expect("virtual feed accepts bytes");
+        app.update();
+        let replies = drain_replies(&host);
+        assert_eq!(replies.len(), 1);
+        assert!(replies[0].ok);
+        let reply = run_query(&mut app, &host, "q3", "state.viz", None);
+        assert_eq!(payload(&reply)["items"], json!([]));
+    }
+
+    #[test]
+    fn state_viz_scopes_foreign_records_to_visible_public_projections() {
+        let (mut app, host) = test_app();
+        let anchor = crate::viz::VizAnchor {
+            row: 2,
+            col: 2,
+            cols: 10,
+            rows: 4,
+        };
+        let payload_for = |pid: u32| {
+            crate::viz::decode_viz_payload("ps.v1", &viz_ps_data(&[pid]))
+                .expect("synthetic payload decodes")
+        };
+        {
+            let mut viz = app.world_mut().resource_mut::<crate::viz::VizRegistry>();
+            // The caller's own, unplaced (hidden) visualization.
+            viz.upsert(ID, payload_for(1), None);
+            // A foreign visible one and a foreign hidden one.
+            viz.upsert(0x8100_0001, payload_for(2), Some(anchor));
+            viz.upsert(0x8100_0002, payload_for(3), None);
+        }
+        let reply = run_query(&mut app, &host, "q1", "state.viz", None);
+        assert!(reply.ok);
+        let page = payload(&reply);
+        let items = page["items"].as_array().expect("items array");
+        assert_eq!(
+            items.len(),
+            2,
+            "a hidden foreign visualization's existence is not readable"
+        );
+        // The caller's own record: hidden but listed, with the private
+        // tier (capture provenance, effect queue length).
+        assert_eq!(items[0]["id"], json!(ID));
+        assert_eq!(items[0]["visible"], json!(false));
+        assert!(items[0]["capture"].is_object());
+        assert!(items[0]["pending_effects"].is_u64());
+        // The foreign visible record: public projection only.
+        assert_eq!(items[1]["id"], json!(0x8100_0001_u32));
+        assert_eq!(items[1]["owner"], json!(1));
+        assert_eq!(items[1]["visible"], json!(true));
+        assert_eq!(items[1]["item_count"], json!(1));
+        assert!(
+            items[1].get("capture").is_none(),
+            "capture provenance is owner-only"
+        );
+        assert!(items[1].get("pending_effects").is_none());
     }
 
     /// The M3.9 closed loop: a locked one-shot drops honestly, a locked

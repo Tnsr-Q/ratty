@@ -119,7 +119,9 @@ The 778 analog of the RGP support reply; keys are append-only.
   "limits": { "max_query_bytes": 8192, "max_query_data_bytes": 4096,
               "max_reply_bytes": 4096, "objects_per_namespace": 64,
               "ids_per_session": 4096, "errors_per_namespace": 32,
-              "sound_voices": 16, "sound_plays_per_sec": 4 } }
+              "viz_per_namespace": 32, "viz_payload_bytes": 32768,
+              "viz_items": 256, "sound_voices": 16,
+              "sound_plays_per_sec": 4 } }
 ```
 
 ### 2. `state.scene` — scene-global public state
@@ -184,17 +186,30 @@ The last 32 rejections in the caller's namespace: `seq`, `action`,
 `code`, `message` — the query-channel return path for every failure that
 used to be only a terminal-side `warn!`.
 
+### 9. `state.viz` — visualization records *(paginated)*
+
+The read side of the `viz.*` family (see the
+[Ratty Visualization Protocol](viz.md)), under the standard three-tier
+scope: the caller's own visualizations appear in full — the public
+fields plus `capture` provenance and the pending-effect count — while
+foreign namespaces' visualizations appear only while visible, as public
+projections (`id`, `owner`, `kind`, `revision`, `visible`, anchor cell
+and footprint, `item_count`). A hidden foreign visualization's
+existence is not readable. Payload read-back is deliberately
+summary-level in v1: `item_count`, never item dumps or raw payloads.
+Sorted by id.
+
 ## Error codes
 
 Append-only, kebab-case, carried in `code=`: `bad-envelope`,
 `bad-version`, `too-large`, `bad-payload`, `unsupported-op`,
 `unsupported`, `bad-command`, `bad-cursor`, `not-owner`, `unknown-id`,
 `no-anchor`, `already-exists`, `id-reused`, `session-budget`,
-`namespace-cap`, `bad-asset`, `bad-mode`, `bad-kind`, `audio-locked`,
-`deferred`, `rate-limited`, `voice-cap`, `not-permitted`, `internal` —
-plus the client-side `timeout` and `disposed`. `deferred` is the one
-code that qualifies an `ok=1` ack rather than naming a rejection (see
-Command acks above and [sound.md](sound.md)).
+`namespace-cap`, `bad-asset`, `bad-mode`, `bad-kind`, `kind-mismatch`,
+`audio-locked`, `deferred`, `rate-limited`, `voice-cap`, `not-permitted`,
+`internal` — plus the client-side `timeout` and `disposed`. `deferred` is
+the one code that qualifies an `ok=1` ack rather than naming a rejection
+(see Command acks above and [sound.md](sound.md)).
 
 ## Client surfaces
 

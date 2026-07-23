@@ -29,4 +29,5 @@ pub mod scene;
 pub mod sound;
 pub mod systems;
 pub mod terminal;
+pub mod viz;
 pub mod web;
