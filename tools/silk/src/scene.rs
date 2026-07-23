@@ -2,10 +2,10 @@
 //!
 //! A scene is JSON with `meta`, `stage`, and a `cast` of timed steps. Each
 //! step carries `at` (absolute seconds) plus exactly one verb field:
-//! `print`, `register`, `place`, `update`, `tween`, `camera`, `delete`,
-//! `marker`, or `clear`. Rows and columns are 0-based terminal cells;
-//! `place.row`/`col` are the CENTER of the placement, matching RGP
-//! semantics.
+//! `print`, `register`, `place`, `update`, `tween`, `camera`, `ai`,
+//! `sound`, `delete`, `marker`, or `clear`. Rows and columns are 0-based
+//! terminal cells; `place.row`/`col` are the CENTER of the placement,
+//! matching RGP semantics.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -127,6 +127,9 @@ pub struct Step {
     /// AI presence / effect command (OSC 777 `ratty-ai` channel).
     #[serde(default)]
     pub ai: Option<AiArgs>,
+    /// Sound organ command (OSC 777 `sound.*` family).
+    #[serde(default)]
+    pub sound: Option<SoundArgs>,
     /// Delete one object (`{"id": N}`) or all (`"all"`).
     #[serde(default)]
     pub delete: Option<DeleteArg>,
@@ -148,6 +151,7 @@ impl Step {
             + usize::from(self.tween.is_some())
             + usize::from(self.camera.is_some())
             + usize::from(self.ai.is_some())
+            + usize::from(self.sound.is_some())
             + usize::from(self.delete.is_some())
             + usize::from(self.marker.is_some())
             + usize::from(self.clear.is_some())
@@ -431,6 +435,37 @@ pub struct AiArgs {
     /// Clear all effects.
     #[serde(default)]
     pub reset: Option<bool>,
+}
+
+/// `sound` verb arguments: sound organ commands carried in-band over the
+/// OSC 777 channel. Exactly one of `play`/`ambient`/`stop` must be set.
+///
+/// Kinds are the registered semantic kinds ratty itself compiles
+/// (`osc::SOUND_KINDS`) — never file paths or URLs — so a cast stays
+/// self-contained. There is deliberately no `tok=` field (a cast has no
+/// return channel, so an ack request would be meaningless) and no master
+/// gain or mute (the mixer belongs to trusted terminal config, not the
+/// wire); `deny_unknown_fields` makes those absences airtight.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SoundArgs {
+    /// One-shot kind to play (`chime`/`alert`/`pulse`/`click`).
+    #[serde(default)]
+    pub play: Option<String>,
+    /// Ambient bed kind to set or crossfade to (`ambient.hum`).
+    #[serde(default)]
+    pub ambient: Option<String>,
+    /// Fade the ambient bed out (must be `true` when present).
+    #[serde(default)]
+    pub stop: Option<bool>,
+    /// Requested gain `0.0..=1.0`; the terminal clamps to the kind's
+    /// registry maximum (the wire requests, it never owns the mixer).
+    #[serde(default)]
+    pub gain: Option<f32>,
+    /// Crossfade (`ambient`) or fade-out (`stop`) duration in seconds;
+    /// the terminal clamps to its supported range.
+    #[serde(default)]
+    pub xfade: Option<f64>,
 }
 
 /// `delete` verb argument.

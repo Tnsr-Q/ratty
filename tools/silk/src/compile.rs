@@ -15,8 +15,8 @@ use ratatui_ratty::{ObjectFormat, RattyGraphic, RattyGraphicSettings};
 use crate::cast::{Cast, Event, Header, XRatty};
 use crate::osc;
 use crate::scene::{
-    AiArgs, CameraArgs, PlaceArgs, PrintArgs, RegisterArgs, Scene, Step, TWEENABLE_FIELDS,
-    TweenArgs, UpdateArgs,
+    AiArgs, CameraArgs, PlaceArgs, PrintArgs, RegisterArgs, Scene, SoundArgs, Step,
+    TWEENABLE_FIELDS, TweenArgs, UpdateArgs,
 };
 
 /// Compilation stats for reporting.
@@ -195,7 +195,7 @@ impl Compiler<'_> {
         if step.verb_count() != 1 {
             bail!(
                 "each step must have exactly one verb (print/register/place/\
-                 update/tween/camera/ai/delete/marker/clear)"
+                 update/tween/camera/ai/sound/delete/marker/clear)"
             );
         }
         if let Some(print) = &step.print {
@@ -212,6 +212,8 @@ impl Compiler<'_> {
             self.camera(step.at, camera)?;
         } else if let Some(ai) = &step.ai {
             self.ai(step.at, ai)?;
+        } else if let Some(sound) = &step.sound {
+            self.sound(step.at, sound)?;
         } else if let Some(delete) = &step.delete {
             match delete.id()? {
                 Some(id) => {
@@ -590,6 +592,118 @@ impl Compiler<'_> {
         }
         Ok(())
     }
+
+    /// Emits exactly one OSC 777 `sound.*` sequence, validating the kind
+    /// against the registry ratty itself compiles (`osc::SOUND_KINDS`) so
+    /// unknown kinds are hard compile errors. Never emits `tok=`: a cast has
+    /// no return channel, so an ack request would be meaningless.
+    fn sound(&mut self, at: f64, sound: &SoundArgs) -> Result<()> {
+        let verbs = usize::from(sound.play.is_some())
+            + usize::from(sound.ambient.is_some())
+            + usize::from(sound.stop.is_some());
+        if verbs != 1 {
+            bail!("sound step must set exactly one of play, ambient, or stop");
+        }
+        if let Some(gain) = sound.gain
+            && !(0.0..=1.0).contains(&gain)
+        {
+            bail!("sound.gain {gain} out of range 0.0..=1.0");
+        }
+        let xfade_ms = sound
+            .xfade
+            .map(|xfade| -> Result<u32> {
+                if !xfade.is_finite() || xfade < 0.0 {
+                    bail!("sound.xfade {xfade} must be a non-negative number of seconds");
+                }
+                let ms = (xfade * 1000.0).round();
+                if ms > f64::from(u32::MAX) {
+                    bail!("sound.xfade {xfade}s overflows the wire's millisecond field");
+                }
+                Ok(ms as u32)
+            })
+            .transpose()?;
+        let enc = osc::percent_encode;
+
+        if let Some(kind) = &sound.play {
+            match osc::sound_kind_class(kind) {
+                Some(osc::SoundKindClass::OneShot) => {}
+                Some(osc::SoundKindClass::Ambient) => bail!(
+                    "sound.play kind \"{kind}\" is an ambient bed; use sound.ambient \
+                     (one-shots: {})",
+                    sound_kind_list(osc::SoundKindClass::OneShot),
+                ),
+                None => bail!(
+                    "unknown sound kind \"{kind}\" (one-shots: {})",
+                    sound_kind_list(osc::SoundKindClass::OneShot),
+                ),
+            }
+            if xfade_ms.is_some() {
+                bail!("sound.xfade has no effect on a one-shot play");
+            }
+            let mut payload = format!("kind={}", enc(kind));
+            if let Some(gain) = sound.gain {
+                payload.push_str(&format!("&gain={}", fmt_f32(gain)));
+            }
+            self.emit_sound(at, "sound.play", &payload)?;
+        } else if let Some(kind) = &sound.ambient {
+            match osc::sound_kind_class(kind) {
+                Some(osc::SoundKindClass::Ambient) => {}
+                Some(osc::SoundKindClass::OneShot) => bail!(
+                    "sound.ambient kind \"{kind}\" is a one-shot; use sound.play \
+                     (ambient beds: {})",
+                    sound_kind_list(osc::SoundKindClass::Ambient),
+                ),
+                None => bail!(
+                    "unknown sound kind \"{kind}\" (ambient beds: {})",
+                    sound_kind_list(osc::SoundKindClass::Ambient),
+                ),
+            }
+            let mut payload = format!("kind={}", enc(kind));
+            if let Some(gain) = sound.gain {
+                payload.push_str(&format!("&gain={}", fmt_f32(gain)));
+            }
+            if let Some(ms) = xfade_ms {
+                payload.push_str(&format!("&xfade={ms}"));
+            }
+            self.emit_sound(at, "sound.ambient.set", &payload)?;
+        } else {
+            if sound.stop != Some(true) {
+                bail!("sound.stop must be true (omit it otherwise)");
+            }
+            if sound.gain.is_some() {
+                bail!("sound.gain has no effect on stop");
+            }
+            let payload = xfade_ms.map(|ms| format!("fade={ms}")).unwrap_or_default();
+            self.emit_sound(at, "sound.ambient.stop", &payload)?;
+        }
+        Ok(())
+    }
+
+    /// Round-trips a sound command through ratty's own parser before
+    /// emitting it — the compiler can never emit what the terminal cannot
+    /// decode (the CLI-and-silk-share-osc.rs contract).
+    fn emit_sound(&mut self, at: f64, action: &str, payload: &str) -> Result<()> {
+        let command = if payload.is_empty() {
+            format!("ratty:{action}")
+        } else {
+            format!("ratty:{action};{payload}")
+        };
+        if osc::parse_command(&command).is_none() {
+            bail!("sound step produced an unparseable command {command:?}");
+        }
+        self.out(at, osc::osc_sequence(action, payload));
+        Ok(())
+    }
+}
+
+/// Comma-separated registered sound kinds of one class, for error messages.
+fn sound_kind_list(class: osc::SoundKindClass) -> String {
+    osc::SOUND_KINDS
+        .iter()
+        .filter(|(_, kind_class)| *kind_class == class)
+        .map(|(kind, _)| *kind)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn parse_ease(name: Option<&str>) -> Result<Ease> {
@@ -883,6 +997,126 @@ mod tests {
             assert!(
                 format!("{error:#}").contains(expected),
                 "expected \"{expected}\" in: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn sound_step_emits_parseable_osc_777() {
+        let scene: Scene = serde_json::from_str(
+            r#"{
+                "meta": {"title": "t"},
+                "cast": [
+                    {"at": 0.0, "sound": {"ambient": "ambient.hum", "gain": 0.4, "xfade": 0.8}},
+                    {"at": 1.0, "sound": {"play": "chime"}},
+                    {"at": 2.0, "sound": {"play": "click", "gain": 0.5}},
+                    {"at": 3.0, "sound": {"stop": true, "xfade": 0.25}},
+                    {"at": 4.0, "sound": {"stop": true}}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let cast = compile(&scene, Path::new(".")).unwrap();
+        let datas: Vec<&str> = cast.events.iter().map(|event| event.data.as_str()).collect();
+        assert_eq!(
+            datas,
+            [
+                "\x1b]777;ratty:sound.ambient.set;kind=ambient.hum&gain=0.4&xfade=800\x07",
+                "\x1b]777;ratty:sound.play;kind=chime\x07",
+                "\x1b]777;ratty:sound.play;kind=click&gain=0.5\x07",
+                "\x1b]777;ratty:sound.ambient.stop;fade=250\x07",
+                "\x1b]777;ratty:sound.ambient.stop\x07",
+            ]
+        );
+        // Every emitted OSC sequence must parse back through the terminal's
+        // own decoder — the CLI-and-silk-share-osc.rs contract.
+        let commands: Vec<super::osc::RattyAiCommand> = cast
+            .events
+            .iter()
+            .map(|event| {
+                let inner = event
+                    .data
+                    .strip_prefix("\x1b]777;")
+                    .and_then(|s| s.strip_suffix('\x07'))
+                    .expect("well-framed osc");
+                super::osc::parse_command(inner).expect("terminal parses silk's osc")
+            })
+            .collect();
+        assert_eq!(
+            commands,
+            vec![
+                super::osc::RattyAiCommand::SoundAmbientSet {
+                    kind: "ambient.hum".into(),
+                    gain: Some(0.4),
+                    xfade: Some(800),
+                },
+                super::osc::RattyAiCommand::SoundPlay {
+                    kind: "chime".into(),
+                    gain: None,
+                },
+                super::osc::RattyAiCommand::SoundPlay {
+                    kind: "click".into(),
+                    gain: Some(0.5),
+                },
+                super::osc::RattyAiCommand::SoundAmbientStop { fade: Some(250) },
+                super::osc::RattyAiCommand::SoundAmbientStop { fade: None },
+            ]
+        );
+    }
+
+    #[test]
+    fn sound_step_rejects_bad_values() {
+        for (sound_json, expected) in [
+            (r#"{}"#, "exactly one of"),
+            (
+                r#"{"play": "chime", "ambient": "ambient.hum"}"#,
+                "exactly one of",
+            ),
+            (r#"{"play": "boom"}"#, "unknown sound kind"),
+            (r#"{"play": "ambient.hum"}"#, "is an ambient bed"),
+            (r#"{"ambient": "chime"}"#, "is a one-shot"),
+            (r#"{"ambient": "boom"}"#, "unknown sound kind"),
+            (r#"{"play": "chime", "gain": 1.5}"#, "out of range"),
+            (
+                r#"{"play": "chime", "xfade": 0.5}"#,
+                "no effect on a one-shot",
+            ),
+            (r#"{"stop": true, "gain": 0.5}"#, "no effect on stop"),
+            (r#"{"stop": false}"#, "must be true"),
+            (
+                r#"{"ambient": "ambient.hum", "xfade": -1.0}"#,
+                "non-negative",
+            ),
+        ] {
+            let json = format!(
+                r#"{{"meta":{{"title":"t"}},"cast":[{{"at":0.0,"sound":{sound_json}}}]}}"#
+            );
+            let scene: Scene = serde_json::from_str(&json).unwrap();
+            let error = compile(&scene, Path::new(".")).unwrap_err();
+            assert!(
+                format!("{error:#}").contains(expected),
+                "expected \"{expected}\" in: {error:#}"
+            );
+        }
+    }
+
+    /// `deny_unknown_fields` is the airtight form of "registry kinds only,
+    /// never paths/URLs" and "no tok=, no master gain": the fields do not
+    /// exist, so scenes naming them fail to parse at all.
+    #[test]
+    fn sound_args_have_no_path_tok_or_master_fields() {
+        for sound_json in [
+            r#"{"play": "chime", "tok": "a1"}"#,
+            r#"{"play": "chime", "path": "boom.ogg"}"#,
+            r#"{"play": "chime", "url": "https://x/boom.ogg"}"#,
+            r#"{"ambient": "ambient.hum", "master_gain": 1.0}"#,
+        ] {
+            let json = format!(
+                r#"{{"meta":{{"title":"t"}},"cast":[{{"at":0.0,"sound":{sound_json}}}]}}"#
+            );
+            assert!(
+                serde_json::from_str::<Scene>(&json).is_err(),
+                "scene with {sound_json} must fail to parse"
             );
         }
     }
