@@ -14,6 +14,9 @@
 //! - [`sync_inline_objects`]
 //! - [`animate_inline_kitty_planes`]
 //! - [`sync_rgp_objects`]
+//! - [`rebuild_viz_objects`]
+//! - [`sync_viz_objects`]
+//! - [`animate_viz_effects`]
 //! - [`apply_instance_brightness`]
 //! - [`animate_terminal_plane_warp`]
 //! - [`sync_asset_to_terminal_cursor`]
@@ -27,7 +30,7 @@ use std::sync::mpsc::TryRecvError;
 use crate::config::{AppConfig, CURSOR_DEPTH, CursorAnimationConfig};
 use crate::direct_render::DirectTerminalSceneExchange;
 use crate::inline::{
-    InlineKittyPlaneLayout, InlineObject, InlineStyle, RgpAnimationState,
+    InlineAnchor, InlineKittyPlaneLayout, InlineObject, InlineStyle, RgpAnimationState,
     TerminalInlineObjectPlane, TerminalInlineObjectSprite, TerminalInlineObjects,
     TerminalRgpObject,
 };
@@ -45,6 +48,10 @@ use crate::scene::{
 };
 use crate::terminal::{
     TerminalRedrawState, TerminalSurface, TerminalWidget, render_scale_for_window,
+};
+use crate::viz::{
+    QueuedVizEffect, VIZ_EFFECT_SECONDS, VizChildRecord, VizChildSpec, VizEffectAnim,
+    VizEffectKind, VizKeyedItem, VizObjectRoot, VizPaletteSlot, VizRegistry, viz_child_specs,
 };
 use bevy::app::AppExit;
 use bevy::asset::AssetMut;
@@ -1628,6 +1635,599 @@ pub(crate) fn apply_instance_brightness(mut params: BrightnessParams) {
     }
 }
 
+// ── Viz renderers ──
+//
+// The `viz.*` family renders as ordinary Bevy entities, never into the
+// Vello terminal surface: one root entity per visualization id with one
+// small keyed mesh child per snapshot item. Mutations arrive exclusively
+// through the registry's granular rebuild/removal sets — the inline
+// scene-wide dirty flag is never involved, so a snapshot refresh can never
+// respawn a transmission's scene, and `sync_inline_objects`' full sync
+// never touches viz entities (its despawn queries match the inline
+// markers, not [`VizObjectRoot`]).
+
+/// Fraction of its grid cell a viz child occupies horizontally.
+const VIZ_BAR_WIDTH_FRACTION: f32 = 0.8;
+
+/// Minimum bar height as a fraction of the cell, so zero-magnitude items
+/// remain visible (an idle process is still a process).
+const VIZ_BAR_MIN_HEIGHT_FRACTION: f32 = 0.08;
+
+/// Bar depth in the root's normalized space.
+const VIZ_BAR_DEPTH: f32 = 0.8;
+
+/// Grid dimensions (columns, rows) for `count` keyed children: near-square,
+/// never taller than wide, always at least one cell.
+pub(crate) fn viz_grid_dims(count: usize) -> (usize, usize) {
+    if count == 0 {
+        return (1, 1);
+    }
+    let cols = (count as f32).sqrt().ceil().max(1.0) as usize;
+    (cols, count.div_ceil(cols))
+}
+
+/// Root-local rest pose for the child at `index` of `count`: a unit cube
+/// translated and scaled into its grid cell within the root's normalized
+/// `[-0.5, 0.5]` footprint. Bars rise from the cell bottom with height
+/// proportional to the clamped magnitude, so the layout is resolution
+/// independent — the root's per-frame scale is the anchored footprint in
+/// pixels.
+pub(crate) fn viz_child_pose(index: usize, count: usize, magnitude: f32) -> (Vec3, Vec3) {
+    let (grid_cols, grid_rows) = viz_grid_dims(count);
+    let cell_width = 1.0 / grid_cols as f32;
+    let cell_height = 1.0 / grid_rows as f32;
+    let col = index % grid_cols;
+    let row = index / grid_cols;
+    let height = cell_height
+        * (VIZ_BAR_MIN_HEIGHT_FRACTION
+            + (1.0 - 2.0 * VIZ_BAR_MIN_HEIGHT_FRACTION) * magnitude.clamp(0.0, 1.0));
+    let x = -0.5 + (col as f32 + 0.5) * cell_width;
+    let cell_bottom = 0.5 - (row as f32 + 1.0) * cell_height;
+    let y = cell_bottom + cell_height * VIZ_BAR_MIN_HEIGHT_FRACTION * 0.5 + height * 0.5;
+    (
+        Vec3::new(x, y, 0.0),
+        Vec3::new(cell_width * VIZ_BAR_WIDTH_FRACTION, height, VIZ_BAR_DEPTH),
+    )
+}
+
+/// Linear-space blend from `base` toward `flash` by `factor` (clamped).
+fn mix_colors(base: Color, flash: Color, factor: f32) -> Color {
+    let base = base.to_linear();
+    let flash = flash.to_linear();
+    let factor = factor.clamp(0.0, 1.0);
+    Color::linear_rgba(
+        base.red + (flash.red - base.red) * factor,
+        base.green + (flash.green - base.green) * factor,
+        base.blue + (flash.blue - base.blue) * factor,
+        base.alpha + (flash.alpha - base.alpha) * factor,
+    )
+}
+
+/// Smooth one-pulse envelope over normalized time: zero at both ends so an
+/// expiring flash restores the base color seamlessly.
+fn flash_envelope(t: f32) -> f32 {
+    (t.clamp(0.0, 1.0) * std::f32::consts::PI).sin()
+}
+
+/// The animated pose (translation, scale) of a keyed child at normalized
+/// effect time `t` in `0.0..=1.0`, computed from the ledger's base pose —
+/// never incrementally — so animations cannot drift and always end exactly
+/// on the base.
+pub(crate) fn viz_effect_pose(
+    effect: VizEffectKind,
+    base_translation: Vec3,
+    base_scale: Vec3,
+    t: f32,
+) -> (Vec3, Vec3) {
+    let t = t.clamp(0.0, 1.0);
+    match effect {
+        // Shrink to nothing; the child is despawned at expiry.
+        VizEffectKind::Died => (base_translation, base_scale * (1.0 - t)),
+        // A decaying horizontal shake: four oscillations whose amplitude
+        // reaches zero exactly at expiry.
+        VizEffectKind::Survived => {
+            let amplitude = base_scale.x * 0.35 * (1.0 - t);
+            let offset = (t * std::f32::consts::TAU * 4.0).sin() * amplitude;
+            (base_translation + Vec3::X * offset, base_scale)
+        }
+        // One smooth swell back to rest.
+        VizEffectKind::Highlight => (
+            base_translation,
+            base_scale * (1.0 + 0.25 * flash_envelope(t)),
+        ),
+        // Color-only flashes.
+        VizEffectKind::Denied | VizEffectKind::Missing | VizEffectKind::Timeout => {
+            (base_translation, base_scale)
+        }
+    }
+}
+
+/// The animated material color of a keyed child at normalized effect time
+/// `t`, blending the palette `base` toward the effect's flash color. Every
+/// non-`died` envelope is zero at `t = 1.0` so expiry restores the base
+/// color exactly.
+pub(crate) fn viz_effect_color(effect: VizEffectKind, base: Color, t: f32) -> Color {
+    let (flash, strength) = match effect {
+        // Darken in step with the shrink; the child never comes back.
+        VizEffectKind::Died => (Color::srgb(0.05, 0.05, 0.06), t.clamp(0.0, 1.0)),
+        VizEffectKind::Survived => (Color::srgb(1.0, 1.0, 0.95), 0.35 * flash_envelope(t)),
+        VizEffectKind::Denied => (Color::srgb(0.85, 0.20, 0.15), flash_envelope(t)),
+        VizEffectKind::Missing => (Color::srgb(0.55, 0.55, 0.58), flash_envelope(t)),
+        VizEffectKind::Timeout => (Color::srgb(0.85, 0.60, 0.20), flash_envelope(t)),
+        VizEffectKind::Highlight => (Color::srgb(1.0, 1.0, 0.95), 0.6 * flash_envelope(t)),
+    };
+    mix_colors(base, flash, strength)
+}
+
+/// Builds the bespoke material a viz child spawns with. Deliberately NOT
+/// routed through [`apply_instance_brightness`]: children spawn with
+/// [`BrightnessAdjusted`] already set, both because effect animations
+/// rewrite `base_color` in place (a cloned-and-swapped handle would orphan
+/// the ledger's copy) and so the every-frame brightness scan skips them.
+fn viz_child_material(palette: VizPaletteSlot) -> StandardMaterial {
+    StandardMaterial {
+        base_color: palette.color(),
+        emissive: LinearRgba::rgb(0.02, 0.02, 0.02),
+        metallic: 0.0,
+        perceptual_roughness: 0.88,
+        reflectance: 0.18,
+        cull_mode: None,
+        ..default()
+    }
+}
+
+/// Mutable access to keyed children during the rebuild diff.
+type VizChildPoseQuery<'w, 's> =
+    Query<'w, 's, (&'static mut Transform, Option<&'static mut VizEffectAnim>), With<VizKeyedItem>>;
+
+/// Rebuild parameters for the viz renderer.
+#[derive(SystemParam)]
+pub(crate) struct VizRebuildParams<'w, 's> {
+    commands: Commands<'w, 's>,
+    registry: ResMut<'w, VizRegistry>,
+    meshes: ResMut<'w, Assets<Mesh>>,
+    materials: ResMut<'w, Assets<StandardMaterial>>,
+    /// The one shared unit-cube mesh every viz child renders with, created
+    /// lazily and cached for the app's lifetime (rebuilds never allocate
+    /// meshes; per-child variety is all transform and material).
+    unit_mesh: Local<'s, Option<Handle<Mesh>>>,
+    roots: Query<'w, 's, (Entity, &'static mut VizObjectRoot)>,
+    children: VizChildPoseQuery<'w, 's>,
+}
+
+/// Applies queued viz registry work to the entity scene: despawns removed
+/// visualizations, spawns or key-diffs rebuilt ones, and lowers queued
+/// keyed effects onto child animations.
+///
+/// Runs after [`crate::viz::apply_viz_commands`] (and after
+/// `answer_queries`, see [`crate::viz::VizPlugin`]) behind a has-work
+/// `run_if`. Everything here is granular: only the ids in the drained sets
+/// are touched, and within a diffed tree only changed children mutate —
+/// an unchanged key keeps its entity, its material, and any running
+/// animation.
+pub(crate) fn rebuild_viz_objects(mut params: VizRebuildParams) {
+    let VizRebuildParams {
+        commands,
+        registry,
+        meshes,
+        materials,
+        unit_mesh,
+        roots,
+        children,
+    } = &mut params;
+
+    let removals = registry.take_removals();
+    let rebuilds = registry.take_rebuilds();
+
+    let mut root_index: HashMap<u32, Entity> = HashMap::new();
+    for (entity, root) in roots.iter() {
+        if removals.contains(&root.viz_id) {
+            // Despawning the root despawns its keyed children with it.
+            commands.entity(entity).despawn();
+        } else {
+            root_index.insert(root.viz_id, entity);
+        }
+    }
+
+    let unit_mesh = unit_mesh
+        .get_or_insert_with(|| meshes.add(Mesh::from(Cuboid::new(1.0, 1.0, 1.0))))
+        .clone();
+
+    // Ledgers of trees spawned this pass: their `VizObjectRoot` insert is
+    // deferred until the next command flush, so same-frame effect
+    // resolution reads these instead of the root query.
+    let mut fresh: HashMap<u32, HashMap<String, VizChildRecord>> = HashMap::new();
+
+    for id in rebuilds {
+        let Some(entry) = registry.get(id) else {
+            // Unreachable while `remove`/`clear_all` move ids to the
+            // removal set; drop any stale tree rather than render a dead
+            // id.
+            if let Some(entity) = root_index.remove(&id) {
+                commands.entity(entity).despawn();
+            }
+            continue;
+        };
+        let specs = viz_child_specs(&entry.payload);
+        if let Some(&root_entity) = root_index.get(&id) {
+            if let Ok((_, mut root)) = roots.get_mut(root_entity) {
+                diff_viz_children(
+                    &mut root,
+                    root_entity,
+                    &specs,
+                    commands,
+                    children,
+                    materials,
+                    &unit_mesh,
+                );
+            }
+        } else {
+            let (root_entity, ledger) = spawn_viz_tree(commands, id, &specs, materials, &unit_mesh);
+            root_index.insert(id, root_entity);
+            fresh.insert(id, ledger);
+        }
+    }
+
+    // Lower queued effects onto per-child animations. A key the ledger
+    // does not carry renders nothing, by design: a kill racing a snapshot
+    // refresh is not an error.
+    let effect_ids: Vec<u32> = registry
+        .iter()
+        .filter(|(_, entry)| !entry.pending_effects.is_empty())
+        .map(|(id, _)| id)
+        .collect();
+    for id in effect_ids {
+        for QueuedVizEffect { key, effect } in registry.take_pending_effects(id) {
+            let target = if let Some(ledger) = fresh.get(&id) {
+                ledger.get(&key)
+            } else if let Some(&root_entity) = root_index.get(&id) {
+                roots
+                    .get(root_entity)
+                    .ok()
+                    .and_then(|(_, root)| root.children.get(&key))
+            } else {
+                None
+            };
+            let Some(record) = target else {
+                continue;
+            };
+            // Insert-or-replace: a newer effect on the same child restarts
+            // the animation from the ledger's base pose, never from a
+            // mid-animation pose, so repeated effects cannot drift.
+            commands.entity(record.entity).insert(VizEffectAnim {
+                effect,
+                elapsed: 0.0,
+                base_translation: record.base_translation,
+                base_scale: record.base_scale,
+            });
+        }
+    }
+}
+
+/// Spawns a fresh root and keyed children for `viz_id`, returning the root
+/// entity and its child ledger. The root spawns hidden; [`sync_viz_objects`]
+/// places and shows it later the same frame (or leaves it hidden while
+/// unanchored).
+fn spawn_viz_tree(
+    commands: &mut Commands,
+    viz_id: u32,
+    specs: &[VizChildSpec],
+    materials: &mut Assets<StandardMaterial>,
+    unit_mesh: &Handle<Mesh>,
+) -> (Entity, HashMap<String, VizChildRecord>) {
+    let root_entity = commands
+        .spawn((
+            VizObjectRoot {
+                viz_id,
+                children: HashMap::new(),
+            },
+            Transform::default(),
+            Visibility::Hidden,
+        ))
+        .id();
+    let count = specs.len();
+    let mut ledger = HashMap::with_capacity(count);
+    for (index, spec) in specs.iter().enumerate() {
+        // A hostile snapshot may repeat a key; the first occurrence wins
+        // so the ledger and the entity tree cannot diverge.
+        if ledger.contains_key(&spec.key) {
+            continue;
+        }
+        let (translation, scale) = viz_child_pose(index, count, spec.magnitude);
+        let record = spawn_viz_child(
+            commands,
+            root_entity,
+            spec,
+            translation,
+            scale,
+            materials,
+            unit_mesh,
+        );
+        ledger.insert(spec.key.clone(), record);
+    }
+    commands.entity(root_entity).insert(VizObjectRoot {
+        viz_id,
+        children: ledger.clone(),
+    });
+    (root_entity, ledger)
+}
+
+/// Spawns one keyed child mesh under `root_entity` and returns its ledger
+/// record.
+fn spawn_viz_child(
+    commands: &mut Commands,
+    root_entity: Entity,
+    spec: &VizChildSpec,
+    translation: Vec3,
+    scale: Vec3,
+    materials: &mut Assets<StandardMaterial>,
+    unit_mesh: &Handle<Mesh>,
+) -> VizChildRecord {
+    let material = materials.add(viz_child_material(spec.palette));
+    let entity = commands
+        .spawn((
+            Mesh3d(unit_mesh.clone()),
+            MeshMaterial3d(material.clone()),
+            Transform {
+                translation,
+                scale,
+                ..default()
+            },
+            VizKeyedItem {
+                key: spec.key.clone(),
+            },
+            // Bespoke material, deliberately outside the brightness pass —
+            // see `viz_child_material`.
+            BrightnessAdjusted,
+        ))
+        .id();
+    commands.entity(root_entity).add_child(entity);
+    VizChildRecord {
+        entity,
+        material,
+        palette: spec.palette,
+        base_translation: translation,
+        base_scale: scale,
+    }
+}
+
+/// Diffs a live tree against a fresh snapshot by semantic key: unchanged
+/// children keep their entities, palette changes recolor the material in
+/// place, layout changes move the ledger's base pose (and any running
+/// animation's restore target), added keys spawn, and dropped keys
+/// despawn. The despawned children's materials are freed when their last
+/// handle (the ledger record) drops.
+fn diff_viz_children(
+    root: &mut VizObjectRoot,
+    root_entity: Entity,
+    specs: &[VizChildSpec],
+    commands: &mut Commands,
+    children: &mut VizChildPoseQuery<'_, '_>,
+    materials: &mut Assets<StandardMaterial>,
+    unit_mesh: &Handle<Mesh>,
+) {
+    let count = specs.len();
+    let mut retained: HashMap<String, VizChildRecord> = HashMap::with_capacity(count);
+    for (index, spec) in specs.iter().enumerate() {
+        if retained.contains_key(&spec.key) {
+            // Hostile duplicate key: first occurrence wins.
+            continue;
+        }
+        let (translation, scale) = viz_child_pose(index, count, spec.magnitude);
+        if let Some(mut record) = root.children.remove(&spec.key) {
+            if record.palette != spec.palette {
+                record.palette = spec.palette;
+                if let Some(mut material) = materials.get_mut(&record.material) {
+                    material.base_color = spec.palette.color();
+                }
+            }
+            record.base_translation = translation;
+            record.base_scale = scale;
+            if let Ok((mut transform, anim)) = children.get_mut(record.entity) {
+                if let Some(mut anim) = anim {
+                    // Mid-animation: move the restore target; the
+                    // animation keeps writing the transform from it.
+                    anim.base_translation = translation;
+                    anim.base_scale = scale;
+                } else if transform.translation != translation || transform.scale != scale {
+                    transform.translation = translation;
+                    transform.scale = scale;
+                }
+            }
+            retained.insert(spec.key.clone(), record);
+        } else {
+            let record = spawn_viz_child(
+                commands,
+                root_entity,
+                spec,
+                translation,
+                scale,
+                materials,
+                unit_mesh,
+            );
+            retained.insert(spec.key.clone(), record);
+        }
+    }
+    // Keys the new snapshot no longer carries.
+    for record in root.children.values() {
+        commands.entity(record.entity).despawn();
+    }
+    root.children = retained;
+}
+
+/// The [`InlineAnchor`] a viz root lays out with, or `None` when the
+/// visualization must be hidden (no live entry, or anchored nowhere —
+/// unplaced or scrolled fully off the top).
+fn viz_root_anchor(registry: &VizRegistry, viz_id: u32) -> Option<InlineAnchor> {
+    let anchor = registry.get(viz_id)?.anchor?;
+    Some(InlineAnchor {
+        row: anchor.row,
+        col: anchor.col,
+        columns: u32::from(anchor.cols),
+        rows: u32::from(anchor.rows),
+        style: InlineStyle::default(),
+    })
+}
+
+/// The terminal plane transform, disjoint from viz roots.
+type VizPlaneQuery<'w, 's> =
+    Query<'w, 's, &'static Transform, (With<TerminalPlane>, Without<VizObjectRoot>)>;
+
+/// One running keyed-effect animation with everything the animator needs.
+type VizAnimatedQuery<'w, 's> = Query<
+    'w,
+    's,
+    (
+        Entity,
+        &'static ChildOf,
+        &'static VizKeyedItem,
+        &'static mut Transform,
+        &'static mut VizEffectAnim,
+        &'static MeshMaterial3d<StandardMaterial>,
+    ),
+>;
+
+/// Per-frame positioning parameters for viz roots.
+#[derive(SystemParam)]
+pub(crate) struct VizSyncParams<'w, 's> {
+    registry: Res<'w, VizRegistry>,
+    terminal: Res<'w, TerminalSurface>,
+    viewport: Res<'w, TerminalViewport>,
+    presentation: Res<'w, TerminalPresentation>,
+    mobius_transition: Res<'w, MobiusTransition>,
+    plane_warp: Res<'w, TerminalPlaneWarp>,
+    time: Res<'w, Time>,
+    plane_query: VizPlaneQuery<'w, 's>,
+    roots: Query<
+        'w,
+        's,
+        (
+            &'static VizObjectRoot,
+            &'static mut Transform,
+            &'static mut Visibility,
+        ),
+    >,
+}
+
+/// Positions every viz root from its registry anchor, per frame, the
+/// [`sync_rgp_objects`] way: anchor → [`inline_layout`] → screen space in
+/// [`TerminalPresentationMode::Flat2d`], or projected onto the active
+/// terminal surface in the 3D modes. A visualization with no anchor (never
+/// placed, or scrolled fully off the top) is hidden, payload intact, until
+/// a later placing `viz.set` re-anchors it.
+///
+/// The root's scale is the anchored footprint in pixels; children lay out
+/// in the root's normalized space ([`viz_child_pose`]), so a resize or
+/// warp needs no child updates.
+pub(crate) fn sync_viz_objects(mut params: VizSyncParams) {
+    let VizSyncParams {
+        registry,
+        terminal,
+        viewport,
+        presentation,
+        mobius_transition,
+        plane_warp,
+        time,
+        plane_query,
+        roots,
+    } = &mut params;
+    let cell_width = viewport.size.x / terminal.cols.max(1) as f32;
+    let cell_height = viewport.size.y / terminal.rows.max(1) as f32;
+    let elapsed_secs = time.elapsed_secs();
+    let mobius_progress = active_mobius_progress(presentation.mode, mobius_transition);
+
+    for (root, mut transform, mut visibility) in roots.iter_mut() {
+        let Some(anchor) = viz_root_anchor(registry, root.viz_id) else {
+            *visibility = Visibility::Hidden;
+            continue;
+        };
+        let layout = inline_layout(&anchor, terminal, viewport, cell_width, cell_height);
+        let scale = Vec3::new(
+            layout.pixel_width.max(1.0),
+            layout.pixel_height.max(1.0),
+            cell_height.max(1.0),
+        );
+        match presentation.mode {
+            TerminalPresentationMode::Flat2d => {
+                transform.translation = Vec3::new(layout.center_x, layout.center_y, CURSOR_DEPTH);
+                transform.rotation = Quat::IDENTITY;
+                transform.scale = scale;
+                *visibility = Visibility::Visible;
+            }
+            TerminalPresentationMode::Plane3d | TerminalPresentationMode::Mobius3d => {
+                let Ok(plane_transform) = plane_query.single() else {
+                    *visibility = Visibility::Hidden;
+                    continue;
+                };
+                let local_position = plane_surface_point(
+                    presentation.mode,
+                    layout.local_x,
+                    layout.local_y,
+                    plane_warp.amount,
+                    elapsed_secs,
+                    8.0,
+                    mobius_progress,
+                );
+                transform.translation = plane_transform.transform_point(local_position);
+                transform.rotation = plane_transform.rotation;
+                transform.scale = scale;
+                *visibility = Visibility::Visible;
+            }
+        }
+    }
+}
+
+/// Advances every running keyed-effect animation and expires it after
+/// [`VIZ_EFFECT_SECONDS`]: `died` despawns the child and drops its ledger
+/// entry (until a later snapshot re-adds the key); every other effect
+/// restores the ledger's base pose and palette color exactly. Poses and
+/// colors are computed from the animation's stored base each frame, never
+/// incrementally, so a hostile effect stream cannot accumulate drift.
+pub(crate) fn animate_viz_effects(
+    time: Res<Time>,
+    mut commands: Commands,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut roots: Query<&mut VizObjectRoot>,
+    mut animated: VizAnimatedQuery,
+) {
+    let delta = time.delta_secs();
+    for (entity, child_of, keyed, mut transform, mut anim, material) in animated.iter_mut() {
+        anim.elapsed += delta;
+        let palette = roots
+            .get(child_of.parent())
+            .ok()
+            .and_then(|root| root.children.get(&keyed.key))
+            .map(|record| record.palette)
+            .unwrap_or(VizPaletteSlot::Neutral);
+        if anim.elapsed >= VIZ_EFFECT_SECONDS {
+            if anim.effect == VizEffectKind::Died {
+                // Confirmed gone: drop the child until a later snapshot
+                // re-adds the key.
+                if let Ok(mut root) = roots.get_mut(child_of.parent()) {
+                    root.children.remove(&keyed.key);
+                }
+                commands.entity(entity).despawn();
+            } else {
+                transform.translation = anim.base_translation;
+                transform.scale = anim.base_scale;
+                if let Some(mut material) = materials.get_mut(&material.0) {
+                    material.base_color = palette.color();
+                }
+                commands.entity(entity).remove::<VizEffectAnim>();
+            }
+            continue;
+        }
+        let t = anim.elapsed / VIZ_EFFECT_SECONDS;
+        let (translation, scale) =
+            viz_effect_pose(anim.effect, anim.base_translation, anim.base_scale, t);
+        transform.translation = translation;
+        transform.scale = scale;
+        if let Some(mut material) = materials.get_mut(&material.0) {
+            material.base_color = viz_effect_color(anim.effect, palette.color(), t);
+        }
+    }
+}
+
 fn extrude_mesh(mesh: Mesh, depth: f32) -> Mesh {
     if depth <= 0.0 {
         return mesh;
@@ -2193,4 +2793,425 @@ fn mobius_surface_point(
         ring * angle.sin(),
         width * sin_half * 320.0 + depth_offset,
     )
+}
+
+#[cfg(test)]
+mod viz_render_tests {
+    use super::*;
+    use crate::viz::{PsItem, PsV1, VizAnchor, VizCapture, VizPayload};
+    use std::time::Duration;
+
+    const ID: u32 = 0x8000_0001;
+
+    fn ps_payload(items: &[(u32, f32, &str)]) -> VizPayload {
+        VizPayload::Ps(PsV1 {
+            capture: VizCapture {
+                source: "test/synthetic".to_string(),
+                ts: "2026-07-22T00:00:00Z".to_string(),
+            },
+            items: items
+                .iter()
+                .map(|(pid, cpu, state)| PsItem {
+                    pid: *pid,
+                    name: format!("proc{pid}"),
+                    cpu: *cpu,
+                    mem: 0,
+                    state: (*state).to_string(),
+                })
+                .collect(),
+        })
+    }
+
+    fn test_app() -> App {
+        let mut app = App::new();
+        app.init_resource::<VizRegistry>();
+        app.init_resource::<Assets<Mesh>>();
+        app.init_resource::<Assets<StandardMaterial>>();
+        app.init_resource::<Time>();
+        // The runtime order: rebuild (spawn/diff/effect lowering), then the
+        // animation pass, with a command flush between them.
+        app.add_systems(Update, (rebuild_viz_objects, animate_viz_effects).chain());
+        app
+    }
+
+    fn registry_mut(app: &mut App) -> Mut<'_, VizRegistry> {
+        app.world_mut().resource_mut::<VizRegistry>()
+    }
+
+    fn keyed_children(app: &mut App) -> HashMap<String, Entity> {
+        let world = app.world_mut();
+        let mut query = world.query::<(Entity, &VizKeyedItem)>();
+        query
+            .iter(world)
+            .map(|(entity, keyed)| (keyed.key.clone(), entity))
+            .collect()
+    }
+
+    fn root_entity(app: &mut App, id: u32) -> Option<Entity> {
+        let world = app.world_mut();
+        let mut query = world.query::<(Entity, &VizObjectRoot)>();
+        query
+            .iter(world)
+            .find(|(_, root)| root.viz_id == id)
+            .map(|(entity, _)| entity)
+    }
+
+    fn ledger(app: &mut App, id: u32) -> HashMap<String, VizChildRecord> {
+        let world = app.world_mut();
+        let mut query = world.query::<&VizObjectRoot>();
+        query
+            .iter(world)
+            .find(|root| root.viz_id == id)
+            .map(|root| root.children.clone())
+            .unwrap_or_default()
+    }
+
+    fn material_count(app: &App) -> usize {
+        app.world()
+            .resource::<Assets<StandardMaterial>>()
+            .iter()
+            .count()
+    }
+
+    fn mesh_count(app: &App) -> usize {
+        app.world().resource::<Assets<Mesh>>().iter().count()
+    }
+
+    /// Advances the clock by `seconds` and runs one frame.
+    fn advance(app: &mut App, seconds: f32) {
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(Duration::from_secs_f32(seconds));
+        app.update();
+    }
+
+    // ── Diff logic ──
+
+    #[test]
+    fn diff_keeps_unchanged_children_and_touches_only_changes() {
+        let mut app = test_app();
+        registry_mut(&mut app).upsert(
+            ID,
+            ps_payload(&[(1, 50.0, "running"), (2, 10.0, "sleeping")]),
+            None,
+        );
+        app.update();
+        let first = keyed_children(&mut app);
+        assert_eq!(first.len(), 2);
+        assert_eq!(mesh_count(&app), 1, "one shared unit mesh for everything");
+        assert_eq!(material_count(&app), 2, "one bespoke material per child");
+
+        // A watcher refresh: pid 2 gone, pid 3 new, pid 1 unchanged.
+        registry_mut(&mut app).upsert(
+            ID,
+            ps_payload(&[(1, 50.0, "running"), (3, 5.0, "sleeping")]),
+            None,
+        );
+        app.update();
+        let second = keyed_children(&mut app);
+        assert_eq!(second.len(), 2);
+        assert_eq!(
+            second.get("1"),
+            first.get("1"),
+            "an unchanged key keeps its entity"
+        );
+        assert!(second.contains_key("3"));
+        assert!(
+            app.world().get_entity(first["2"]).is_err(),
+            "the dropped key's child despawned"
+        );
+        assert_eq!(mesh_count(&app), 1, "rebuilds never allocate meshes");
+        assert_eq!(
+            material_count(&app),
+            3,
+            "only the added child allocated a material"
+        );
+
+        // An identical refresh is a no-op on the tree.
+        registry_mut(&mut app).upsert(
+            ID,
+            ps_payload(&[(1, 50.0, "running"), (3, 5.0, "sleeping")]),
+            None,
+        );
+        app.update();
+        assert_eq!(keyed_children(&mut app), second);
+        assert_eq!(material_count(&app), 3);
+    }
+
+    #[test]
+    fn palette_change_recolors_the_material_in_place() {
+        let mut app = test_app();
+        registry_mut(&mut app).upsert(ID, ps_payload(&[(1, 50.0, "running")]), None);
+        app.update();
+        let before = ledger(&mut app, ID)["1"].clone();
+        assert_eq!(before.palette, VizPaletteSlot::Active);
+
+        registry_mut(&mut app).upsert(ID, ps_payload(&[(1, 50.0, "zombie")]), None);
+        app.update();
+        let after = ledger(&mut app, ID)["1"].clone();
+        assert_eq!(after.entity, before.entity, "same entity");
+        assert_eq!(after.material, before.material, "same material handle");
+        assert_eq!(after.palette, VizPaletteSlot::Alert);
+        let materials = app.world().resource::<Assets<StandardMaterial>>();
+        let material = materials.get(&after.material).expect("material lives");
+        assert_eq!(material.base_color, VizPaletteSlot::Alert.color());
+        assert_eq!(material_count(&app), 1, "recolored, not reallocated");
+    }
+
+    #[test]
+    fn removal_and_reset_despawn_whole_trees() {
+        let mut app = test_app();
+        registry_mut(&mut app).upsert(ID, ps_payload(&[(1, 50.0, "running")]), None);
+        registry_mut(&mut app).upsert(ID + 1, ps_payload(&[(2, 10.0, "sleeping")]), None);
+        app.update();
+        assert!(root_entity(&mut app, ID).is_some());
+        assert!(root_entity(&mut app, ID + 1).is_some());
+
+        assert!(registry_mut(&mut app).remove(ID));
+        app.update();
+        assert!(
+            root_entity(&mut app, ID).is_none(),
+            "removed tree despawned"
+        );
+        assert!(
+            root_entity(&mut app, ID + 1).is_some(),
+            "the other tree is untouched"
+        );
+        assert_eq!(keyed_children(&mut app).len(), 1);
+
+        registry_mut(&mut app).clear_all();
+        app.update();
+        assert!(
+            root_entity(&mut app, ID + 1).is_none(),
+            "reset despawns everything"
+        );
+        assert!(keyed_children(&mut app).is_empty());
+    }
+
+    // ── Effect expiry ──
+
+    #[test]
+    fn died_effect_shrinks_then_removes_the_child_until_the_next_snapshot() {
+        let mut app = test_app();
+        registry_mut(&mut app).upsert(ID, ps_payload(&[(1, 50.0, "running")]), None);
+        app.update();
+        let child = keyed_children(&mut app)["1"];
+        let base_scale = ledger(&mut app, ID)["1"].base_scale;
+
+        assert!(registry_mut(&mut app).queue_effect(ID, "1".to_string(), VizEffectKind::Died));
+        app.update();
+        assert!(
+            app.world().get::<VizEffectAnim>(child).is_some(),
+            "the effect lowered onto the child"
+        );
+
+        advance(&mut app, VIZ_EFFECT_SECONDS * 0.5);
+        let transform = app
+            .world()
+            .get::<Transform>(child)
+            .expect("alive mid-animation");
+        assert!(
+            (transform.scale - base_scale * 0.5).length() < 1e-4,
+            "halfway through the shrink"
+        );
+
+        advance(&mut app, VIZ_EFFECT_SECONDS);
+        assert!(
+            app.world().get_entity(child).is_err(),
+            "the died child despawned at expiry"
+        );
+        assert!(
+            !ledger(&mut app, ID).contains_key("1"),
+            "its ledger entry dropped with it"
+        );
+        assert!(root_entity(&mut app, ID).is_some(), "the root survives");
+
+        // A later snapshot honestly re-adds the key.
+        registry_mut(&mut app).upsert(ID, ps_payload(&[(1, 50.0, "running")]), None);
+        app.update();
+        assert!(keyed_children(&mut app).contains_key("1"));
+    }
+
+    #[test]
+    fn non_died_effects_expire_restoring_base_pose_and_color() {
+        let mut app = test_app();
+        registry_mut(&mut app).upsert(ID, ps_payload(&[(1, 50.0, "running")]), None);
+        app.update();
+        let child = keyed_children(&mut app)["1"];
+        let record = ledger(&mut app, ID)["1"].clone();
+
+        assert!(registry_mut(&mut app).queue_effect(ID, "1".to_string(), VizEffectKind::Highlight));
+        app.update();
+        advance(&mut app, VIZ_EFFECT_SECONDS * 0.5);
+        let transform = app.world().get::<Transform>(child).expect("alive");
+        assert!(
+            transform.scale != record.base_scale,
+            "mid-pulse the child is swollen"
+        );
+        let materials = app.world().resource::<Assets<StandardMaterial>>();
+        let mid_color = materials.get(&record.material).expect("lives").base_color;
+        assert_ne!(
+            mid_color,
+            VizPaletteSlot::Active.color(),
+            "mid-flash the color moved"
+        );
+
+        advance(&mut app, VIZ_EFFECT_SECONDS);
+        assert!(
+            app.world().get::<VizEffectAnim>(child).is_none(),
+            "the animation expired"
+        );
+        let transform = app.world().get::<Transform>(child).expect("alive");
+        assert_eq!(transform.translation, record.base_translation);
+        assert_eq!(transform.scale, record.base_scale);
+        let materials = app.world().resource::<Assets<StandardMaterial>>();
+        let color = materials.get(&record.material).expect("lives").base_color;
+        assert_eq!(
+            color,
+            VizPaletteSlot::Active.color(),
+            "the palette color is restored exactly"
+        );
+    }
+
+    #[test]
+    fn effects_on_absent_keys_drain_and_render_nothing() {
+        let mut app = test_app();
+        registry_mut(&mut app).upsert(ID, ps_payload(&[(1, 50.0, "running")]), None);
+        app.update();
+        assert!(registry_mut(&mut app).queue_effect(ID, "999".to_string(), VizEffectKind::Died));
+        app.update();
+        {
+            let world = app.world_mut();
+            let mut query = world.query::<&VizEffectAnim>();
+            assert_eq!(query.iter(world).count(), 0, "nothing animates");
+        }
+        assert!(
+            registry_mut(&mut app)
+                .get(ID)
+                .expect("live")
+                .pending_effects
+                .is_empty(),
+            "the queue still drained"
+        );
+    }
+
+    #[test]
+    fn a_same_frame_set_and_effect_lands_on_the_fresh_tree() {
+        let mut app = test_app();
+        {
+            let mut registry = registry_mut(&mut app);
+            registry.upsert(ID, ps_payload(&[(1, 50.0, "running")]), None);
+            assert!(registry.queue_effect(ID, "1".to_string(), VizEffectKind::Highlight));
+        }
+        app.update();
+        let child = keyed_children(&mut app)["1"];
+        assert!(
+            app.world().get::<VizEffectAnim>(child).is_some(),
+            "the effect resolved against the just-spawned ledger"
+        );
+    }
+
+    // ── Anchor visibility ──
+
+    #[test]
+    fn viz_root_anchor_hides_unplaced_and_dead_visualizations() {
+        let mut registry = VizRegistry::default();
+        assert!(
+            viz_root_anchor(&registry, ID).is_none(),
+            "no entry means hidden"
+        );
+        registry.upsert(ID, ps_payload(&[(1, 50.0, "running")]), None);
+        assert!(
+            viz_root_anchor(&registry, ID).is_none(),
+            "unplaced stays hidden"
+        );
+        registry.upsert(
+            ID,
+            ps_payload(&[(1, 50.0, "running")]),
+            Some(VizAnchor {
+                row: 5,
+                col: 3,
+                cols: 10,
+                rows: 4,
+            }),
+        );
+        let anchor = viz_root_anchor(&registry, ID).expect("anchored");
+        assert_eq!(
+            (anchor.row, anchor.col, anchor.columns, anchor.rows),
+            (5, 3, 10, 4)
+        );
+        // Scrolled fully off the top: anchor dropped, payload kept, hidden.
+        registry.apply_scroll(20);
+        assert!(registry.get(ID).is_some(), "the payload survives");
+        assert!(viz_root_anchor(&registry, ID).is_none());
+    }
+
+    // ── Pure vocabulary ──
+
+    #[test]
+    fn grid_poses_stay_inside_the_footprint_and_scale_with_magnitude() {
+        for count in [1usize, 2, 5, 9, 17, 256] {
+            let (cols, rows) = viz_grid_dims(count);
+            assert!(cols * rows >= count, "{count} items fit");
+            assert!(cols >= rows, "wider than tall");
+            for index in 0..count {
+                let (translation, scale) = viz_child_pose(index, count, 0.7);
+                assert!(translation.x - scale.x * 0.5 >= -0.5 - 1e-4);
+                assert!(translation.x + scale.x * 0.5 <= 0.5 + 1e-4);
+                assert!(translation.y - scale.y * 0.5 >= -0.5 - 1e-4);
+                assert!(translation.y + scale.y * 0.5 <= 0.5 + 1e-4);
+            }
+        }
+        let (_, low) = viz_child_pose(0, 4, 0.0);
+        let (_, high) = viz_child_pose(0, 4, 1.0);
+        assert!(high.y > low.y, "magnitude drives bar height");
+        assert!(low.y > 0.0, "zero magnitude keeps a visible sliver");
+    }
+
+    #[test]
+    fn effect_poses_and_colors_end_exactly_on_the_base() {
+        fn linear_distance(a: Color, b: Color) -> f32 {
+            let a = a.to_linear();
+            let b = b.to_linear();
+            (a.red - b.red)
+                .abs()
+                .max((a.green - b.green).abs())
+                .max((a.blue - b.blue).abs())
+        }
+        let base_translation = Vec3::new(0.1, -0.2, 0.0);
+        let base_scale = Vec3::new(0.4, 0.6, 0.8);
+        let base_color = VizPaletteSlot::Active.color();
+        for effect in [
+            VizEffectKind::Survived,
+            VizEffectKind::Denied,
+            VizEffectKind::Missing,
+            VizEffectKind::Timeout,
+            VizEffectKind::Highlight,
+        ] {
+            let (translation, scale) = viz_effect_pose(effect, base_translation, base_scale, 1.0);
+            assert!(
+                (translation - base_translation).length() < 1e-4,
+                "{} ends on the base translation",
+                effect.name()
+            );
+            assert!(
+                (scale - base_scale).length() < 1e-3,
+                "{} ends on the base scale",
+                effect.name()
+            );
+            assert!(
+                linear_distance(viz_effect_color(effect, base_color, 1.0), base_color) < 1e-4,
+                "{} ends on the base color",
+                effect.name()
+            );
+            assert!(
+                linear_distance(viz_effect_color(effect, base_color, 0.0), base_color) < 1e-4,
+                "{} starts on the base color",
+                effect.name()
+            );
+        }
+        let (_, died_scale) =
+            viz_effect_pose(VizEffectKind::Died, base_translation, base_scale, 1.0);
+        assert_eq!(died_scale, Vec3::ZERO, "died shrinks to nothing");
+    }
 }

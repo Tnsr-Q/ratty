@@ -82,6 +82,12 @@ pub const MAX_VIZ_PER_NAMESPACE: usize = 32;
 /// (newest wins; effects are ephemeral presentation, not state).
 pub const MAX_VIZ_PENDING_EFFECTS: usize = 16;
 
+/// Seconds a `viz.effect` animation runs before it expires on its own.
+/// Effects are bounded presentation, never state: every animation restores
+/// (or, for `died`, removes) its child after exactly this long, so a
+/// hostile effect stream cannot pin a child in a mutated pose.
+pub const VIZ_EFFECT_SECONDS: f32 = 0.8;
+
 /// Default footprint width in cells when `viz.set` places an anchor
 /// without `cols=`.
 pub const DEFAULT_VIZ_COLUMNS: u16 = 24;
@@ -475,6 +481,216 @@ pub struct QueuedVizEffect {
     pub effect: VizEffectKind,
 }
 
+// ── Render vocabulary ──
+//
+// The v1 vocabulary is deliberately small: every kind lowers onto keyed
+// grid cells (one small mesh per item) with a normalized magnitude and a
+// palette slot. M3.6 grows real chart kinds on the same substrate.
+
+/// The fixed material palette viz children draw from. Slots are semantic
+/// (what the color *means*), so every kind maps states onto the same
+/// small, consistent set instead of inventing per-kind colors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VizPaletteSlot {
+    /// Actively doing work / the current selection (running process,
+    /// checked-out branch, interface that is up).
+    Active,
+    /// Alive but idle (sleeping process).
+    Idle,
+    /// A state worth attention (zombie/stopped process, interface down).
+    Alert,
+    /// A container of other things (directory).
+    Container,
+    /// No particular state (file, unrecognized process state).
+    Neutral,
+}
+
+impl VizPaletteSlot {
+    /// The slot's base color.
+    pub fn color(self) -> Color {
+        match self {
+            Self::Active => Color::srgb(0.45, 0.75, 0.45),
+            Self::Idle => Color::srgb(0.45, 0.55, 0.70),
+            Self::Alert => Color::srgb(0.80, 0.35, 0.30),
+            Self::Container => Color::srgb(0.80, 0.65, 0.30),
+            Self::Neutral => Color::srgb(0.62, 0.62, 0.66),
+        }
+    }
+}
+
+/// One snapshot item lowered onto the shared grid-render vocabulary: a
+/// stable domain key, a normalized magnitude, and a palette slot.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VizChildSpec {
+    /// The item's stable semantic key (pid / path / branch / iface as a
+    /// string) — the same key `viz.effect` targets.
+    pub key: String,
+    /// Magnitude in `0.0..=1.0`, normalized *within the snapshot* (the
+    /// tallest bar is the snapshot's largest item, not an absolute unit).
+    pub magnitude: f32,
+    /// The semantic palette slot for the item's state.
+    pub palette: VizPaletteSlot,
+}
+
+/// Lowers a decoded payload onto the shared grid vocabulary, in item
+/// order. Magnitudes are normalized within the snapshot (cpu for `ps`,
+/// log-scaled size for `fs`, log-scaled rx+tx for `net`; `git` branches
+/// weight the checked-out branch over the rest).
+pub fn viz_child_specs(payload: &VizPayload) -> Vec<VizChildSpec> {
+    match payload {
+        VizPayload::Ps(ps) => {
+            let max_cpu = ps
+                .items
+                .iter()
+                .map(|item| item.cpu)
+                .fold(0.0_f32, f32::max)
+                .max(f32::EPSILON);
+            ps.items
+                .iter()
+                .map(|item| VizChildSpec {
+                    key: item.pid.to_string(),
+                    magnitude: (item.cpu / max_cpu).clamp(0.0, 1.0),
+                    palette: ps_state_palette(&item.state),
+                })
+                .collect()
+        }
+        VizPayload::Fs(fs) => {
+            let max_size = fs.items.iter().map(|item| item.size).max().unwrap_or(0);
+            fs.items
+                .iter()
+                .map(|item| VizChildSpec {
+                    key: item.path.clone(),
+                    magnitude: log_normalized(item.size, max_size),
+                    palette: match item.kind {
+                        FsEntryKind::Dir => VizPaletteSlot::Container,
+                        FsEntryKind::File => VizPaletteSlot::Neutral,
+                    },
+                })
+                .collect()
+        }
+        VizPayload::Git(git) => git
+            .branches
+            .iter()
+            .map(|branch| VizChildSpec {
+                key: branch.name.clone(),
+                magnitude: if branch.current { 1.0 } else { 0.55 },
+                palette: if branch.current {
+                    VizPaletteSlot::Active
+                } else {
+                    VizPaletteSlot::Neutral
+                },
+            })
+            .collect(),
+        VizPayload::Net(net) => {
+            let max_total = net
+                .items
+                .iter()
+                .map(|item| item.rx_bytes.saturating_add(item.tx_bytes))
+                .max()
+                .unwrap_or(0);
+            net.items
+                .iter()
+                .map(|item| VizChildSpec {
+                    key: item.iface.clone(),
+                    magnitude: log_normalized(
+                        item.rx_bytes.saturating_add(item.tx_bytes),
+                        max_total,
+                    ),
+                    palette: if item.up {
+                        VizPaletteSlot::Active
+                    } else {
+                        VizPaletteSlot::Alert
+                    },
+                })
+                .collect()
+        }
+    }
+}
+
+/// Maps a process scheduler-state tag onto the palette.
+fn ps_state_palette(state: &str) -> VizPaletteSlot {
+    let lower = state.to_ascii_lowercase();
+    if lower.starts_with("run") {
+        VizPaletteSlot::Active
+    } else if lower.starts_with("zombie") || lower.starts_with("stop") || lower.starts_with("dead")
+    {
+        VizPaletteSlot::Alert
+    } else if lower.is_empty() {
+        VizPaletteSlot::Neutral
+    } else {
+        VizPaletteSlot::Idle
+    }
+}
+
+/// Log-scale normalization for byte magnitudes: `ln(1+value)/ln(1+max)`,
+/// so a snapshot mixing kilobytes and gigabytes still shows the small
+/// items instead of flattening them against the largest.
+fn log_normalized(value: u64, max: u64) -> f32 {
+    let denominator = ((max as f64) + 1.0).ln();
+    if denominator <= f64::EPSILON {
+        return 0.0;
+    }
+    ((((value as f64) + 1.0).ln() / denominator) as f32).clamp(0.0, 1.0)
+}
+
+// ── Render components ──
+
+/// Root entity of one visualization's render tree, keyed by viz id, with
+/// the live child ledger the renderer diffs snapshots against (the
+/// handle-caching-in-state pattern the inline objects use).
+#[derive(Component)]
+pub struct VizObjectRoot {
+    /// The visualization id this root renders.
+    pub viz_id: u32,
+    /// Live keyed children: semantic key → child record. Snapshot
+    /// refreshes diff against this map so only changed children respawn.
+    pub(crate) children: HashMap<String, VizChildRecord>,
+}
+
+/// One live keyed child of a viz root: its entity plus the cached
+/// material handle, current palette slot, and base pose. The ledger is the
+/// single source of truth for a child's rest pose — effect animations copy
+/// it at start and restore it on expiry, so a rebuild that re-lays-out a
+/// mid-animation child updates the restore target, never the drifting
+/// animated transform.
+#[derive(Debug, Clone)]
+pub(crate) struct VizChildRecord {
+    /// The child mesh entity.
+    pub(crate) entity: Entity,
+    /// The child's bespoke material (mutated in place on state changes
+    /// and during effect animations; freed when the handle drops).
+    pub(crate) material: Handle<StandardMaterial>,
+    /// The palette slot the material currently shows.
+    pub(crate) palette: VizPaletteSlot,
+    /// Root-local rest translation from the grid layout.
+    pub(crate) base_translation: Vec3,
+    /// Root-local rest scale from the grid layout.
+    pub(crate) base_scale: Vec3,
+}
+
+/// The semantic key a viz child renders — carried on the child so effect
+/// expiry can clean the parent ledger without a reverse lookup.
+#[derive(Component)]
+pub struct VizKeyedItem {
+    /// The domain key (pid / path / branch / iface as a string).
+    pub key: String,
+}
+
+/// A running keyed-effect animation. Inserted when the renderer drains a
+/// queued effect, advanced every frame, and removed (restoring the base
+/// pose) after [`VIZ_EFFECT_SECONDS`]; `died` despawns the child instead.
+#[derive(Component)]
+pub struct VizEffectAnim {
+    /// The registered effect being animated.
+    pub effect: VizEffectKind,
+    /// Seconds since the animation started.
+    pub elapsed: f32,
+    /// Child translation restored on expiry.
+    pub base_translation: Vec3,
+    /// Child scale restored on expiry.
+    pub base_scale: Vec3,
+}
+
 // ── Registry ──
 
 /// Grid anchor for a visualization: top-left cell plus footprint extent.
@@ -633,9 +849,12 @@ impl VizRegistry {
         self.rebuild.clear();
     }
 
-    /// Drains ids whose render trees must be (re)built from the current
-    /// entry state. Renderer contract: despawn any existing tree for the
-    /// id, then spawn from [`VizRegistry::get`].
+    /// Drains ids whose render trees must be rebuilt from the current
+    /// entry state. Renderer contract: an id with no existing tree spawns
+    /// one from [`VizRegistry::get`]; an id with a live tree is *diffed*
+    /// by semantic key — unchanged children keep their entities, changed
+    /// children mutate in place, and only added/dropped keys spawn or
+    /// despawn.
     pub fn take_rebuilds(&mut self) -> HashSet<u32> {
         std::mem::take(&mut self.rebuild)
     }
@@ -645,6 +864,26 @@ impl VizRegistry {
     /// re-added before the renderer ran lands only in the rebuild set.
     pub fn take_removals(&mut self) -> HashSet<u32> {
         std::mem::take(&mut self.removed)
+    }
+
+    /// Whether the rebuild pass has queued work: pending rebuilds,
+    /// removals, or undrained effects. The renderer's `run_if` gate, so
+    /// idle frames skip the pass entirely.
+    pub fn has_render_work(&self) -> bool {
+        !self.rebuild.is_empty()
+            || !self.removed.is_empty()
+            || self
+                .entries
+                .values()
+                .any(|entry| !entry.pending_effects.is_empty())
+    }
+
+    /// Drains the queued effects for `id` (empty when the id is dead).
+    pub(crate) fn take_pending_effects(&mut self, id: u32) -> VecDeque<QueuedVizEffect> {
+        self.entries
+            .get_mut(&id)
+            .map(|entry| std::mem::take(&mut entry.pending_effects))
+            .unwrap_or_default()
     }
 
     /// Applies upward terminal scroll to anchors, mirroring the inline
@@ -675,21 +914,55 @@ impl VizRegistry {
 
 // ── Plugin & applier ──
 
-/// Registers the [`VizRegistry`] and the `viz.*` command applier.
+/// Registers the [`VizRegistry`], the `viz.*` command applier, and the
+/// renderer systems.
 ///
 /// The applier runs after `pump_pty_output` so commands apply the frame
 /// they arrive, and `answer_queries` is ordered after it (see
 /// [`crate::ai::RattyAiPlugin`]) so a same-chunk write-then-read observes
-/// the write. The per-kind renderer (`sync_viz_objects`) orders itself
-/// after this applier when it lands.
+/// the write. The renderer is three systems in `crate::systems`, each with
+/// its own `run_if` so idle frames cost nothing:
+///
+/// - `rebuild_viz_objects` (after the applier *and* after
+///   `answer_queries`, so a same-chunk `state.viz` still sees queued
+///   effects) drains the granular rebuild/removal sets and queued effects
+///   — never a scene-wide dirty flag — spawning/despawning roots and
+///   diffing keyed children.
+/// - `sync_viz_objects` (after the rebuild pass, so same-frame spawns are
+///   positioned at once) places every root from its anchor per frame.
+/// - `animate_viz_effects` advances and expires effect animations.
 pub struct VizPlugin;
 
 impl Plugin for VizPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<VizRegistry>().add_systems(
-            Update,
-            apply_viz_commands.after(crate::systems::pump_pty_output),
-        );
+        app.init_resource::<VizRegistry>()
+            .add_systems(
+                Update,
+                apply_viz_commands.after(crate::systems::pump_pty_output),
+            )
+            .add_systems(
+                Update,
+                // After `answer_queries` as well: the rebuild pass drains
+                // each entry's pending-effect queue, and a same-chunk
+                // `viz.effect` + `state.viz` must observe the queued
+                // effect before the renderer consumes it.
+                crate::systems::rebuild_viz_objects
+                    .after(apply_viz_commands)
+                    .after(crate::query_channel::answer_queries)
+                    .run_if(|registry: Res<VizRegistry>| registry.has_render_work()),
+            )
+            .add_systems(
+                Update,
+                crate::systems::sync_viz_objects
+                    .after(crate::systems::rebuild_viz_objects)
+                    .run_if(|roots: Query<(), With<VizObjectRoot>>| !roots.is_empty()),
+            )
+            .add_systems(
+                Update,
+                crate::systems::animate_viz_effects
+                    .after(crate::systems::rebuild_viz_objects)
+                    .run_if(|animated: Query<(), With<VizEffectAnim>>| !animated.is_empty()),
+            );
     }
 }
 
@@ -801,9 +1074,7 @@ pub fn apply_viz_commands(
                     }
                     // A fresh id claims a namespace slot; upserts never
                     // count against the cap.
-                    None if registry.namespace_len(source.namespace())
-                        >= MAX_VIZ_PER_NAMESPACE =>
-                    {
+                    None if registry.namespace_len(source.namespace()) >= MAX_VIZ_PER_NAMESPACE => {
                         warn!(
                             "ratty-ai: viz.set rejected: namespace {} is at its \
                              {MAX_VIZ_PER_NAMESPACE}-visualization limit",
