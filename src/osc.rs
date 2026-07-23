@@ -50,6 +50,32 @@ pub fn ai_object_namespace(id: u32) -> Option<u8> {
     (id >= AI_OBJECT_ID_MIN).then_some(((id >> AI_OBJECT_INDEX_BITS) & 0x7F) as u8)
 }
 
+// ── Viz wire limits ──
+//
+// These bounds are part of the `viz.*` wire contract, so they live in this
+// shared std-only module: the terminal enforces them at decode and the
+// `ratty-ai` collectors normalize under them at encode — compiling the same
+// constants on both ends means the two can never drift.
+
+/// Upper bound on one *decoded* `viz.set` payload, in bytes. The terminal
+/// enforces it before allocating (bounding the memory a hostile sequence
+/// can pin); collectors bound their `--top` output so a worst-case snapshot
+/// provably encodes under it. The terminal side additionally const-asserts
+/// that the 4/3 base64url expansion plus envelope survives its OSC
+/// watchdog.
+pub const MAX_VIZ_PAYLOAD_BYTES: usize = 32 * 1024;
+
+/// Upper bound on the items in one snapshot (`ps`/`fs`/`net` items, `git`
+/// branches). Bounds per-entry render work and memory against a hostile
+/// emitter packing the byte budget with tiny items.
+pub const MAX_VIZ_ITEMS_PER_SNAPSHOT: usize = 256;
+
+/// Upper bound, in bytes, on any single label string inside a payload
+/// (names, paths, states, capture provenance) and on `viz.effect` keys.
+/// Bounds stored-string memory and keeps every projection record small
+/// enough for size-bounded reply pages.
+pub const MAX_VIZ_LABEL_BYTES: usize = 128;
+
 /// A command parsed from an OSC 777 control sequence.
 ///
 /// Variants are grouped by subsystem. The first block is reachable today

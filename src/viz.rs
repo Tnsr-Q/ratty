@@ -42,12 +42,11 @@ use crate::osc::{RattyAiCommand, ai_object_namespace};
 use crate::query::{B64DecodeError, b64url_decode, codes};
 use crate::query_channel::{AckOutcome, AiDiagnostics, ack_commit};
 
-/// Upper bound on one *decoded* `viz.set` payload, enforced before the
-/// bytes are allocated ([`crate::query::b64url_decode`]). Bounds the
-/// memory a single hostile sequence can pin and — via the const assert
-/// below — guarantees a maximal legitimate payload survives the OSC
-/// watchdog intact.
-pub const MAX_VIZ_PAYLOAD_BYTES: usize = 32 * 1024;
+// The payload/item/label limits are part of the wire contract and live in
+// the shared std-only `osc` module so the `ratty-ai` collectors compile
+// the exact same numbers; re-exported here because this module owns their
+// enforcement (decode limits below).
+pub use crate::osc::{MAX_VIZ_ITEMS_PER_SNAPSHOT, MAX_VIZ_LABEL_BYTES, MAX_VIZ_PAYLOAD_BYTES};
 
 // A `viz.set` payload rides a single OSC 777 sequence, and the OSC
 // watchdog (`crate::inline::MAX_OSC_SEQUENCE_BYTES`) truncates anything
@@ -58,17 +57,6 @@ pub const MAX_VIZ_PAYLOAD_BYTES: usize = 32 * 1024;
 // the wire cannot actually carry.
 const _: () =
     assert!(MAX_VIZ_PAYLOAD_BYTES.div_ceil(3) * 4 + 1024 <= crate::inline::MAX_OSC_SEQUENCE_BYTES);
-
-/// Upper bound on the items in one snapshot (`ps`/`fs`/`net` items, `git`
-/// branches). Bounds per-entry render work and memory against a hostile
-/// emitter packing the byte budget with tiny items.
-pub const MAX_VIZ_ITEMS_PER_SNAPSHOT: usize = 256;
-
-/// Upper bound, in bytes, on any single label string inside a payload
-/// (names, paths, states, capture provenance) and on `viz.effect` keys.
-/// Bounds stored-string memory and keeps every projection record small
-/// enough for size-bounded reply pages.
-pub const MAX_VIZ_LABEL_BYTES: usize = 128;
 
 /// Upper bound on live visualizations per agent namespace: an honest
 /// failure instead of an unbounded registry driven by untrusted output.
