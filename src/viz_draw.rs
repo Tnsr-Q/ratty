@@ -1205,6 +1205,86 @@ mod tests {
         assert_eq!(glyph_strokes('k'), glyph_strokes('K'));
     }
 
+    /// CPU-side rasterization smoke: every chart kind's underlay appends
+    /// real geometry into a vello scene without panicking — including
+    /// stroke-font text, arcs, and a degenerate one-pixel rect (where
+    /// text drops below its three-pixel floor rather than dividing by
+    /// nothing).
+    #[test]
+    fn underlays_append_real_vello_geometry() {
+        let payloads = [
+            decode(
+                "chart.bar.v1",
+                json!({
+                    "capture": capture(),
+                    "title": "queue depth", "unit": "msgs", "max": 10.0,
+                    "items": [{ "key": "a", "label": "Ingest", "value": 3.0 }],
+                }),
+            ),
+            decode(
+                "chart.line.v1",
+                json!({
+                    "capture": capture(),
+                    "title": "hit rate",
+                    "series": [{ "name": "l1", "points": [
+                        { "x": 0.0, "y": 1.0 }, { "x": 1.0, "y": 2.0 },
+                    ] }],
+                }),
+            ),
+            decode(
+                "chart.gauge.v1",
+                json!({
+                    "capture": capture(),
+                    "items": [{ "key": "w", "value": 0.62, "unit": "%" }],
+                }),
+            ),
+            decode(
+                "timeline.v1",
+                json!({
+                    "capture": capture(),
+                    "title": "layers",
+                    "lanes": [{ "name": "layer-0", "events": [
+                        { "id": "e1", "t": 0.0, "dur": 1.0 },
+                    ] }],
+                }),
+            ),
+        ];
+        for payload in &payloads {
+            let ops = viz_underlay_ops(payload).expect("chart kinds draw");
+            let mut scene = Scene::new();
+            append_viz_underlay(
+                &mut scene,
+                UnderlayRect {
+                    x: 12.0,
+                    y: 8.0,
+                    width: 480.0,
+                    height: 160.0,
+                },
+                &ops,
+            );
+            let encoding = scene.encoding();
+            assert!(
+                encoding.n_paths > 1,
+                "{}: underlay encodes paths (got {})",
+                payload.kind(),
+                encoding.n_paths
+            );
+            // The degenerate rect must not panic; text drops, paths clamp
+            // to one-pixel strokes.
+            let mut tiny = Scene::new();
+            append_viz_underlay(
+                &mut tiny,
+                UnderlayRect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 1.0,
+                    height: 1.0,
+                },
+                &ops,
+            );
+        }
+    }
+
     #[test]
     fn values_format_compactly_and_instants_read_as_utc() {
         assert_eq!(format_value(0.0), "0");
