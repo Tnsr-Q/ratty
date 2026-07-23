@@ -199,6 +199,15 @@ fields are ignored (additive evolution); identity fields (keys, names)
 are required while magnitude fields default; every size limit is
 hard-rejected with `too-large`.
 
+**Domain keys are unique within a snapshot.** A well-formed emitter
+never repeats a key (pid, path, branch, interface). If a snapshot does
+repeat one, the renderer is **first-occurrence-wins**: the first item
+with a given key renders and later items sharing it are dropped, so the
+entity tree and its key ledger can never diverge. The `state.viz`
+`item_count` is the **raw** payload item count, so a snapshot carrying
+duplicates reports the pre-dedup number — the read-back never hides
+that the wire carried repeats.
+
 ```json
 "capture": { "source": "ratty-ai ps/sysinfo macos; top 5 of 732 by cpu",
              "ts": "2026-07-22T17:03:11Z" }
@@ -280,9 +289,10 @@ ratty-ai kill <pid> [--sigkill] [--timeout-ms 5000] [--id N]
   slot: `ps` 2147483904 (`0x8000_0100`), `fs` 2147483905
   (`0x8000_0101`), `git` 2147483906 (`0x8000_0102`), `net` 2147483907
   (`0x8000_0103`). `--id` overrides.
-- **`--top` is hard-capped at 64** on every collector: 64 is the
-  largest N for which a snapshot of worst-case labels provably encodes
-  under the 32 KiB payload limit for all four kinds (pinned by test).
+- **`--top` is hard-capped at 64** on every collector: a hard cap
+  chosen with ample provable headroom — a snapshot of 64 worst-case
+  labels stays under the 32 KiB payload limit for all four kinds (pinned
+  by test), not the largest such N.
 - **`--watch <secs>` (min 1)** republishes fresh snapshots under the
   same id until interrupted. Only the first emission sends the anchor;
   refreshes are upserts that keep the live anchor, so a view the user
@@ -290,9 +300,12 @@ ratty-ai kill <pid> [--sigkill] [--timeout-ms 5000] [--id N]
 - **Provenance is machine-visible.** Truncation and gathering caveats
   land in `capture.source`: `ratty-ai ps/sysinfo macos; top 32 of 732
   by cpu` · `ratty-ai fs/walk; top 64 of 4096 by size; 2 unreadable
-  skipped; walk capped at 4096` · `ratty-ai net/sysinfo linux;
-  up=IFF_UP` (or `up=has-address` where the IFF_UP link state is
-  unavailable).
+  skipped; walk capped at 4096; 3 paths truncated` · `ratty-ai
+  net/sysinfo linux; up=IFF_UP` (or `up=has-address` where the IFF_UP
+  link state is unavailable). A path longer than the 128-byte label
+  bound is truncated to a hash-disambiguated key (so distinct
+  over-long paths never collapse to one domain key), and the count of
+  such paths is declared here.
 - The `fs` walk is bounded: breadth-first, depth-limited (direct
   children are depth 1), capped at 4096 entries, never follows
   symlinks, skips-but-counts unreadable directories, and records
