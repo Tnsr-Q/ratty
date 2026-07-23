@@ -574,10 +574,7 @@ impl VizPayload {
                     check_finite("min", item.min)?;
                     check_finite("max", item.max)?;
                     if item.min >= item.max {
-                        return Err(bad_payload(format!(
-                            "gauge '{}' needs min < max",
-                            item.key
-                        )));
+                        return Err(bad_payload(format!("gauge '{}' needs min < max", item.key)));
                     }
                     if !(item.max - item.min).is_finite() {
                         return Err(bad_payload(format!(
@@ -827,8 +824,8 @@ mod tests {
 
         for max in [0.0, -3.0] {
             let bad_max = json!({ "capture": capture(), "max": max });
-            let error = decode_viz_payload("chart.bar.v1", &encode(bad_max))
-                .expect_err("non-positive max");
+            let error =
+                decode_viz_payload("chart.bar.v1", &encode(bad_max)).expect_err("non-positive max");
             assert_eq!(error.code, codes::BAD_PAYLOAD);
         }
     }
@@ -848,7 +845,10 @@ mod tests {
         // 1e400 overflows f64 to +inf inside serde_json; every chart-family
         // magnitude must reject it rather than poison the lowering.
         let bar = json!({ "capture": capture(), "items": [{ "key": "a", "value": 1e308 }] });
-        assert!(decode_viz_payload("chart.bar.v1", &encode(bar)).is_ok(), "finite f64 max is fine");
+        assert!(
+            decode_viz_payload("chart.bar.v1", &encode(bar)).is_ok(),
+            "finite f64 max is fine"
+        );
         for raw in [
             format!(
                 r#"{{ "capture": {}, "items": [{{ "key": "a", "value": 1e400 }}] }}"#,

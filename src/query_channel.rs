@@ -910,8 +910,8 @@ mod tests {
 
     use crate::ai::{AiCommand, AiObjectRegistry, AiObjectRemoved, apply_ai_object_commands};
     use crate::config::AppConfig;
-    use crate::osc::RattyAiCommand;
     use crate::inline::InlineStyle;
+    use crate::osc::RattyAiCommand;
     use crate::query::{ParsedReply, ReplyScanner, parse_reply_body, query_sequence};
     use crate::runtime::VirtualTerminalHost;
     use crate::scene::TerminalPresentationMode;
@@ -1463,6 +1463,67 @@ mod tests {
         assert_eq!(payload(&reply)["items"], json!([]));
     }
 
+    /// The chart-kind closed loop over the wire: an authored
+    /// `chart.bar.v1` snapshot rides `viz.set` with `tok=`, reads back
+    /// through `state.viz` with its kind, count, and provenance, and a
+    /// hostile follow-up (an unknown state tag) rejects `bad-payload`
+    /// without touching the live snapshot.
+    #[test]
+    fn closed_loop_chart_kind_over_777_and_778() {
+        let (mut app, host) = test_app();
+        let chart_data = |state: &str| {
+            let value = json!({
+                "capture": { "source": "authored", "ts": "authored" },
+                "title": "queue",
+                "max": 10.0,
+                "items": [
+                    { "key": "a", "value": 3.0, "state": state },
+                    { "key": "b", "value": 7.5 },
+                ],
+            });
+            crate::query::b64url_encode(value.to_string().as_bytes())
+        };
+        let set = format!(
+            "\x1b]777;ratty:viz.set;id={ID}&kind=chart.bar.v1&data={}&x=4&y=2&cols=30&rows=10&tok=c1\x07",
+            chart_data("active")
+        );
+        let query = query_sequence("q1", "state.viz", None);
+        host.feed_tx
+            .send(format!("{set}{query}").into_bytes())
+            .expect("virtual feed accepts bytes");
+        app.update();
+        let replies = drain_replies(&host);
+        assert_eq!(replies.len(), 2, "one ack, one query reply");
+        assert!(replies[0].ok, "the chart committed");
+        let page = payload(&replies[1]);
+        let item = &page["items"][0];
+        assert_eq!(item["kind"], json!("chart.bar.v1"));
+        assert_eq!(item["item_count"], json!(2));
+        assert_eq!(item["capture"]["source"], json!("authored"));
+        assert_eq!(item["anchor"]["cols"], json!(30));
+
+        // A hostile refresh with an unregistered state tag rejects and
+        // leaves the live snapshot untouched.
+        let bad = format!(
+            "\x1b]777;ratty:viz.set;id={ID}&kind=chart.bar.v1&data={}&tok=c2\x07",
+            chart_data("exploding")
+        );
+        host.feed_tx
+            .send(bad.into_bytes())
+            .expect("virtual feed accepts bytes");
+        app.update();
+        let replies = drain_replies(&host);
+        assert_eq!(replies.len(), 1);
+        assert!(!replies[0].ok);
+        assert_eq!(replies[0].code.as_deref(), Some(codes::BAD_PAYLOAD));
+        let reply = run_query(&mut app, &host, "q2", "state.viz", None);
+        assert_eq!(
+            payload(&reply)["items"][0]["item_count"],
+            json!(2),
+            "a rejected refresh changes nothing"
+        );
+    }
+
     /// The bookmark closed loop over the wire: store with `tok=`, read
     /// back through `state.bookmarks`, collide without `mode=replace`,
     /// and jump — whose relowered `SetMode`/`SetWarp` ride the normal
@@ -1471,9 +1532,7 @@ mod tests {
     fn closed_loop_bookmark_store_read_jump_over_777_and_778() {
         let (mut app, host) = test_app();
         // Warp the view so the stored snapshot has something to remember.
-        app.world_mut()
-            .resource_mut::<TerminalPlaneWarp>()
-            .amount = 0.5;
+        app.world_mut().resource_mut::<TerminalPlaneWarp>().amount = 0.5;
         host.feed_tx
             .send(b"\x1b]777;ratty:bookmark;name=dock&tok=b1\x07".to_vec())
             .expect("virtual feed accepts bytes");
@@ -1502,9 +1561,7 @@ mod tests {
         // Change the live view, then jump back: the relowered commands
         // land on the normal AiCommand stream (the mode/warp appliers are
         // exercised by their own tests; here the loop pins the plumbing).
-        app.world_mut()
-            .resource_mut::<TerminalPlaneWarp>()
-            .amount = 0.75;
+        app.world_mut().resource_mut::<TerminalPlaneWarp>().amount = 0.75;
         app.world_mut()
             .resource_mut::<Messages<AiCommand>>()
             .clear();

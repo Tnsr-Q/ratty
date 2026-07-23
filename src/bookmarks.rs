@@ -309,7 +309,10 @@ mod tests {
         app.init_resource::<TerminalPlaneWarp>();
         app.add_message::<AiCommand>();
         app.add_message::<AckOutcome>();
-        app.add_systems(Update, (apply_bookmark_commands, drain_bookmark_jumps).chain());
+        app.add_systems(
+            Update,
+            (apply_bookmark_commands, drain_bookmark_jumps).chain(),
+        );
         app
     }
 

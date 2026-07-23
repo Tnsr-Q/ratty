@@ -1,0 +1,803 @@
+Could I use a framework like this to monitor and for memory? 
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Skill-Agent Loop Ecosystem — GPU Memory Merge Coalescer</title>
+<style>
+  :root {
+    --bg: #06090f;
+    --surface: #0d1117;
+    --surface2: #161b22;
+    --surface3: #1c2230;
+    --border: #21262d;
+    --border-lit: #30363d;
+    --text: #c9d1d9;
+    --text-dim: #6e7681;
+    --text-bright: #f0f6fc;
+    --cyan: #58a6ff;
+    --green: #3fb950;
+    --teal: #56d4dd;
+    --purple: #bc8cff;
+    --orange: #d29922;
+    --red: #f85149;
+    --pink: #f778ba;
+    --warp: #1f6feb;
+  }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { background:var(--bg); color:var(--text); font-family:'JetBrains Mono',Consolas,monospace; font-size:13px; }
+
+  .app { display:grid; grid-template-rows:auto repeating(3, 1fr); height:100vh; gap:4px; padding:4px; }
+  .header { background:var(--surface); border:1px solid var(--border); border-radius:10px; padding:12px 20px; display:flex; align-items:center; justify-content:space-between; }
+  .mid { display:grid; grid-template-columns:260px 1fr 340px; gap:4px; }
+  .lower { display:grid; grid-template-columns:1fr 1fr; gap:4px; }
+  .bottom { display:grid; grid-template-columns:1fr; gap:4px; }
+
+  .panel { background:var(--surface); border:1px solid var(--border); border-radius:8px; overflow:hidden; display:flex; flex-direction:column; }
+  .ph { padding:10px 14px; background:var(--surface2); border-bottom:1px solid var(--border); font-size:11px; text-transform:uppercase; letter-spacing:1.2px; font-weight:700; display:flex; align-items:center; gap:8px; flex-shrink:0; }
+  .ph .dot { width:7px; height:7px; border-radius:50%; }
+  .pb { padding:10px 12px; flex:1; overflow-y:auto; overflow-x:hidden; }
+  .pb::-webkit-scrollbar { width:4px; } .pb::-webkit-scrollbar-thumb { background:var(--border-lit); border-radius:2px; }
+
+  /* ─── Header ─── */
+  .logo { font-size:14px; font-weight:800; background:linear-gradient(135deg,var(--cyan),var(--green)); -webkit-background-clip:text; -webkit-text-fill-color:transparent; }
+  .sub { font-size:10px; color:var(--text-dim); }
+  .controls { display:flex; gap:6px; }
+  .btn { padding:6px 14px; border:1px solid var(--border); border-radius:6px; background:var(--surface2); color:var(--text); font-family:inherit; font-size:10px; font-weight:700; cursor:pointer; text-transform:uppercase; letter-spacing:.5px; transition:.15s; }
+  .btn:hover { border-color:var(--cyan); color:var(--cyan); }
+  .btn.go { background:linear-gradient(135deg,#1a4d2e,#0d2818); border-color:var(--green); color:var(--green); }
+  .btn.go:hover { background:linear-gradient(135deg,#22693a,#143d22); }
+  .btn.stop { border-color:var(--red); color:var(--red); }
+
+  /* ─── Skills ─── */
+  .skill-card { background:var(--bg); border:1px solid var(--border); border-radius:6px; padding:8px 10px; margin-bottom:6px; cursor:pointer; transition:.2s; }
+  .skill-card:hover, .skill-card.active { border-color:var(--cyan); }
+  .skill-card.active { box-shadow:0 0 12px rgba(88,166,255,.12); }
+  .sk-hd { display:flex; align-items:center; gap:6px; margin-bottom:3px; }
+  .sk-icon { font-size:14px; }
+  .sk-name { font-size:11px; font-weight:700; color:var(--text-bright); }
+  .sk-type { font-size:9px; color:var(--text-dim); background:var(--surface2); padding:1px 5px; border-radius:4px; margin-left:auto; }
+  .sk-bar { height:3px; background:var(--border); border-radius:2px; margin-top:4px; overflow:hidden; }
+  .sk-bar .fill { height:100%; border-radius:2px; transition:width .4s; }
+  .sk-mem { font-size:9px; color:var(--text-dim); margin-top:3px; }
+
+  /* ─── Loop Ring ─── */
+  .loop-wrap { display:flex; flex-direction:column; align-items:center; justify-content:center; height:100%; position:relative; }
+  .loop-ring { position:relative; width:220px; height:220px; }
+  .loop-node { position:absolute; width:52px; height:52px; border-radius:50%; background:var(--bg); border:2px solid var(--border); display:flex; flex-direction:column; align-items:center; justify-content:center; transition:.3s; }
+  .loop-node.active { border-color:var(--cyan); box-shadow:0 0 16px rgba(88,166,255,.25); }
+  .loop-node .ln-icon { font-size:16px; }
+  .loop-node .ln-label { font-size:8px; color:var(--text-dim); text-transform:uppercase; letter-spacing:.5px; }
+  .loop-arrow { position:absolute; width:100%; height:100%; pointer-events:none; }
+  .loop-status { position:absolute; top:50%; left:50%; transform:translate(-50%,-50%); text-align:center; width:140px; }
+  .loop-status .ls-step { font-size:18px; font-weight:800; color:var(--cyan); }
+  .loop-status .ls-label { font-size:10px; color:var(--text-dim); }
+  .loop-status .ls-msg { font-size:9px; color:var(--text); margin-top:4px; line-height:1.4; }
+
+  /* ─── Merge Viz ─── */
+  .thread-grid { display:grid; grid-template-columns:repeat(8,1fr); gap:3px; margin-bottom:8px; }
+  .cell { width:100%; aspect-ratio:1; border-radius:4px; background:var(--bg); border:1px solid var(--border); display:flex; align-items:center; justify-content:center; font-size:9px; font-weight:700; transition:.15s; position:relative; }
+  .cell.has-val { color:var(--text); }
+  .cell.winner { border-color:var(--green); background:#122117; color:var(--green); box-shadow:0 0 8px rgba(63,185,80,.2); }
+  .cell.scanned { border-color:var(--orange); background:#1a180e; color:var(--orange); }
+  .cell.min-val { border-color:var(--cyan); background:#0e1a26; color:var(--cyan); }
+  .cell .tid { position:absolute; top:1px; right:3px; font-size:7px; color:var(--text-dim); }
+
+  .merge-label { font-size:10px; color:var(--text-dim); margin:4px 0 2px; text-transform:uppercase; letter-spacing:.5px; }
+  .output-strip { display:flex; gap:2px; flex-wrap:wrap; }
+  .out-cell { width:28px; height:20px; border-radius:3px; background:var(--surface2); border:1px solid var(--border); display:flex; align-items:center; justify-content:center; font-size:8px; color:var(--green); font-weight:700; }
+  .out-cell.latest { border-color:var(--green); background:#122117; animation:pop .3s ease; }
+  @keyframes pop { 0%{transform:scale(.7);} 100%{transform:scale(1);} }
+
+  .reduction-bar { display:flex; gap:3px; margin-top:6px; }
+  .red-cell { flex:1; height:18px; border-radius:4px; background:var(--bg); border:1px solid var(--border); display:flex; align-items:center; justify-content:center; font-size:8px; font-weight:700; color:text-dim; }
+  .red-cell.active { border-color:var(--warp); background:#0e1a30; color:var(--cyan); }
+
+  /* ─── Memory Lists ─── */
+  .mem-list-row { display:flex; gap:4px; align-items:flex-start; margin-bottom:8px; }
+  .mem-list-label { width:56px; text-align:right; font-size:9px; color:var(--text-dim); padding-top:3px; flex-shrink:0; }
+  .mem-list-bars { display:flex; gap:2px; flex:1; flex-wrap:wrap; }
+  .mem-bar { width:24px; height:22px; border-radius:3px; background:var(--bg); border:1px solid var(--border); display:flex; align-items:center; justify-content:center; font-size:8px; font-weight:700; color:var(--text-dim); transition:.15s; }
+  .mem-bar.popped { border-color:var(--green); color:var(--green); background:#0e1a12; }
+
+  /* ─── CUDA Code ─── */
+  .code-block { font-size:11px; line-height:1.6; white-space:pre; overflow-x:auto; }
+  .code-block .kw { color:var(--pink); } .code-block .ty { color:var(--cyan); }
+  .code-block .fn { color:var(--purple); } .code-block .cm { color:var(--text-dim); font-style:italic; }
+  .code-block .st { color:var(--green); } .code-block .num { color:var(--orange); }
+  .code-block .hl { background:rgba(88,166,255,.08); display:block; margin:0 -12px; padding:0 12px; border-left:2px solid var(--cyan); }
+
+  /* ─── Log ─── */
+  .log-line { padding:4px 8px; font-size:10px; border-left:2px solid var(--border); margin-bottom:3px; animation:fadeUp .2s ease; }
+  .log-line .lt { color:var(--text-dim); margin-right:6px; }
+  .log-line.t-loop { border-color:var(--cyan); }
+  .log-line.t-merge { border-color:var(--green); }
+  .log-line.t-skill { border-color:var(--purple); }
+  .log-line.t-mem { border-color:var(--orange); }
+  @keyframes fadeUp { from{opacity:0;transform:translateY(4px);} to{opacity:1;transform:translateY(0);} }
+</style>
+</head>
+<body>
+<div class="app">
+  <!-- HEADER -->
+  <div class="header">
+    <div>
+      <div class="logo">⚡ Skill-Agent Loop Ecosystem</div>
+      <div class="sub">GPU-Accelerated Memory Coalescing · Parallel K-Way Merge · Adaptive Skill Orchestration</div>
+    </div>
+    <div class="controls">
+      <button class="btn" onclick="stepLoop()">⏭ Step</button>
+      <button class="btn go" id="runBtn" onclick="toggleRun()">▶ Run</button>
+      <button class="btn stop" onclick="resetAll()">↺ Reset</button>
+    </div>
+  </div>
+
+  <!-- MIDDLE ROW -->
+  <div class="mid">
+    <!-- Skills Registry -->
+    <div class="panel">
+      <div class="ph"><span class="dot" style="background:var(--purple)"></span> Skill Registry</div>
+      <div class="pb" id="skillPanel"></div>
+    </div>
+
+    <!-- Agent Loop -->
+    <div class="panel">
+      <div class="ph"><span class="dot" style="background:var(--cyan)"></span> Agent Loop Cycle <span id="loopInfo" style="margin-left:auto;font-weight:400;font-size:10px;color:var(--text-dim)"></span></div>
+      <div class="pb">
+        <div class="loop-wrap">
+          <div class="loop-ring" id="loopRing">
+            <canvas id="loopCanvas" width="220" height="220" style="position:absolute;top:0;left:0;"></canvas>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- GPU Merge Visualization -->
+    <div class="panel">
+      <div class="ph"><span class="dot" style="background:var(--green)"></span> GPU Parallel K-Way Merge <span id="mergeInfo" style="margin-left:auto;font-weight:400;font-size:10px;color:var(--text-dim)"></span></div>
+      <div class="pb scroll-only">
+        <div class="merge-label">Thread Pool (32 threads, 4 warps × 8 reduction groups)</div>
+        <div class="thread-grid" id="threadGrid"></div>
+        <div class="merge-label">Stage 1 — Warp Reductions (atomicMin × 4 groups)</div>
+        <div class="reduction-bar" id="redBar1"></div>
+        <div class="merge-label">Stage 2 — Final Reduction (atomicMin → global min)</div>
+        <div class="reduction-bar" id="redBar2"></div>
+        <div class="merge-label">Merged Output Stream (sorted ascending)</div>
+        <div class="output-strip" id="outputStrip"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- LOWER ROW -->
+  <div class="lower">
+    <!-- Memory Lists -->
+    <div class="panel">
+      <div class="ph"><span class="dot" style="background:var(--orange)"></span> Skill Memory Channels (Sorted Lists → Merge Input)</div>
+      <div class="pb" id="memPanel"></div>
+    </div>
+
+    <!-- CUDA Source -->
+    <div class="panel">
+      <div class="ph"><span class="dot" style="background:var(--pink)"></span> merge_array9 · CUDA Kernel (Live Execution)</div>
+      <div class="pb" id="codePanel" style="font-size:11px;"></div>
+    </div>
+  </div>
+
+  <!-- BOTTOM -->
+  <div class="bottom">
+    <div class="panel">
+      <div class="ph"><span class="dot"></span> Execution Trace</div>
+      <div class="pb" id="logPanel"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+// ═══════════════════════════════════════════════════════════════════
+// CONSTANTS (matching CUDA source)
+// ═══════════════════════════════════════════════════════════════════
+const REDUCTION_SIZE = 8;
+const REDUCTION_SIZE_BIT_SHIFT = 3;
+const NUM_THREADS = 32; // 4 warps
+const NUM_LISTS = 8;    // 8 sorted memory channels
+const ELEMS_PER_LIST = 8;
+const TOTAL_ELEMENTS = NUM_LISTS * ELEMS_PER_LIST;
+const MAX_ACTIVE_REDUCTIONS = Math.floor(NUM_LISTS / REDUCTION_SIZE); // 1
+
+// ═══════════════════════════════════════════════════════════════════
+// STATE
+// ═══════════════════════════════════════════════════════════════════
+const state = {
+  running: false,
+  interval: null,
+  loopPhase: 0,          // 0=perceive,1=think,2=act,3=reflect,4=remember
+  loopCycle: 0,
+  activeSkill: -1,
+  mergePos: 0,           // current merge output position
+  mergeDone: false,
+  // Source arrays (per-skill sorted memory lists, interleaved column-major)
+  src: [],               // flat u32[TOTAL_ELEMENTS]
+  listIdx: [],           // per-list read pointer
+  dest: [],              // merged output
+  // GPU state for viz
+  threadData: [],        // per-thread current value
+  threadOwner: [],       // which list each thread came from
+  reductionMin: [],
+  globalMin: 0xFFFFFFFF,
+  winnerTid: 0xFFFFFFFF,
+  // highlight
+  codeLine: -1,
+  logs: [],
+  logStart: 0,
+};
+
+const SKILLS = [
+  { id:0, name:"Perception",     icon:"👁", type:"sense",   mem:0,  color:"#58a6ff" },
+  { id:1, name:"Planning",       icon:"🧭", type:"reason",   mem:1,  color:"#bc8cff" },
+  { id:2, name:"Tool Use",       icon:"🛠", type:"action",   mem:2,  color:"#3fb950" },
+  { id:3, name:"Code Gen",       icon:"⌨", type:"generate", mem:3,  color:"#56d4dd" },
+  { id:4, name:"RAG Retrieval",  icon:"🔍", type:"retrieve", mem:4,  color:"#d29922" },
+  { id:5, name:"Reasoning",      icon:"🧠", type:"reason",  mem:5,  color:"#f778ba" },
+  { id:6, name:"Self-Debug",     icon:"🔧", type:"repair",  mem:6,  color:"#f85149" },
+  { id:7, name:"Memory Read/Write",icon:"💾",type:"memory",  mem:7,  color:"#8b949e" },
+];
+
+const LOOP_PHASES = [
+  { name:"Perceive",  icon:"👁", skill:0 },
+  { name:"Think",     icon:"🧠", skill:5 },
+  { name:"Act",       icon:"⚡", skill:2 },
+  { name:"Reflect",   icon:"🔍", skill:4 },
+  { name:"Remember",  icon:"💾", skill:7 },
+];
+
+// ─── CUDA Source Lines ───
+const CUDA_LINES = [
+  '<span class="cm">// Uses multiple threads for merge</span>',
+  '<span class="cm">// Does reduction into a warp and then into a single value</span>',
+  '<span class="ty">__device__</span> <span class="ty">void</span> <span class="fn">merge_array9</span>(<span class="ty">const u32 * const</span> src_array,',
+  '                         <span class="ty">u32 *</span> dest_array,',
+  '                         <span class="ty">const u32</span> num_lists,',
+  '                         <span class="ty">const u32</span> num_elements,',
+  '                         <span class="ty">const u32</span> tid)',
+  '{',
+  '  <span class="cm">// Read initial value from the list</span>',
+  '  <span class="ty">u32</span> data = src_array[tid];',
+  '',
+  '  <span class="cm">// Shared memory index</span>',
+  '  <span class="ty">const u32</span> s_idx = tid >> REDUCTION_SIZE_BIT_SHIFT;',
+  '',
+  '  <span class="cm">// Calculate number of 1st stage reductions</span>',
+  '  <span class="ty">const u32</span> num_reductions = num_lists >> REDUCTION_SIZE_BIT_SHIFT;',
+  '',
+  '  <span class="ty">const u32</span> num_elements_per_list = (num_elements / num_lists);',
+  '',
+  '  <span class="cm">// Declare list pointers, initially zero</span>',
+  '  <span class="ty">__shared__ u32</span> list_indexes[MAX_NUM_LISTS];',
+  '  list_indexes[tid] = <span class="num">0</span>;',
+  '',
+  '  <span class="cm">// Iterate over all elements</span>',
+  '  <span class="kw">for</span> (<span class="ty">u32</span> i=<span class="num">0</span>; i&lt;num_elements; i++)',
+  '  {',
+  '    <span class="ty">__shared__ u32</span> min_val[MAX_ACTIVE_REDUCTIONS];',
+  '    <span class="ty">__shared__ u32</span> min_tid;',
+  '',
+  '    <span class="cm">// Clear min_val for this iteration</span>',
+  '    <span class="kw">if</span> (tid &lt; num_lists)',
+  '    {',
+  '      min_val[s_idx] = <span class="num">0xFFFFFFFF</span>;',
+  '      min_tid   = <span class="num">0xFFFFFFFF</span>;',
+  '    }',
+  '    <span class="ty">__syncthreads</span>();',
+  '',
+  '    <span class="cm">// Each thread atomicMins its value into its reduction group</span>',
+  '    <span class="fn">atomicMin</span>(&amp;min_val[s_idx], data);',
+  '',
+  '    <span class="kw">if</span> (num_reductions &gt; <span class="num">0</span>)',
+  '    {',
+  '      <span class="ty">__syncthreads</span>();',
+  '      <span class="cm">// Warp-0 does final cross-group reduction</span>',
+  '      <span class="kw">if</span> (tid &lt; num_reductions)',
+  '      {',
+  '        <span class="fn">atomicMin</span>(&amp;min_val[<span class="num">0</span>], min_val[tid]);',
+  '      }',
+  '      <span class="ty">__syncthreads</span>();',
+  '    }',
+  '',
+  '    <span class="cm">// Determine winning thread (lowest tid for ties)</span>',
+  '    <span class="kw">if</span> (min_val[<span class="num">0</span>] == data)',
+  '    {',
+  '      <span class="fn">atomicMin</span>(&amp;min_tid, tid);',
+  '    }',
+  '    <span class="ty">__syncthreads</span>();',
+  '',
+  '    <span class="cm">// Winner writes, advances pointer</span>',
+  '    <span class="kw">if</span> (tid == min_tid)',
+  '    {',
+  '      list_indexes[tid]++;',
+  '      dest_array[i] = data;',
+  '      <span class="kw">if</span> (list_indexes[tid] &lt; num_elements_per_list)',
+  '        data = src_array[tid + (list_indexes[tid] * num_lists)];',
+  '      <span class="kw">else</span>',
+  '        data = <span class="num">0xFFFFFFFF</span>;',
+  '    }',
+  '    <span class="ty">__syncthreads</span>();',
+  '  }',
+  '}',
+];
+
+// ═══════════════════════════════════════════════════════════════════
+// HELPERS
+// ═══════════════════════════════════════════════════════════════════
+const hex = v => ("0000" + v.toString(16).toUpperCase()).slice(-4);
+const rand = (a,b) => Math.floor(Math.random()*(b-a+1))+a;
+
+function seededShuffle(arr, seed) {
+  let s = seed;
+  for (let i = arr.length-1; i > 0; i--) {
+    s = (s * 16807 + 1) % 2147483647;
+    const j = s % (i+1);
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// INIT — generate 8 sorted lists, interleave column-major
+// ═══════════════════════════════════════════════════════════════════
+function initMemory() {
+  const lists = [];
+  // Generate 8 individually sorted lists
+  for (let l = 0; l < NUM_LISTS; l++) {
+    const base = rand(1, 50) * 100;
+    const arr = [];
+    for (let i = 0; i < ELEMS_PER_LIST; i++) {
+      arr.push(base + i * rand(8, 40));
+    }
+    arr.sort((a,b) => a-b);
+    lists.push(arr);
+  }
+  // Interleave column-major: src[tid + listIdx * NUM_LISTS] = lists[tid][listIdx]
+  // i.e. each thread "owns" one list, data is spread by column
+  state.src = [];
+  for (let li = 0; li < ELEMS_PER_LIST; li++) {
+    for (let t = 0; t < NUM_THREADS; t++) {
+      if (t < NUM_LISTS) {
+        state.src.push(lists[t][li]);
+      } else {
+        state.src.push(0xFFFFFFFF); // idle threads
+      }
+    }
+  }
+  // Store lists for display
+  state.memLists = lists;
+  state.listIdx = new Array(NUM_THREADS).fill(0);
+  state.dest = [];
+  state.mergePos = 0;
+  state.mergeDone = false;
+  state.globalMin = 0xFFFFFFFF;
+  state.winnerTid = 0xFFFFFFFF;
+  state.reductionMin = [];
+  // Thread data = first value per thread
+  state.threadData = new Array(NUM_THREADS).fill(0xFFFFFFFF);
+  state.threadOwner = new Array(NUM_THREADS);
+  for (let t = 0; t < NUM_THREADS; t++) {
+    if (t < NUM_LISTS) {
+      state.threadData[t] = lists[t][0];
+      state.threadOwner[t] = t;
+    }
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// MERGE STEP — simulate one iteration of merge_array9
+// ═══════════════════════════════════════════════════════════════════
+function mergeStep() {
+  if (state.mergeDone || state.mergePos >= TOTAL_ELEMENTS) {
+    state.mergeDone = true;
+    return;
+  }
+  const i = state.mergePos;
+  state.codeLine = -1;
+
+  // Reset shared state
+  state.codeLine = 23; // min_val allocation
+  const numReductions = NUM_LISTS >> REDUCTION_SIZE_BIT_SHIFT; // 1
+  const activeReductions = Math.min(numReductions + 1, MAX_ACTIVE_REDUCTIONS);
+
+  // Clear min_vals
+  for (let r = 0; r < activeReductions; r++) state.reductionMin[r] = 0xFFFFFFFF;
+  state.globalMin = 0xFFFFFFFF;
+  state.winnerTid = 0xFFFFFFFF;
+
+  log(`Cycle ${i}: clearing shared min_val[], atomicMin phase`, "merge");
+  state.codeLine = 26;
+
+  // Stage 1: each active thread atomicMins into its reduction group
+  let groupMins = [];
+  for (let g = 0; g <= numReductions; g++) groupMins[g] = 0xFFFFFFFF;
+
+  const scannedTids = [];
+  for (let t = 0; t < NUM_LISTS; t++) {
+    const val = state.threadData[t];
+    const s_idx = t >> REDUCTION_SIZE_BIT_SHIFT;
+    scannedTids.push(t);
+    if (val < groupMins[s_idx]) groupMins[s_idx] = val;
+  }
+  state.codeLine = 35; // atomicMin line
+  state.reductionMin = groupMins.slice();
+
+  log(`Stage1 atomicMin: groups=[${groupMins.map(hex).join(", ")}] over ${NUM_LISTS} threads`, "merge");
+
+  // Stage 2: reduction across groups (only 1 group with 8 threads here)
+  let finalMin = 0xFFFFFFFF;
+  if (numReductions > 0) {
+    state.codeLine = 39;
+    for (let r = 0; r < groupMins.length; r++) {
+      if (groupMins[r] < finalMin) finalMin = groupMins[r];
+    }
+    log(`Stage2 cross-reduction: global_min=${hex(finalMin)}`, "merge");
+  } else {
+    finalMin = groupMins[0];
+  }
+  state.globalMin = finalMin;
+
+  // Determine winner (lowest tid with matching value)
+  if (finalMin !== 0xFFFFFFFF) {
+    state.codeLine = 46;
+    for (let t = 0; t < NUM_LISTS; t++) {
+      if (state.threadData[t] === finalMin) {
+        state.winnerTid = t;
+        break; // lowest tid wins
+      }
+    }
+  }
+  log(`Winner: tid=${state.winnerTid} val=${hex(finalMin)}`, "merge");
+
+  // Winner writes dest and advances
+  state.codeLine = 52;
+  const winnerTid = state.winnerTid;
+  if (winnerTid < NUM_LISTS) {
+    state.dest.push(finalMin);
+    state.listIdx[winnerTid]++;
+    const li = state.listIdx[winnerTid];
+    if (li < ELEMS_PER_LIST) {
+      // read next from column-major src
+      state.threadData[winnerTid] = state.memLists[winnerTid][li];
+    } else {
+      state.threadData[winnerTid] = 0xFFFFFFFF;
+      state.threadOwner[winnerTid] = -1; // exhausted
+    }
+    // Mark memory bar as popped
+    markMemPopped(winnerTid, li - 1);
+    log(`dest[${i}]=${hex(finalMin)}  list[${winnerTid}] advanced to idx ${li}`, "merge");
+  }
+
+  state.mergePos++;
+  if (state.mergePos >= TOTAL_ELEMENTS) {
+    state.mergeDone = true;
+    log("✅ Merge complete — all lists coalesced!", "merge");
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// AGENT LOOP
+// ═══════════════════════════════════════════════════════════════════
+function stepLoop() {
+  if (state.mergeDone && state.loopPhase === 4 && state.mergePos > 0) {
+    // Loop complete
+    log("Loop complete. Merged memory feeding back into next cycle.", "loop");
+    state.loopCycle++;
+    initMemory();
+    renderMemory();
+    renderThreads();
+  }
+
+  state.loopPhase = (state.loopPhase + 1) % 5;
+  const ph = LOOP_PHASES[state.loopPhase];
+  state.codeLine = -1;
+
+  log(`<strong>${ph.name}</strong> — using ${SKILLS[ph.skill].icon} ${SKILLS[ph.skill].name}`, "loop");
+
+  if (ph.name === "Remember") {
+    // Trigger merge on the memory lists
+    let merged = [];
+    while (!state.mergeDone && merged.length < 4) {
+      mergeStep();
+      merged.push(state.mergePos);
+    }
+    renderAll();
+    return;
+  }
+
+  // Activate corresponding skill
+  state.activeSkill = ph.skill;
+  updateLoopVisual(ph.name);
+  renderSkills();
+  renderAll();
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// RUN LOOP
+// ═══════════════════════════════════════════════════════════════════
+function toggleRun() {
+  if (state.running) {
+    clearInterval(state.interval);
+    state.running = false;
+    document.getElementById("runBtn").textContent = "▶ Run";
+  } else {
+    state.running = true;
+    document.getElementById("runBtn").textContent = "⏸ Pause";
+    state.interval = setInterval(() => {
+      stepLoop();
+      if (state.mergeDone && state.loopPhase === 0) {
+        clearInterval(state.interval);
+        state.running = false;
+        document.getElementById("runBtn").textContent = "▶ Run";
+      }
+    }, 900);
+  }
+}
+
+function resetAll() {
+  clearInterval(state.interval);
+  state.running = false;
+  state.loopPhase = 0;
+  state.loopCycle = 0;
+  state.activeSkill = -1;
+  state.codeLine = -1;
+  state.logs = [];
+  state.logStart = 0;
+  document.getElementById("runBtn").textContent = "▶ Run";
+  initMemory();
+  renderAll();
+  log("System reset. Ready.", "loop");
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// LOGGING
+// ═══════════════════════════════════════════════════════════════════
+function log(msg, type) {
+  state.logs.push({ msg, type, t: Date.now() });
+  const lp = document.getElementById("logPanel");
+  const d = document.createElement("div");
+  d.className = `log-line t-${type}`;
+  const ts = new Date().toLocaleTimeString();
+  d.innerHTML = `<span class="lt">${ts}</span>${msg}`;
+  lp.prepend(d);
+  // Trim
+  while (lp.children.length > 60) lp.removeChild(lp.lastChild);
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// RENDERING
+// ═══════════════════════════════════════════════════════════════════
+function renderSkills() {
+  const el = document.getElementById("skillPanel");
+  el.innerHTML = SKILLS.map((s, i) => {
+    const active = i === state.activeSkill ? "active" : "";
+    const usage = state.activeSkill >= 0 ? (i === state.activeSkill ? 0.8 : Math.random() * 0.3) : 0;
+    return `<div class="skill-card ${active}" style="border-left:3px solid ${s.color};">
+      <div class="sk-hd"><span class="sk-icon">${s.icon}</span><span class="sk-name">${s.name}</span><span class="sk-type">${s.type}</span></div>
+      <div class="sk-bar"><div class="fill" style="width:${(usage*100).toFixed(0)}%;background:${s.color};"></div></div>
+      <div class="sk-mem">mem_ch[${s.mem}] · ${state.memLists && state.memLists[s.mem] ? state.memLists[s.mem].length : 0} entries</div>
+    </div>`;
+  }).join("");
+}
+
+function renderLoopRing() {
+  const canvas = document.getElementById("loopCanvas");
+  const ctx = canvas.getContext("2d");
+  const W = 220, H = 220, cx = W/2, cy = H/2, R = 80;
+  ctx.clearRect(0, 0, W, H);
+
+  // Draw circle
+  ctx.beginPath();
+  ctx.arc(cx, cy, R, 0, 2*Math.PI);
+  ctx.strokeStyle = "#21262d";
+  ctx.lineWidth = 2;
+  ctx.stroke();
+
+  // Phases positioned around circle
+  const nodes = [];
+  LOOP_PHASES.forEach((ph, i) => {
+    const angle = (i / 5) * 2 * Math.PI - Math.PI / 2;
+    const x = cx + R * Math.cos(angle);
+    const y = cy + R * Math.sin(angle);
+    nodes.push({ x, y, ph, i, angle });
+  });
+
+  // Arrows
+  nodes.forEach((n, i) => {
+    const next = nodes[(i + 1) % 5];
+    const midAngle = (n.angle + n.angle + (2*Math.PI/5)) / 2;
+    const arrowR = R + 8;
+    ctx.beginPath();
+    ctx.arc(cx, cy, arrowR, n.angle + 0.15, nodes[(i+1)%5].angle - 0.15);
+    ctx.strokeStyle = i === state.loopPhase ? "#58a6ff" : "#21262d";
+    ctx.lineWidth = i === state.loopPhase ? 2 : 1;
+    ctx.stroke();
+    // Arrowhead
+    const headAngle = nodes[(i+1)%5].angle - 0.2;
+    const hx = cx + arrowR * Math.cos(headAngle);
+    const hy = cy + arrowR * Math.sin(headAngle);
+    ctx.beginPath();
+    ctx.arc(hx, hy, 3, 0, 2*Math.PI);
+    ctx.fillStyle = i === state.loopPhase ? "#58a6ff" : "#21262d";
+    ctx.fill();
+  });
+
+  // Nodes
+  nodes.forEach(n => {
+    const active = n.i === state.loopPhase;
+    ctx.beginPath();
+    ctx.arc(n.x, n.y, 22, 0, 2*Math.PI);
+    ctx.fillStyle = active ? "#0d1117" : "#06090f";
+    ctx.fill();
+    ctx.strokeStyle = active ? "#58a6ff" : "#21262d";
+    ctx.lineWidth = active ? 2.5 : 1.5;
+    ctx.stroke();
+    if (active) {
+      ctx.shadowColor = "rgba(88,166,255,0.3)";
+      ctx.shadowBlur = 12;
+      ctx.fill();
+      ctx.shadowBlur = 0;
+    }
+
+    ctx.font = "16px serif";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText(n.ph.icon, n.x, n.y - 2);
+
+    ctx.font = "8px 'JetBrains Mono'";
+    ctx.fillStyle = active ? "#58a6ff" : "#6e7681";
+    ctx.fillText(n.ph.name, n.x, n.y + 16);
+  });
+
+  // Center info
+  ctx.font = "bold 22px 'JetBrains Mono'";
+  ctx.fillStyle = "#58a6ff";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillText(state.loopCycle, cx, cy - 4);
+  ctx.font = "9px 'JetBrains Mono'";
+  ctx.fillStyle = "#6e7681";
+  ctx.fillText("CYCLE", cx, cy + 14);
+}
+
+function updateLoopVisual(phaseName) {
+  renderLoopRing();
+  document.getElementById("loopInfo").textContent = `Phase: ${phaseName} · Cycle ${state.loopCycle}`;
+}
+
+function renderThreads() {
+  const tg = document.getElementById("threadGrid");
+  tg.innerHTML = "";
+  for (let t = 0; t < NUM_THREADS; t++) {
+    const d = document.createElement("div");
+    d.className = "cell";
+    const val = state.threadData[t];
+    if (val !== 0xFFFFFFFF && t < NUM_LISTS) {
+      d.classList.add("has-val");
+      d.textContent = hex(val);
+      // Color coding
+      if (t === state.winnerTid && !state.mergeDone && state.mergePos > 0) d.classList.add("winner");
+      else if (state.reductionMin && val === state.globalMin) d.classList.add("min-val");
+    } else if (t < NUM_LISTS && state.threadOwner[t] === -1) {
+      d.textContent = "—";
+      d.style.color = "#6e7681";
+    } else {
+      d.textContent = "";
+      d.style.opacity = "0.3";
+    }
+    const tid = document.createElement("span");
+    tid.className = "tid";
+    tid.textContent = `t${t}`;
+    d.appendChild(tid);
+    tg.appendChild(d);
+  }
+}
+
+function renderReductions() {
+  const rb1 = document.getElementById("redBar1");
+  const rb2 = document.getElementById("redBar2");
+  rb1.innerHTML = "";
+  rb2.innerHTML = "";
+  for (let r = 0; r < MAX_ACTIVE_REDUCTIONS + 1; r++) {
+    const d1 = document.createElement("div");
+    d1.className = "red-cell" + ((state.reductionMin[r] !== undefined && state.reductionMin[r] !== 0xFFFFFFFF) ? " active" : "");
+    d1.textContent = state.reductionMin[r] !== undefined && state.reductionMin[r] !== 0xFFFFFFFF ? hex(state.reductionMin[r]) : "—";
+    rb1.appendChild(d1);
+  }
+  // Final
+  const d2 = document.createElement("div");
+  d2.className = "red-cell" + (state.globalMin !== 0xFFFFFFFF ? " active" : "");
+  d2.textContent = state.globalMin !== 0xFFFFFFFF ? `GLOBAL: ${hex(state.globalMin)}` : "—";
+  rb2.appendChild(d2);
+  if (state.winnerTid !== 0xFFFFFFFF) {
+    const dw = document.createElement("div");
+    dw.className = "red-cell active";
+    dw.textContent = `WINNER: tid=${state.winnerTid}`;
+    rb2.appendChild(dw);
+  }
+}
+
+function renderOutput() {
+  const os = document.getElementById("outputStrip");
+  os.innerHTML = state.dest.map((v, i) => {
+    const latest = i === state.dest.length - 1 && state.mergePos > 0 && !state.mergeDone;
+    return `<div class="out-cell ${latest ? 'latest' : ''}">${hex(v)}</div>`;
+  }).join("");
+  document.getElementById("mergeInfo").textContent = `Output ${state.dest.length}/${TOTAL_ELEMENTS}`;
+}
+
+function renderMemory() {
+  const mp = document.getElementById("memPanel");
+  mp.innerHTML = "";
+  for (let l = 0; l < NUM_LISTS; l++) {
+    const row = document.createElement("div");
+    row.className = "mem-list-row";
+    const label = document.createElement("div");
+    label.className = "mem-list-label";
+    label.textContent = `L${l} ${SKILLS[l].icon}`;
+    row.appendChild(label);
+    const bars = document.createElement("div");
+    bars.className = "mem-list-bars";
+    for (let e = 0; e < ELEMS_PER_LIST; e++) {
+      const b = document.createElement("div");
+      b.className = "mem-bar";
+      b.setAttribute("data-list", l);
+      b.setAttribute("data-elem", e);
+      b.textContent = hex(state.memLists[l][e]);
+      bars.appendChild(b);
+    }
+    row.appendChild(bars);
+    mp.appendChild(row);
+  }
+}
+
+let memMarked = [];
+function markMemPopped(list, elem) {
+  memMarked.push({ list, elem });
+  const bars = document.querySelectorAll(".mem-bar");
+  bars.forEach(b => {
+    const bl = parseInt(b.getAttribute("data-list"));
+    const be = parseInt(b.getAttribute("data-elem"));
+    if (memMarked.some(m => m.list === bl && m.elem === be)) {
+      b.classList.add("popped");
+    }
+  });
+}
+
+function renderCode() {
+  const cp = document.getElementById("codePanel");
+  cp.innerHTML = `<div class="code-block">${CUDA_LINES.map((line, i) => {
+    const hl = i === state.codeLine ? "hl" : "";
+    return `<span class="${hl}">${line}</span>`;
+  }).join("\n")}</div>`;
+  // Scroll to highlighted line
+  const hlEl = cp.querySelector(".hl");
+  if (hlEl) hlEl.scrollIntoView({ behavior: "smooth", block: "center" });
+}
+
+function renderAll() {
+  renderSkills();
+  renderLoopRing();
+  updateLoopVisual(LOOP_PHASES[state.loopPhase]?.name || "—");
+  renderThreads();
+  renderReductions();
+  renderOutput();
+  renderMemory();
+  renderCode();
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// INIT
+// ═══════════════════════════════════════════════════════════════════
+initMemory();
+memMarked = [];
+renderAll();
+log("System initialized. 8 skill memory channels ready. Hit ▶ or ⏭ to begin.", "loop");
+</script>
+</body>
+</html>

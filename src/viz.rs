@@ -276,13 +276,14 @@ pub struct VizChildSpec {
 /// Shared with the underlay so the drawn axis label and the mesh heights
 /// can never disagree.
 pub(crate) fn bar_axis_max(bar: &ChartBarV1) -> f64 {
-    bar.max.unwrap_or_else(|| {
-        bar.items
-            .iter()
-            .map(|item| item.value)
-            .fold(0.0_f64, f64::max)
-    })
-    .max(f64::EPSILON)
+    bar.max
+        .unwrap_or_else(|| {
+            bar.items
+                .iter()
+                .map(|item| item.value)
+                .fold(0.0_f64, f64::max)
+        })
+        .max(f64::EPSILON)
 }
 
 /// The `chart.line.v1` plot ranges as `((x_min, x_max), (y_min, y_max))`:
@@ -324,7 +325,11 @@ pub(crate) fn timeline_window(timeline: &TimelineV1) -> (f64, f64) {
         start = start.min(event.t);
         end = end.max(event.t + event.dur);
     }
-    if start > end { (0.0, 1.0) } else { (start, end) }
+    if start > end {
+        (0.0, 1.0)
+    } else {
+        (start, end)
+    }
 }
 
 /// Normalizes `value` into `low..=high` as `0..=1`, mapping a degenerate
@@ -334,7 +339,8 @@ pub(crate) fn timeline_window(timeline: &TimelineV1) -> (f64, f64) {
 /// (Decode rejects the constructible cases; this guard is the backstop.)
 pub(crate) fn range_normalized(value: f64, low: f64, high: f64) -> f32 {
     let span = high - low;
-    if !(span > f64::EPSILON) {
+    // NaN spans (inf - inf) take the degenerate branch explicitly.
+    if span.is_nan() || span <= f64::EPSILON {
         return 0.5;
     }
     let normalized = ((value - low) / span) as f32;

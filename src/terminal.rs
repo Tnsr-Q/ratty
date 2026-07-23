@@ -283,8 +283,10 @@ impl TerminalSurface {
             .map(|(id, _)| id)
             .collect();
         viz_ids.sort_unstable();
-        let mut underlays: Vec<(crate::viz_draw::UnderlayRect, Vec<crate::viz_draw::VizDrawOp>)> =
-            Vec::new();
+        let mut underlays: Vec<(
+            crate::viz_draw::UnderlayRect,
+            Vec<crate::viz_draw::VizDrawOp>,
+        )> = Vec::new();
         for id in viz_ids {
             let Some(entry) = viz.get(id) else {
                 continue;

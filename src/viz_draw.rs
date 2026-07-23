@@ -487,12 +487,7 @@ fn line_ops(line: &ChartLineV1) -> Vec<VizDrawOp> {
                 points: series
                     .points
                     .iter()
-                    .map(|point| {
-                        (
-                            px + span_x(point.x) * pw,
-                            py + (1.0 - span_y(point.y)) * ph,
-                        )
-                    })
+                    .map(|point| (px + span_x(point.x) * pw, py + (1.0 - span_y(point.y)) * ph))
                     .collect(),
                 width: SERIES_WIDTH,
                 color,
@@ -500,7 +495,10 @@ fn line_ops(line: &ChartLineV1) -> Vec<VizDrawOp> {
         }
         // Series name, stacked below the title at the plot's right edge.
         ops.push(VizDrawOp::Text {
-            pos: (px + pw - 0.01, py + 0.02 + index as f32 * (LABEL_HEIGHT + 0.02)),
+            pos: (
+                px + pw - 0.01,
+                py + 0.02 + index as f32 * (LABEL_HEIGHT + 0.02),
+            ),
             height: LABEL_HEIGHT,
             text: series.name.clone(),
             color,
@@ -612,7 +610,12 @@ fn timeline_ops(timeline: &TimelineV1) -> Vec<VizDrawOp> {
         let center = py + (index as f32 + 0.5) * lane_height;
         if index > 0 {
             let separator = py + index as f32 * lane_height;
-            ops.push(segment((px, separator), (px + pw, separator), GRID_WIDTH, GRID));
+            ops.push(segment(
+                (px, separator),
+                (px + pw, separator),
+                GRID_WIDTH,
+                GRID,
+            ));
         }
         ops.push(VizDrawOp::Text {
             pos: (px - 0.015, center - LABEL_HEIGHT * 0.5),
@@ -646,8 +649,20 @@ fn glyph_strokes(character: char) -> Option<GlyphStrokes> {
             &[(0, 0), (3, 0), (4, 1), (4, 2), (3, 3), (0, 3)],
             &[(3, 3), (4, 4), (4, 5), (3, 6), (0, 6)],
         ],
-        'C' => &[&[(4, 1), (3, 0), (1, 0), (0, 1), (0, 5), (1, 6), (3, 6), (4, 5)]],
-        'D' => &[&[(0, 0), (0, 6)], &[(0, 0), (3, 0), (4, 1), (4, 5), (3, 6), (0, 6)]],
+        'C' => &[&[
+            (4, 1),
+            (3, 0),
+            (1, 0),
+            (0, 1),
+            (0, 5),
+            (1, 6),
+            (3, 6),
+            (4, 5),
+        ]],
+        'D' => &[
+            &[(0, 0), (0, 6)],
+            &[(0, 0), (3, 0), (4, 1), (4, 5), (3, 6), (0, 6)],
+        ],
         'E' => &[&[(4, 0), (0, 0), (0, 6), (4, 6)], &[(0, 3), (3, 3)]],
         'F' => &[&[(4, 0), (0, 0), (0, 6)], &[(0, 3), (3, 3)]],
         'G' => &[&[
@@ -777,7 +792,16 @@ fn glyph_strokes(character: char) -> Option<GlyphStrokes> {
                 (0, 1),
                 (1, 0),
             ],
-            &[(1, 3), (0, 4), (0, 5), (1, 6), (3, 6), (4, 5), (4, 4), (3, 3)],
+            &[
+                (1, 3),
+                (0, 4),
+                (0, 5),
+                (1, 6),
+                (3, 6),
+                (4, 5),
+                (4, 4),
+                (3, 3),
+            ],
         ],
         '9' => &[&[
             (1, 6),
@@ -884,8 +908,7 @@ pub(crate) fn append_viz_underlay(scene: &mut Scene, rect: UnderlayRect, ops: &[
                 if points.len() < 2 {
                     continue;
                 }
-                let mapped: Vec<(f64, f64)> =
-                    points.iter().map(|&(fx, fy)| map(fx, fy)).collect();
+                let mapped: Vec<(f64, f64)> = points.iter().map(|&(fx, fy)| map(fx, fy)).collect();
                 scene.stroke(
                     &Stroke::new(stroke_width(*width)),
                     Affine::IDENTITY,
@@ -965,8 +988,7 @@ fn append_text(
         return;
     }
     let run_width = advance * characters.len() as f32;
-    let start_x = rect.x
-        + pos.0 * rect.width
+    let start_x = rect.x + pos.0 * rect.width
         - match align {
             TextAlign::Left => 0.0,
             TextAlign::Center => run_width * 0.5,
@@ -1100,8 +1122,7 @@ mod tests {
         let (cx, cy, _, ry) = gauge_dial_geometry(0, 1);
         let (expected_x, expected_y) = foot_to_root(cx, cy - ry);
         assert!(
-            (translation.x - expected_x).abs() < 1e-4
-                && (translation.y - expected_y).abs() < 1e-4,
+            (translation.x - expected_x).abs() < 1e-4 && (translation.y - expected_y).abs() < 1e-4,
             "a half dial points at the arc top"
         );
     }
@@ -1147,7 +1168,10 @@ mod tests {
             "ps.v1",
             json!({ "capture": capture(), "items": [{ "pid": 1, "name": "a" }] }),
         );
-        assert!(viz_underlay_ops(&grid).is_none(), "grid kinds keep M3.5's look");
+        assert!(
+            viz_underlay_ops(&grid).is_none(),
+            "grid kinds keep M3.5's look"
+        );
         let bar = decode("chart.bar.v1", json!({ "capture": capture(), "items": [] }));
         let ops = viz_underlay_ops(&bar).expect("chart kinds draw an underlay");
         assert!(

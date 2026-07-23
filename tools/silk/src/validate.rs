@@ -507,12 +507,7 @@ fn check_viz(
 /// Checks a sound kind against the registry ratty itself compiles
 /// (`osc::SOUND_KINDS`): unknown kinds and class mismatches are rejected
 /// terminal-side with `bad-kind`, so a cast carrying them is broken.
-fn check_sound_kind(
-    line: usize,
-    kind: &str,
-    expected: osc::SoundKindClass,
-    report: &mut Report,
-) {
+fn check_sound_kind(line: usize, kind: &str, expected: osc::SoundKindClass, report: &mut Report) {
     match osc::sound_kind_class(kind) {
         Some(class) if class == expected => {}
         Some(_) => {
@@ -737,7 +732,11 @@ mod tests {
                 "o",
                 "\x1b]777;ratty:sound.ambient.set;kind=ambient.hum&gain=0.4&xfade=800\x07",
             ),
-            (0.5, "o", "\x1b]777;ratty:sound.play;kind=chime&gain=0.5\x07"),
+            (
+                0.5,
+                "o",
+                "\x1b]777;ratty:sound.play;kind=chime&gain=0.5\x07",
+            ),
             (0.6, "o", "\x1b]777;ratty:mood;mood=excited\x07"),
             (1.0, "o", "\x1b]777;ratty:sound.ambient.stop;fade=250\x07"),
         ]);

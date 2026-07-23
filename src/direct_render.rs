@@ -238,7 +238,10 @@ pub(crate) fn update_direct_terminal_frame(
     cursor: Option<Position>,
     cursor_visible: bool,
     elapsed_seconds: f32,
-    viz_underlays: &[(crate::viz_draw::UnderlayRect, Vec<crate::viz_draw::VizDrawOp>)],
+    viz_underlays: &[(
+        crate::viz_draw::UnderlayRect,
+        Vec<crate::viz_draw::VizDrawOp>,
+    )],
 ) {
     let build_scene = exchange.take_recycled_scene();
     let spare_scene = terminal_renderer.replace_scene(build_scene);

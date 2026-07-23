@@ -2726,12 +2726,10 @@ mod tests {
     #[test]
     fn think_flags_become_state() {
         assert_eq!(
-            round_trip(
-                &Commands::Think {
-                    start: true,
-                    end: false
-                }
-            ),
+            round_trip(&Commands::Think {
+                start: true,
+                end: false
+            }),
             RattyAiCommand::Think {
                 state: "start".into()
             }
@@ -2793,11 +2791,9 @@ mod tests {
     #[test]
     fn mood_enum_maps_to_strings() {
         assert_eq!(
-            round_trip(
-                &Commands::Mood {
-                    mood: MoodArg::Excited
-                }
-            ),
+            round_trip(&Commands::Mood {
+                mood: MoodArg::Excited
+            }),
             RattyAiCommand::Mood {
                 mood: "excited".into()
             }
@@ -2807,25 +2803,21 @@ mod tests {
     #[test]
     fn sound_subcommands_round_trip() {
         assert_eq!(
-            round_trip(
-                &Commands::Sound(SoundAction::Play {
-                    kind: "chime".into(),
-                    gain: Some(0.5),
-                })
-            ),
+            round_trip(&Commands::Sound(SoundAction::Play {
+                kind: "chime".into(),
+                gain: Some(0.5),
+            })),
             RattyAiCommand::SoundPlay {
                 kind: "chime".into(),
                 gain: Some(0.5),
             }
         );
         assert_eq!(
-            round_trip(
-                &Commands::Sound(SoundAction::Ambient(AmbientAction::Set {
-                    kind: "ambient.hum".into(),
-                    gain: None,
-                    xfade: Some(800),
-                }))
-            ),
+            round_trip(&Commands::Sound(SoundAction::Ambient(AmbientAction::Set {
+                kind: "ambient.hum".into(),
+                gain: None,
+                xfade: Some(800),
+            }))),
             RattyAiCommand::SoundAmbientSet {
                 kind: "ambient.hum".into(),
                 gain: None,
@@ -2833,9 +2825,9 @@ mod tests {
             }
         );
         assert_eq!(
-            round_trip(
-                &Commands::Sound(SoundAction::Ambient(AmbientAction::Stop { fade: None }))
-            ),
+            round_trip(&Commands::Sound(SoundAction::Ambient(
+                AmbientAction::Stop { fade: None }
+            ))),
             RattyAiCommand::SoundAmbientStop { fade: None }
         );
     }

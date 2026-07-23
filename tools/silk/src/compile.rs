@@ -754,7 +754,11 @@ impl Compiler<'_> {
         }
         let encoded = query::b64url_encode(&bytes);
         if let Err(error) = viz_wire::decode_viz_payload(kind, &encoded) {
-            bail!("viz step rejected by ratty's decoder ({}): {}", error.code, error.message);
+            bail!(
+                "viz step rejected by ratty's decoder ({}): {}",
+                error.code,
+                error.message
+            );
         }
         // base64url never needs escaping; the other values are numeric.
         let mut payload = format!("id={id}&kind={}&data={encoded}", osc::percent_encode(kind));
@@ -1100,7 +1104,11 @@ mod tests {
         )
         .unwrap();
         let cast = compile(&scene, Path::new(".")).unwrap();
-        let datas: Vec<&str> = cast.events.iter().map(|event| event.data.as_str()).collect();
+        let datas: Vec<&str> = cast
+            .events
+            .iter()
+            .map(|event| event.data.as_str())
+            .collect();
         assert_eq!(
             datas,
             [
@@ -1228,7 +1236,10 @@ mod tests {
         assert_eq!(payload.capture().source, "synthetic demo");
 
         for (viz_json, expected) in [
-            (r#"{"kind": "chart.bar.v1", "data": {}}"#, "viz.id is required"),
+            (
+                r#"{"kind": "chart.bar.v1", "data": {}}"#,
+                "viz.id is required",
+            ),
             (
                 r#"{"id": 42, "kind": "chart.bar.v1", "data": {}}"#,
                 "below the AI-owned range",
@@ -1297,9 +1308,8 @@ mod tests {
                 "non-negative",
             ),
         ] {
-            let json = format!(
-                r#"{{"meta":{{"title":"t"}},"cast":[{{"at":0.0,"sound":{sound_json}}}]}}"#
-            );
+            let json =
+                format!(r#"{{"meta":{{"title":"t"}},"cast":[{{"at":0.0,"sound":{sound_json}}}]}}"#);
             let scene: Scene = serde_json::from_str(&json).unwrap();
             let error = compile(&scene, Path::new(".")).unwrap_err();
             assert!(
@@ -1320,9 +1330,8 @@ mod tests {
             r#"{"play": "chime", "url": "https://x/boom.ogg"}"#,
             r#"{"ambient": "ambient.hum", "master_gain": 1.0}"#,
         ] {
-            let json = format!(
-                r#"{{"meta":{{"title":"t"}},"cast":[{{"at":0.0,"sound":{sound_json}}}]}}"#
-            );
+            let json =
+                format!(r#"{{"meta":{{"title":"t"}},"cast":[{{"at":0.0,"sound":{sound_json}}}]}}"#);
             assert!(
                 serde_json::from_str::<Scene>(&json).is_err(),
                 "scene with {sound_json} must fail to parse"
