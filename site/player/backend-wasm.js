@@ -37,23 +37,46 @@ export class WasmBackend {
     this.onready?.();
   }
 
-  // One-time browser-autoplay unlock. The first genuine gesture resumes
-  // the captured AudioContexts (the wasm audio backend only tries once,
-  // at creation — before any gesture exists) and reports the gesture to
-  // the session, which unlocks the sound organ and fades in a deferred
-  // ambient bed. Pre-unlock semantics are the normal first-load path:
-  // the first transmission autoplays with no gesture.
+  // Browser-autoplay unlock. Only an activation-granting gesture can
+  // resume a suspended AudioContext, and only once one actually reaches
+  // "running" do we report the gesture to the session (which unlocks the
+  // sound organ and fades in a deferred ambient bed) and drop the
+  // listeners. A single non-activating event (Escape, a lone modifier, a
+  // pointerdown a browser does not count as activation) or a rejected
+  // resume() must not consume the unlock and leave the organ reporting
+  // unlocked while the context stays silent — so the listeners stay
+  // installed, retrying on each gesture, until audio is genuinely live.
+  // Pre-unlock is the normal first-load path: the first transmission
+  // autoplays with no gesture.
   installUnlockListeners(audioContexts) {
-    const unlock = () => {
-      window.removeEventListener("pointerdown", unlock);
-      window.removeEventListener("keydown", unlock);
-      for (const context of audioContexts) {
-        if (context.state !== "running") context.resume().catch(() => {});
-      }
+    const events = ["pointerup", "click", "keydown", "touchend"];
+    const isActivating = (event) => {
+      if (event.type !== "keydown") return true;
+      // Escape and lone modifier presses do not grant user activation.
+      if (event.key === "Escape" || event.key === "Esc") return false;
+      return !["Shift", "Control", "Alt", "Meta"].includes(event.key);
+    };
+    const finish = () => {
+      for (const type of events) window.removeEventListener(type, tryUnlock);
       this.session?.user_gesture();
     };
-    window.addEventListener("pointerdown", unlock, { passive: true });
-    window.addEventListener("keydown", unlock);
+    const tryUnlock = async (event) => {
+      if (!isActivating(event)) return;
+      const pending = audioContexts.filter((c) => c.state !== "running");
+      // No context to resume (audio feature off, or already running):
+      // the gesture stands on its own.
+      if (pending.length === 0) {
+        finish();
+        return;
+      }
+      // resume() is invoked synchronously inside the handler so the user
+      // activation still counts; we only await to learn whether it took.
+      await Promise.all(pending.map((c) => c.resume().catch(() => {})));
+      if (audioContexts.every((c) => c.state === "running")) finish();
+    };
+    for (const type of events) {
+      window.addEventListener(type, tryUnlock, { passive: true });
+    }
   }
 
   startInputPolling() {
