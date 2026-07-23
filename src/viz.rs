@@ -328,13 +328,20 @@ pub(crate) fn timeline_window(timeline: &TimelineV1) -> (f64, f64) {
 }
 
 /// Normalizes `value` into `low..=high` as `0..=1`, mapping a degenerate
-/// range onto its center.
+/// range onto its center. Defensive against extreme-but-finite inputs
+/// whose *difference* overflows (`high - low = inf` gives `inf/inf =
+/// NaN`): a non-finite result centers instead of poisoning a transform.
+/// (Decode rejects the constructible cases; this guard is the backstop.)
 pub(crate) fn range_normalized(value: f64, low: f64, high: f64) -> f32 {
     let span = high - low;
-    if span <= f64::EPSILON {
+    if !(span > f64::EPSILON) {
         return 0.5;
     }
-    (((value - low) / span) as f32).clamp(0.0, 1.0)
+    let normalized = ((value - low) / span) as f32;
+    if !normalized.is_finite() {
+        return 0.5;
+    }
+    normalized.clamp(0.0, 1.0)
 }
 
 /// The gauge needle fraction: `value` inside `min..=max`, clamped — the

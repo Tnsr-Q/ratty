@@ -579,6 +579,12 @@ impl VizPayload {
                             item.key
                         )));
                     }
+                    if !(item.max - item.min).is_finite() {
+                        return Err(bad_payload(format!(
+                            "gauge '{}': max - min overflows; the range must be finite",
+                            item.key
+                        )));
+                    }
                 }
             }
             VizPayload::Timeline(payload) => {
@@ -599,6 +605,15 @@ impl VizPayload {
                         if event.dur < 0.0 {
                             return Err(bad_payload(format!(
                                 "event '{}' carries a negative dur",
+                                event.id
+                            )));
+                        }
+                        // Two finite values whose sum overflows would put
+                        // infinity into the derived window and NaN into
+                        // every normalized span downstream.
+                        if !(event.t + event.dur).is_finite() {
+                            return Err(bad_payload(format!(
+                                "event '{}': t + dur overflows; the span end must be finite",
                                 event.id
                             )));
                         }
@@ -673,6 +688,13 @@ fn check_axis_pair(
             check_finite(high_name, high_value)?;
             if low_value >= high_value {
                 return Err(bad_payload(format!("{low_name} must be below {high_name}")));
+            }
+            // Two finite extremes whose span overflows would divide by
+            // infinity downstream.
+            if !(high_value - low_value).is_finite() {
+                return Err(bad_payload(format!(
+                    "{high_name} - {low_name} overflows; the range must be finite"
+                )));
             }
             Ok(())
         }
@@ -1000,6 +1022,45 @@ mod tests {
         )
         .expect_err("over the item cap");
         assert_eq!(error.code, codes::TOO_LARGE);
+    }
+
+    #[test]
+    fn finite_pairs_whose_span_overflows_reject() {
+        // Individually finite extremes whose difference (or sum) is
+        // infinite would put NaN into every normalized span downstream.
+        let event_overflow = json!({
+            "capture": capture(),
+            "lanes": [{ "name": "l", "events": [
+                { "id": "e", "t": f64::MAX, "dur": f64::MAX },
+            ] }],
+        });
+        let error =
+            decode_viz_payload("timeline.v1", &encode(event_overflow)).expect_err("t+dur overflow");
+        assert_eq!(error.code, codes::BAD_PAYLOAD);
+
+        let window_overflow = json!({
+            "capture": capture(),
+            "t0": -f64::MAX, "t1": f64::MAX,
+        });
+        let error = decode_viz_payload("timeline.v1", &encode(window_overflow))
+            .expect_err("window span overflow");
+        assert_eq!(error.code, codes::BAD_PAYLOAD);
+
+        let axis_overflow = json!({
+            "capture": capture(),
+            "y_min": -f64::MAX, "y_max": f64::MAX,
+        });
+        let error = decode_viz_payload("chart.line.v1", &encode(axis_overflow))
+            .expect_err("y span overflow");
+        assert_eq!(error.code, codes::BAD_PAYLOAD);
+
+        let gauge_overflow = json!({
+            "capture": capture(),
+            "items": [{ "key": "g", "value": 0.0, "min": -f64::MAX, "max": f64::MAX }],
+        });
+        let error = decode_viz_payload("chart.gauge.v1", &encode(gauge_overflow))
+            .expect_err("gauge span overflow");
+        assert_eq!(error.code, codes::BAD_PAYLOAD);
     }
 
     #[test]
