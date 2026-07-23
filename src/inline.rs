@@ -110,7 +110,7 @@ pub struct TerminalInlineObjects {
 /// Ratty handles no OSC that legitimately exceeds this (titles, 778
 /// queries, and every other OSC code — all far smaller), so truncation
 /// only ever affects pathological or hostile input.
-const MAX_OSC_SEQUENCE_BYTES: usize = 64 * 1024;
+pub(crate) const MAX_OSC_SEQUENCE_BYTES: usize = 64 * 1024;
 
 // The watchdog cap must never sit below the query-acceptance bound, or a
 // valid-but-large 778 query would be truncated before it could be parsed.

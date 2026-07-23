@@ -158,6 +158,7 @@ pub(crate) fn shutdown_terminal_runtime_on_exit(
 pub fn pump_pty_output(
     mut runtime: ResMut<TerminalRuntime>,
     mut inline_objects: ResMut<TerminalInlineObjects>,
+    mut viz_registry: ResMut<crate::viz::VizRegistry>,
     mut app_exit: MessageWriter<AppExit>,
     mut ai_commands: MessageWriter<crate::ai::AiCommand>,
     mut queries: MessageWriter<crate::query_channel::QueryRequest>,
@@ -172,7 +173,10 @@ pub fn pump_pty_output(
     loop {
         match runtime.try_recv() {
             Ok(chunk) => {
-                let track_scroll = inline_objects.has_scroll_tracked_anchors();
+                // Viz anchors always scroll with text, so any anchored
+                // visualization keeps scroll inference alive too.
+                let track_scroll =
+                    inline_objects.has_scroll_tracked_anchors() || viz_registry.has_anchors();
                 let prev_rows: Option<Vec<String>> = if track_scroll {
                     let (_, cols) = runtime.parser.screen().size();
                     Some(runtime.parser.screen().rows(0, cols).collect::<Vec<_>>())
@@ -209,6 +213,7 @@ pub fn pump_pty_output(
                     let next_rows = screen_rows(runtime.parser.screen());
                     let scrolled = infer_upward_scroll(&prev_rows, &next_rows);
                     inline_objects.apply_scroll(scrolled);
+                    viz_registry.apply_scroll(scrolled);
                 }
                 inline_objects.refresh_placeholder_anchors(runtime.parser.screen());
                 processed_output = true;

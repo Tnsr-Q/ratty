@@ -90,6 +90,13 @@ pub mod codes {
     pub const BAD_ASSET: &str = "bad-asset";
     /// The mode string is not a known presentation mode.
     pub const BAD_MODE: &str = "bad-mode";
+    /// The viz payload kind is not a registered, versioned kind. An
+    /// unknown schema version is the same case: the version is part of
+    /// the kind name (`ps.v1`).
+    pub const BAD_KIND: &str = "bad-kind";
+    /// A live visualization under the id has a different kind and
+    /// `replace=true` was not set.
+    pub const KIND_MISMATCH: &str = "kind-mismatch";
     /// The query timed out client-side (never emitted by the terminal).
     pub const TIMEOUT: &str = "timeout";
     /// The session was disposed with the query outstanding.
