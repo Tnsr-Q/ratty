@@ -15,6 +15,7 @@ pub mod effects;
 pub mod inline;
 pub mod keyboard;
 pub mod kitty;
+pub mod macros;
 pub mod model;
 pub mod mouse;
 pub mod osc;

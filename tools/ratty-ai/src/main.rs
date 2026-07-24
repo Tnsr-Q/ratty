@@ -649,15 +649,27 @@ enum MacroAction {
         /// Macro name.
         #[arg(short, long)]
         name: String,
+        /// Overwrite an existing macro of the same name (transactional).
+        #[arg(long)]
+        replace: bool,
     },
-    /// Stop recording.
+    /// Stop recording (finalize) or cancel an active playback.
     Stop,
     /// Replay a macro.
     Play {
         /// Macro name.
         name: String,
+        /// Playback rate multiplier (2.0 = double speed, 0.5 = half).
+        #[arg(long)]
+        rate: Option<f32>,
+        /// Drop recorded delays; replay in order at the per-frame budget.
+        #[arg(long)]
+        instant: bool,
+        /// Resolution scope; omit to resolve session then trusted.
+        #[arg(long, value_enum)]
+        scope: Option<ScopeArg>,
     },
-    /// Export a macro to a file.
+    /// Export a macro to a file (rejected: the wire never writes a path).
     Export {
         /// Macro name.
         #[arg(short, long)]
@@ -666,11 +678,28 @@ enum MacroAction {
         #[arg(short, long, default_value = "macro.ratty")]
         to: String,
     },
-    /// Run a macro file.
+    /// Run a macro file (rejected: the wire never reads a path).
     Run {
         /// Macro file path.
         path: String,
     },
+}
+
+/// The `macro play --scope` vocabulary (mirrors `osc::MacroScope`).
+#[derive(Clone, Copy, ValueEnum)]
+enum ScopeArg {
+    /// The caller's per-agent session registry.
+    Session,
+    /// The trusted, wire-immutable promoted registry.
+    Trusted,
+}
+
+/// The wire spelling of a `--scope` value.
+fn scope_str(scope: ScopeArg) -> &'static str {
+    match scope {
+        ScopeArg::Session => "session",
+        ScopeArg::Trusted => "trusted",
+    }
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -914,11 +943,29 @@ fn command_to_osc(command: &Commands) -> (String, String) {
             AvatarAction::Hide => ("avatar.hide".into(), String::new()),
         },
         Commands::Macro(action) => match action {
-            MacroAction::Record { name } => {
-                ("macro.record".into(), p().field("name", name).build())
+            MacroAction::Record { name, replace } => {
+                let mut payload = p().field("name", name);
+                if *replace {
+                    payload = payload.field("mode", "replace");
+                }
+                ("macro.record".into(), payload.build())
             }
             MacroAction::Stop => ("macro.stop".into(), String::new()),
-            MacroAction::Play { name } => ("macro.play".into(), p().field("name", name).build()),
+            MacroAction::Play {
+                name,
+                rate,
+                instant,
+                scope,
+            } => {
+                let mut payload = p().field("name", name).opt("rate", *rate);
+                if *instant {
+                    payload = payload.field("mode", "instant");
+                }
+                if let Some(scope) = scope {
+                    payload = payload.field("scope", scope_str(*scope));
+                }
+                ("macro.play".into(), payload.build())
+            }
             MacroAction::Export { name, to } => (
                 "macro.export".into(),
                 p().field("name", name).field("to", to).build(),
@@ -2784,6 +2831,56 @@ mod tests {
             }),
             RattyAiCommand::BookmarkJump {
                 name: "dock".into()
+            }
+        );
+    }
+
+    #[test]
+    fn macro_record_and_play_round_trip_with_flags() {
+        assert_eq!(
+            round_trip(&Commands::Macro(MacroAction::Record {
+                name: "deploy".into(),
+                replace: true,
+            })),
+            RattyAiCommand::MacroRecord {
+                name: "deploy".into(),
+                replace: true,
+            }
+        );
+        assert_eq!(
+            round_trip(&Commands::Macro(MacroAction::Stop)),
+            RattyAiCommand::MacroStop
+        );
+        // A bare play: recorded tempo, session-then-trusted, one run.
+        assert_eq!(
+            round_trip(&Commands::Macro(MacroAction::Play {
+                name: "deploy".into(),
+                rate: None,
+                instant: false,
+                scope: None,
+            })),
+            RattyAiCommand::MacroPlay {
+                name: "deploy".into(),
+                hash: None,
+                rate: 1.0,
+                instant: false,
+                scope: None,
+            }
+        );
+        // Every flag set.
+        assert_eq!(
+            round_trip(&Commands::Macro(MacroAction::Play {
+                name: "deploy".into(),
+                rate: Some(2.0),
+                instant: true,
+                scope: Some(ScopeArg::Trusted),
+            })),
+            RattyAiCommand::MacroPlay {
+                name: "deploy".into(),
+                hash: None,
+                rate: 2.0,
+                instant: true,
+                scope: Some(osc::MacroScope::Trusted),
             }
         );
     }

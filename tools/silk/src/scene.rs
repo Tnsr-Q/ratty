@@ -134,6 +134,11 @@ pub struct Step {
     /// Data visualization snapshot (OSC 777 `viz.set`).
     #[serde(default)]
     pub viz: Option<VizArgs>,
+    /// Record the enclosed choreography as a session macro (compiles to the
+    /// `macro.record … macro.stop` bracket). Pure sugar — no new wire
+    /// authority.
+    #[serde(default, rename = "macro")]
+    pub macro_: Option<MacroArgs>,
     /// Delete one object (`{"id": N}`) or all (`"all"`).
     #[serde(default)]
     pub delete: Option<DeleteArg>,
@@ -157,6 +162,7 @@ impl Step {
             + usize::from(self.ai.is_some())
             + usize::from(self.sound.is_some())
             + usize::from(self.viz.is_some())
+            + usize::from(self.macro_.is_some())
             + usize::from(self.delete.is_some())
             + usize::from(self.marker.is_some())
             + usize::from(self.clear.is_some())
@@ -510,6 +516,23 @@ pub struct VizArgs {
     /// Allow replacing a live visualization of a different kind.
     #[serde(default)]
     pub replace: Option<bool>,
+}
+
+/// `macro` verb arguments: the enclosed `cast` is recorded once as it plays,
+/// bracketed by `macro.record … macro.stop`. Pure sugar over the same wire —
+/// no new authority. The enclosed steps are ordinary verbs; a nested `macro`
+/// block (no recursion) and a `reset` (it would cancel the recording) are
+/// compile errors.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MacroArgs {
+    /// Macro name (stored in the caller's session registry at play time).
+    pub name: String,
+    /// Overwrite an existing macro of the same name (transactional replace).
+    #[serde(default)]
+    pub replace: bool,
+    /// The enclosed choreography, recorded once as it plays.
+    pub cast: Vec<Step>,
 }
 
 /// `delete` verb argument.
