@@ -225,6 +225,11 @@ pub(crate) fn resize_terminal_image(image: &mut Image, width: u32, height: u32) 
     });
 }
 
+/// Builds and publishes one terminal frame. Chart-family visualizations
+/// hand in their vello underlays (pixel rect + resolution-independent
+/// ops); they append after the text so charts draw over the cells their
+/// anchored footprint covers, exactly like inline objects do.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn update_direct_terminal_frame(
     exchange: &DirectTerminalSceneExchange,
     images: TerminalImages,
@@ -233,13 +238,20 @@ pub(crate) fn update_direct_terminal_frame(
     cursor: Option<Position>,
     cursor_visible: bool,
     elapsed_seconds: f32,
+    viz_underlays: &[(
+        crate::viz_draw::UnderlayRect,
+        Vec<crate::viz_draw::VizDrawOp>,
+    )],
 ) {
     let build_scene = exchange.take_recycled_scene();
     let spare_scene = terminal_renderer.replace_scene(build_scene);
     let (width, height) = terminal_renderer.texture_size_for_buffer(buffer);
     let base_color = terminal_renderer.theme().background.to_peniko();
     terminal_renderer.build_scene_with_elapsed(buffer, cursor, cursor_visible, elapsed_seconds);
-    let scene = terminal_renderer.replace_scene(spare_scene);
+    let mut scene = terminal_renderer.replace_scene(spare_scene);
+    for (rect, ops) in viz_underlays {
+        crate::viz_draw::append_viz_underlay(&mut scene, *rect, ops);
+    }
 
     exchange.publish_frame(DirectTerminalFrame {
         render_image: images.render,

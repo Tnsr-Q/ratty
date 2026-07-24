@@ -31,6 +31,10 @@ mod osc;
 #[path = "../../../src/query.rs"]
 mod query;
 
+#[allow(dead_code)] // Shared viz schemas; the CLI validates authored payloads.
+#[path = "../../../src/viz_wire.rs"]
+mod viz_wire;
+
 /// Exit codes for the reply-reading paths (`query`, `state`, `--ack`):
 /// `0` success, `2` bad arguments/input JSON (clap usage errors also exit
 /// 2), `3` timeout, `4` malformed reply, `5` the terminal answered `ok=0`,
@@ -177,41 +181,30 @@ enum Commands {
     },
     /// Reset the scene to defaults.
     Reset,
-    /// Capture a screenshot (handler pending).
-    Screenshot {
-        /// Output path.
-        #[arg(short, long, default_value = "ratty-screenshot.png")]
-        output: String,
-    },
-    /// Render inline data as a chart (data from `--data` or stdin).
+    /// Publish authored chart data as a `viz.set` snapshot.
+    ///
+    /// The JSON (from `--data` or stdin) must conform to the kind's
+    /// schema — it is validated with the terminal's own decoder before a
+    /// byte leaves the CLI, and a missing `capture` is stamped as
+    /// authored, so provenance is explicit in both directions.
     Chart {
-        /// Chart kind.
+        /// Registered kind (`chart.bar.v1`, `chart.line.v1`,
+        /// `chart.gauge.v1`, `timeline.v1`; `bar`/`line`/`gauge`/
+        /// `timeline` shorthands).
         #[arg(short, long, default_value = "bar")]
         kind: String,
-        /// Anchor column.
-        #[arg(short, long, default_value = "0")]
-        x: u16,
-        /// Anchor row.
-        #[arg(short, long, default_value = "0")]
-        y: u16,
-        /// Scale.
-        #[arg(short, long, default_value = "1.0")]
-        scale: f32,
-        /// Inline data; reads stdin when omitted.
+        /// Inline JSON data; reads stdin when omitted.
         #[arg(short, long)]
         data: Option<String>,
-    },
-    /// Render piped input as a 3D timeline (reads stdin).
-    Timeline {
-        /// Anchor column.
-        #[arg(short, long, default_value = "0")]
-        x: u16,
-        /// Anchor row.
-        #[arg(short, long, default_value = "0")]
-        y: u16,
-        /// Scale.
-        #[arg(short, long, default_value = "1.0")]
-        scale: f32,
+        /// Visualization id (decimal, AI-owned range). Defaults to the
+        /// stable chart slot 2147483909 (0x8000_0105).
+        #[arg(long)]
+        id: Option<u32>,
+        /// Allow replacing a live visualization of a different kind.
+        #[arg(long)]
+        replace: bool,
+        #[command(flatten)]
+        anchor: AnchorArgs,
     },
     /// Collect a process snapshot and publish it as a `ps.v1` viz.
     ///
@@ -388,22 +381,45 @@ enum Commands {
         /// Pane id.
         pane: u8,
     },
-    /// Visualize command history.
+    /// Collect shell history and publish it as a `timeline.v1` viz.
+    ///
+    /// Reads permitted history data under the invoking user's own
+    /// permissions and normalizes it into a timeline snapshot — the
+    /// terminal never reads shell history on wire command. zsh extended
+    /// (`: start:elapsed;cmd`) and bash (`#epoch` stamps) formats keep
+    /// their real times and durations; when any entry is untimed the
+    /// whole snapshot falls back to sequence positions, declared in the
+    /// capture provenance.
     History {
-        /// How many recent entries.
-        #[arg(short, long, default_value = "50")]
-        last: usize,
-        /// Draw the visualization.
-        #[arg(short, long)]
-        visualize: bool,
+        /// Keep the last N entries.
+        #[arg(long, default_value_t = 32,
+              value_parser = clap::value_parser!(u64).range(1..=MAX_COLLECTOR_TOP))]
+        last: u64,
+        /// History file to read. Defaults to $HISTFILE, then
+        /// ~/.zsh_history, then ~/.bash_history.
+        #[arg(long)]
+        file: Option<std::path::PathBuf>,
+        /// Visualization id (decimal, AI-owned range). Defaults to the
+        /// stable history slot 2147483908 (0x8000_0104).
+        #[arg(long)]
+        id: Option<u32>,
+        /// Republish a fresh snapshot every N seconds (min 1) under the
+        /// same id until interrupted.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        watch: Option<u64>,
+        #[command(flatten)]
+        anchor: AnchorArgs,
     },
-    /// Bookmark the current state.
+    /// Store the current view (mode, warp) as a named bookmark.
     Bookmark {
         /// Bookmark name.
         #[arg(short, long)]
         name: String,
+        /// Overwrite an existing bookmark of the same name.
+        #[arg(long)]
+        replace: bool,
     },
-    /// Jump to a bookmark.
+    /// Jump to a stored view bookmark (`bookmark.jump`).
     Jump {
         /// Bookmark name.
         name: String,
@@ -703,7 +719,7 @@ impl Payload {
 
 /// Maps a parsed CLI command to its `(action, payload)`. `stdin` supplies
 /// piped input for `chart`/`timeline`.
-fn command_to_osc(command: &Commands, stdin: &str) -> (String, String) {
+fn command_to_osc(command: &Commands) -> (String, String) {
     let p = Payload::default;
     match command {
         Commands::Query { .. } | Commands::State { .. } => {
@@ -790,39 +806,14 @@ fn command_to_osc(command: &Commands, stdin: &str) -> (String, String) {
                 .build(),
         ),
         Commands::Reset => ("reset".into(), String::new()),
-        Commands::Screenshot { output } => ("screenshot".into(), p().field("path", output).build()),
-        Commands::Chart {
-            kind,
-            x,
-            y,
-            scale,
-            data,
-        } => {
-            let data = data.clone().unwrap_or_else(|| stdin.to_string());
-            (
-                "chart".into(),
-                p().field("kind", kind)
-                    .field("x", x)
-                    .field("y", y)
-                    .field("scale", scale)
-                    .field("data", data)
-                    .build(),
-            )
-        }
-        Commands::Timeline { x, y, scale } => (
-            "timeline".into(),
-            p().field("x", x)
-                .field("y", y)
-                .field("scale", scale)
-                .field("input", stdin)
-                .build(),
-        ),
         Commands::Ps { .. }
         | Commands::Fs { .. }
         | Commands::Git { .. }
         | Commands::Net { .. }
+        | Commands::History { .. }
+        | Commands::Chart { .. }
         | Commands::Kill { .. } => {
-            unreachable!("collectors gather locally and are handled before command_to_osc")
+            unreachable!("collectors and chart publishing are handled before command_to_osc")
         }
         Commands::Think { start, end } => {
             let state = if *start {
@@ -858,14 +849,14 @@ fn command_to_osc(command: &Commands, stdin: &str) -> (String, String) {
                 .build(),
         ),
         Commands::Close { pane } => ("pane.close".into(), p().field("pane", pane).build()),
-        Commands::History { last, visualize } => (
-            "history".into(),
-            p().field("last", last)
-                .field("visualize", visualize)
-                .build(),
-        ),
-        Commands::Bookmark { name } => ("bookmark".into(), p().field("name", name).build()),
-        Commands::Jump { name } => ("jump".into(), p().field("name", name).build()),
+        Commands::Bookmark { name, replace } => {
+            let mut payload = p().field("name", name);
+            if *replace {
+                payload = payload.field("mode", "replace");
+            }
+            ("bookmark".into(), payload.build())
+        }
+        Commands::Jump { name } => ("bookmark.jump".into(), p().field("name", name).build()),
         Commands::User(action) => match action {
             UserAction::Join { name, color } => (
                 "user.join".into(),
@@ -971,14 +962,6 @@ fn gesture_str(gesture: GestureArg) -> &'static str {
     }
 }
 
-/// Whether a command needs piped stdin for its payload.
-fn reads_stdin(command: &Commands) -> bool {
-    matches!(
-        command,
-        Commands::Timeline { .. } | Commands::Chart { data: None, .. }
-    )
-}
-
 // ── Collectors ──
 //
 // The `ps`/`fs`/`git`/`net` subcommands and the `kill` watcher gather
@@ -1000,6 +983,10 @@ const DEFAULT_FS_VIZ_ID: u32 = 0x8000_0101;
 const DEFAULT_GIT_VIZ_ID: u32 = 0x8000_0102;
 /// Default `net` viz id (see [`DEFAULT_PS_VIZ_ID`]).
 const DEFAULT_NET_VIZ_ID: u32 = 0x8000_0103;
+/// Default `history` viz id (see [`DEFAULT_PS_VIZ_ID`]).
+const DEFAULT_HISTORY_VIZ_ID: u32 = 0x8000_0104;
+/// Default `chart` viz id (see [`DEFAULT_PS_VIZ_ID`]).
+const DEFAULT_CHART_VIZ_ID: u32 = 0x8000_0105;
 
 /// Hard cap on every collector's `--top`: with worst-case labels (128
 /// bytes of `"` escaping to 256 in JSON) a snapshot of this many items
@@ -1133,7 +1120,13 @@ fn capture_json(source: &str) -> serde_json::Value {
 /// Builds a `viz.set` payload. `anchor` is only supplied for the first
 /// emission of a watch loop: an upsert without `x`/`y` keeps the live
 /// anchor, so refreshes never move (or un-scroll) the view.
-fn viz_set_wire(id: u32, kind: &str, data: &str, anchor: Option<&AnchorArgs>) -> String {
+fn viz_set_wire(
+    id: u32,
+    kind: &str,
+    data: &str,
+    anchor: Option<&AnchorArgs>,
+    replace: bool,
+) -> String {
     let mut payload = Payload::default()
         .field("id", id)
         .field("kind", kind)
@@ -1144,6 +1137,9 @@ fn viz_set_wire(id: u32, kind: &str, data: &str, anchor: Option<&AnchorArgs>) ->
             .opt("y", anchor.y)
             .opt("cols", anchor.cols)
             .opt("rows", anchor.rows);
+    }
+    if replace {
+        payload = payload.field("replace", "true");
     }
     payload.build()
 }
@@ -1231,6 +1227,24 @@ fn run_collector(cli: &Cli) -> ExitCode {
                 move || Ok(gather_net(&mut networks, top)),
             )
         }
+        Commands::History {
+            last,
+            file,
+            id,
+            watch,
+            anchor,
+        } => {
+            let last = *last as usize;
+            let file = file.clone();
+            emit_snapshots(
+                cli,
+                id.unwrap_or(DEFAULT_HISTORY_VIZ_ID),
+                "timeline.v1",
+                *watch,
+                anchor,
+                move || gather_history(file.as_deref(), last),
+            )
+        }
         _ => unreachable!("run_collector only handles the collector subcommands"),
     }
 }
@@ -1283,7 +1297,7 @@ fn emit_snapshots(
             return exit_codes::bad_input();
         }
         let data = query::b64url_encode(&bytes);
-        let payload = viz_set_wire(id, kind, &data, first.then_some(anchor));
+        let payload = viz_set_wire(id, kind, &data, first.then_some(anchor), false);
         if let Err(exit) = emit_command(cli, "viz.set", payload) {
             return exit;
         }
@@ -1951,24 +1965,324 @@ fn main() -> ExitCode {
             let op = format!("state.{}", path.as_deref().unwrap_or("scene"));
             run_query(&cli, &op, None, None, *pretty)
         }
-        Commands::Ps { .. } | Commands::Fs { .. } | Commands::Git { .. } | Commands::Net { .. } => {
-            run_collector(&cli)
-        }
+        Commands::Ps { .. }
+        | Commands::Fs { .. }
+        | Commands::Git { .. }
+        | Commands::Net { .. }
+        | Commands::History { .. } => run_collector(&cli),
+        Commands::Chart { .. } => run_chart(&cli),
         Commands::Kill { .. } => run_kill(&cli),
         _ => run_command(&cli),
     }
 }
 
+// ── History collector ──
+
+/// One parsed history entry before normalization.
+struct HistoryEntry {
+    /// Unix start time, when the format carried one.
+    t: Option<f64>,
+    /// Elapsed seconds (zsh extended), else 0.
+    dur: f64,
+    /// The raw command text.
+    cmd: String,
+}
+
+/// Resolves the history file: explicit `--file`, else `$HISTFILE`, else
+/// `~/.zsh_history`, else `~/.bash_history`.
+fn resolve_history_file(file: Option<&std::path::Path>) -> Result<std::path::PathBuf, String> {
+    if let Some(file) = file {
+        return Ok(file.to_path_buf());
+    }
+    if let Ok(histfile) = std::env::var("HISTFILE")
+        && !histfile.is_empty()
+    {
+        return Ok(std::path::PathBuf::from(histfile));
+    }
+    let home = std::env::var("HOME")
+        .map_err(|_| "neither --file, $HISTFILE, nor $HOME is set".to_string())?;
+    for candidate in [".zsh_history", ".bash_history"] {
+        let path = std::path::Path::new(&home).join(candidate);
+        if path.exists() {
+            return Ok(path);
+        }
+    }
+    Err(
+        "no history file found (tried $HISTFILE, ~/.zsh_history, ~/.bash_history); pass --file"
+            .to_string(),
+    )
+}
+
+/// Parses history lines: zsh extended (`: start:elapsed;cmd`), bash
+/// timestamp stamps (`#epoch` preceding a command), and plain lines
+/// (untimed). A line matching no timed format is its own untimed entry —
+/// zsh multi-line commands therefore appear as separate entries, which
+/// the snapshot declares by falling back to sequence positions.
+fn parse_history_lines(text: &str) -> Vec<HistoryEntry> {
+    let mut entries = Vec::new();
+    let mut pending_bash_ts: Option<f64> = None;
+    for line in text.lines() {
+        let line = line.trim_end();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix(": ")
+            && let Some((meta, cmd)) = rest.split_once(';')
+            && let Some((start, elapsed)) = meta.split_once(':')
+            && let (Ok(start), Ok(elapsed)) =
+                (start.trim().parse::<f64>(), elapsed.trim().parse::<f64>())
+            // `1e999` parses to infinity; the terminal rejects non-finite
+            // magnitudes, so a hostile stamp degrades to untimed instead.
+            && start.is_finite()
+            && elapsed.is_finite()
+            && (start + elapsed).is_finite()
+        {
+            entries.push(HistoryEntry {
+                t: Some(start),
+                dur: elapsed.max(0.0),
+                cmd: cmd.to_string(),
+            });
+            pending_bash_ts = None;
+            continue;
+        }
+        if let Some(stamp) = line.strip_prefix('#')
+            && let Ok(timestamp) = stamp.trim().parse::<f64>()
+        {
+            pending_bash_ts = Some(timestamp);
+            continue;
+        }
+        entries.push(HistoryEntry {
+            t: pending_bash_ts.take(),
+            dur: 0.0,
+            cmd: line.to_string(),
+        });
+    }
+    entries
+}
+
+/// Normalizes parsed history into a `timeline.v1` snapshot: one lane
+/// named for the shell, the newest entry `active`. Real times and
+/// durations when every kept entry carried one; otherwise sequence
+/// positions for all, declared in the capture provenance — a mixed axis
+/// would silently misplace the untimed entries.
+fn history_snapshot(
+    path_label: &str,
+    shell: &str,
+    mut entries: Vec<HistoryEntry>,
+    last: usize,
+) -> serde_json::Value {
+    let total = entries.len();
+    let keep = entries.split_off(total.saturating_sub(last));
+    let all_timed = !keep.is_empty() && keep.iter().all(|entry| entry.t.is_some());
+    let mut source = format!(
+        "ratty-ai history/{shell} {path_label}; last {} of {total}",
+        keep.len()
+    );
+    if !keep.is_empty() && !all_timed {
+        source.push_str("; untimed; sequence positions");
+    }
+    let mut truncated = 0_usize;
+    let mut seen = std::collections::HashSet::new();
+    let events: Vec<serde_json::Value> = keep
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            if label_would_truncate(&entry.cmd) {
+                truncated += 1;
+            }
+            let (t, dur) = if all_timed {
+                (entry.t.unwrap_or_default(), entry.dur)
+            } else {
+                (index as f64, 0.0)
+            };
+            // A content-derived id stays stable across watch refreshes
+            // for as long as the entry stays in the window; identical
+            // repeated commands disambiguate by occurrence.
+            let base = fnv1a32(format!("{t}:{}", entry.cmd).as_bytes());
+            let mut id = format!("{base:08x}");
+            let mut occurrence = 1_u32;
+            while !seen.insert(id.clone()) {
+                occurrence += 1;
+                id = format!("{base:08x}-{occurrence}");
+            }
+            let state = if index + 1 == keep.len() {
+                "active"
+            } else {
+                "neutral"
+            };
+            serde_json::json!({
+                "id": id,
+                "label": clean_label(&entry.cmd),
+                "t": t,
+                "dur": dur,
+                "state": state,
+            })
+        })
+        .collect();
+    if truncated > 0 {
+        source.push_str(&format!("; {truncated} labels truncated"));
+    }
+    serde_json::json!({
+        "capture": capture_json(&source),
+        "title": "shell history",
+        "lanes": [ { "name": shell, "events": events } ],
+    })
+}
+
+/// Gathers shell history locally — under the invoking user's own
+/// permissions, like every collector — and normalizes it into a
+/// `timeline.v1` snapshot.
+fn gather_history(
+    file: Option<&std::path::Path>,
+    last: usize,
+) -> Result<serde_json::Value, String> {
+    let path = resolve_history_file(file)?;
+    let bytes = std::fs::read(&path)
+        .map_err(|error| format!("could not read {}: {error}", path.display()))?;
+    // Lossy: zsh metafies non-ASCII bytes and history files carry raw
+    // user input; a garbled label beats a refused snapshot.
+    let text = String::from_utf8_lossy(&bytes);
+    let entries = parse_history_lines(&text);
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("history")
+        .to_ascii_lowercase();
+    let shell = if file_name.contains("zsh") {
+        "zsh"
+    } else if file_name.contains("bash") {
+        "bash"
+    } else if file_name.contains("fish") {
+        "fish"
+    } else {
+        "shell"
+    };
+    Ok(history_snapshot(
+        &path.display().to_string(),
+        shell,
+        entries,
+        last,
+    ))
+}
+
+// ── Authored charts ──
+
+/// Resolves a chart kind argument: shorthands map onto their `.v1`
+/// kinds, and full names must be registered.
+fn resolve_chart_kind(kind: &str) -> Result<&'static str, String> {
+    Ok(match kind {
+        "bar" => "chart.bar.v1",
+        "line" => "chart.line.v1",
+        "gauge" => "chart.gauge.v1",
+        "timeline" => "timeline.v1",
+        other => {
+            return viz_wire::REGISTERED_VIZ_KINDS
+                .iter()
+                .copied()
+                .find(|registered| *registered == other)
+                .ok_or_else(|| {
+                    format!(
+                        "unknown kind '{other}' (registered: {:?})",
+                        viz_wire::REGISTERED_VIZ_KINDS
+                    )
+                });
+        }
+    })
+}
+
+/// `ratty-ai chart`: publish authored data as a `viz.set` snapshot. The
+/// exact bytes that will ride the wire are validated with the terminal's
+/// own decoder first, so the CLI can never emit a payload the terminal
+/// rejects; a missing `capture` is stamped as authored, and one the
+/// author supplied is never overwritten.
+fn run_chart(cli: &Cli) -> ExitCode {
+    let Commands::Chart {
+        kind,
+        data,
+        id,
+        replace,
+        anchor,
+    } = &cli.command
+    else {
+        unreachable!("run_chart only handles the chart subcommand");
+    };
+    let kind = match resolve_chart_kind(kind) {
+        Ok(kind) => kind,
+        Err(message) => {
+            emit_failure(cli.json, "bad-kind", &message);
+            return exit_codes::bad_input();
+        }
+    };
+    let raw = match data {
+        Some(data) => data.clone(),
+        None => {
+            let mut buffer = String::new();
+            if std::io::stdin().read_to_string(&mut buffer).is_err() {
+                emit_failure(cli.json, "bad-input", "could not read stdin");
+                return exit_codes::bad_input();
+            }
+            buffer.trim().to_string()
+        }
+    };
+    let mut value: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(value) => value,
+        Err(error) => {
+            emit_failure(cli.json, "bad-input", &format!("data is not JSON: {error}"));
+            return exit_codes::bad_input();
+        }
+    };
+    if let Some(object) = value.as_object_mut()
+        && !object.contains_key("capture")
+    {
+        object.insert(
+            "capture".to_string(),
+            capture_json("ratty-ai chart (authored)"),
+        );
+    }
+    let bytes = match serde_json::to_vec(&value) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            emit_failure(
+                cli.json,
+                "bad-input",
+                &format!("could not encode the payload: {error}"),
+            );
+            return exit_codes::bad_input();
+        }
+    };
+    if bytes.len() > osc::MAX_VIZ_PAYLOAD_BYTES {
+        emit_failure(
+            cli.json,
+            "too-large",
+            &format!(
+                "payload is {} bytes; the wire caps decoded payloads at {}",
+                bytes.len(),
+                osc::MAX_VIZ_PAYLOAD_BYTES
+            ),
+        );
+        return exit_codes::bad_input();
+    }
+    let encoded = query::b64url_encode(&bytes);
+    if let Err(error) = viz_wire::decode_viz_payload(kind, &encoded) {
+        emit_failure(cli.json, error.code, &error.message);
+        return exit_codes::bad_input();
+    }
+    let payload = viz_set_wire(
+        id.unwrap_or(DEFAULT_CHART_VIZ_ID),
+        kind,
+        &encoded,
+        Some(anchor),
+        *replace,
+    );
+    match emit_command(cli, "viz.set", payload) {
+        Ok(()) => exit_codes::OK,
+        Err(exit) => exit,
+    }
+}
+
 /// The classic fire-and-forget path, plus the `--ack` wait when requested.
 fn run_command(cli: &Cli) -> ExitCode {
-    let stdin = if reads_stdin(&cli.command) {
-        let mut buffer = String::new();
-        let _ = std::io::stdin().read_to_string(&mut buffer);
-        buffer.trim().to_string()
-    } else {
-        String::new()
-    };
-    let (action, payload) = command_to_osc(&cli.command, &stdin);
+    let (action, payload) = command_to_osc(&cli.command);
     match emit_command(cli, &action, payload) {
         Ok(()) => exit_codes::OK,
         Err(exit) => exit,
@@ -2343,8 +2657,8 @@ mod tests {
     /// Round-trips a command through the CLI encoder and the terminal's
     /// parser: `command_to_osc` must produce bytes the parser recovers as
     /// the expected `RattyAiCommand`. This is the CLI↔terminal contract.
-    fn round_trip(command: &Commands, stdin: &str) -> RattyAiCommand {
-        let (action, payload) = command_to_osc(command, stdin);
+    fn round_trip(command: &Commands) -> RattyAiCommand {
+        let (action, payload) = command_to_osc(command);
         let sequence = osc::osc_sequence(&action, &payload);
         // Strip the OSC framing (ESC ] 777 ; … BEL) back to the inner form
         // the parser's string entry point expects.
@@ -2358,7 +2672,7 @@ mod tests {
     #[test]
     fn mode_round_trips() {
         assert_eq!(
-            round_trip(&Commands::Mode { mode: "3d".into() }, ""),
+            round_trip(&Commands::Mode { mode: "3d".into() }),
             RattyAiCommand::SetMode { mode: "3d".into() }
         );
     }
@@ -2376,7 +2690,7 @@ mod tests {
             replace: false,
         });
         assert_eq!(
-            round_trip(&command, ""),
+            round_trip(&command),
             RattyAiCommand::SpawnObject {
                 id: 0x8000_0001,
                 path: "rat.obj".into(),
@@ -2402,7 +2716,7 @@ mod tests {
             brightness: 1.0,
             replace: true,
         });
-        let RattyAiCommand::SpawnObject { id, replace, .. } = round_trip(&command, "") else {
+        let RattyAiCommand::SpawnObject { id, replace, .. } = round_trip(&command) else {
             panic!("expected SpawnObject");
         };
         assert_eq!(id, 0x8000_0002);
@@ -2412,13 +2726,10 @@ mod tests {
     #[test]
     fn think_flags_become_state() {
         assert_eq!(
-            round_trip(
-                &Commands::Think {
-                    start: true,
-                    end: false
-                },
-                ""
-            ),
+            round_trip(&Commands::Think {
+                start: true,
+                end: false
+            }),
             RattyAiCommand::Think {
                 state: "start".into()
             }
@@ -2435,7 +2746,7 @@ mod tests {
             expires: "1h".into(),
         };
         assert_eq!(
-            round_trip(&command, ""),
+            round_trip(&command),
             RattyAiCommand::Note {
                 text: "check x=1 & y=2; done".into(),
                 x: 15,
@@ -2446,21 +2757,33 @@ mod tests {
     }
 
     #[test]
-    fn timeline_reads_stdin() {
+    fn bookmark_round_trips_with_and_without_replace() {
         assert_eq!(
-            round_trip(
-                &Commands::Timeline {
-                    x: 5,
-                    y: 10,
-                    scale: 1.0
-                },
-                "abc def"
-            ),
-            RattyAiCommand::Timeline {
-                x: 5,
-                y: 10,
-                scale: 1.0,
-                input: "abc def".into(),
+            round_trip(&Commands::Bookmark {
+                name: "dock".into(),
+                replace: false,
+            }),
+            RattyAiCommand::Bookmark {
+                name: "dock".into(),
+                replace: false,
+            }
+        );
+        assert_eq!(
+            round_trip(&Commands::Bookmark {
+                name: "dock".into(),
+                replace: true,
+            }),
+            RattyAiCommand::Bookmark {
+                name: "dock".into(),
+                replace: true,
+            }
+        );
+        assert_eq!(
+            round_trip(&Commands::Jump {
+                name: "dock".into()
+            }),
+            RattyAiCommand::BookmarkJump {
+                name: "dock".into()
             }
         );
     }
@@ -2468,12 +2791,9 @@ mod tests {
     #[test]
     fn mood_enum_maps_to_strings() {
         assert_eq!(
-            round_trip(
-                &Commands::Mood {
-                    mood: MoodArg::Excited
-                },
-                ""
-            ),
+            round_trip(&Commands::Mood {
+                mood: MoodArg::Excited
+            }),
             RattyAiCommand::Mood {
                 mood: "excited".into()
             }
@@ -2483,27 +2803,21 @@ mod tests {
     #[test]
     fn sound_subcommands_round_trip() {
         assert_eq!(
-            round_trip(
-                &Commands::Sound(SoundAction::Play {
-                    kind: "chime".into(),
-                    gain: Some(0.5),
-                }),
-                ""
-            ),
+            round_trip(&Commands::Sound(SoundAction::Play {
+                kind: "chime".into(),
+                gain: Some(0.5),
+            })),
             RattyAiCommand::SoundPlay {
                 kind: "chime".into(),
                 gain: Some(0.5),
             }
         );
         assert_eq!(
-            round_trip(
-                &Commands::Sound(SoundAction::Ambient(AmbientAction::Set {
-                    kind: "ambient.hum".into(),
-                    gain: None,
-                    xfade: Some(800),
-                })),
-                ""
-            ),
+            round_trip(&Commands::Sound(SoundAction::Ambient(AmbientAction::Set {
+                kind: "ambient.hum".into(),
+                gain: None,
+                xfade: Some(800),
+            }))),
             RattyAiCommand::SoundAmbientSet {
                 kind: "ambient.hum".into(),
                 gain: None,
@@ -2511,10 +2825,9 @@ mod tests {
             }
         );
         assert_eq!(
-            round_trip(
-                &Commands::Sound(SoundAction::Ambient(AmbientAction::Stop { fade: None })),
-                ""
-            ),
+            round_trip(&Commands::Sound(SoundAction::Ambient(
+                AmbientAction::Stop { fade: None }
+            ))),
             RattyAiCommand::SoundAmbientStop { fade: None }
         );
     }
@@ -2531,7 +2844,7 @@ mod tests {
     #[test]
     fn ack_token_appends_and_round_trips() {
         // Keyed payload.
-        let (action, payload) = command_to_osc(&Commands::Mode { mode: "3d".into() }, "");
+        let (action, payload) = command_to_osc(&Commands::Mode { mode: "3d".into() });
         let payload = format!("{payload}&{}=abc123", osc::ACK_TOKEN_KEY);
         let sequence = osc::osc_sequence(&action, &payload);
         let inner = sequence
@@ -2546,7 +2859,7 @@ mod tests {
         );
 
         // Empty payload.
-        let (action, payload) = command_to_osc(&Commands::Object(ObjectAction::Clear), "");
+        let (action, payload) = command_to_osc(&Commands::Object(ObjectAction::Clear));
         assert!(payload.is_empty());
         let sequence = osc::osc_sequence(&action, &format!("{}=t1", osc::ACK_TOKEN_KEY));
         let inner = sequence
@@ -2608,7 +2921,7 @@ mod tests {
             cols: Some(24),
             rows: Some(8),
         };
-        let payload = viz_set_wire(DEFAULT_PS_VIZ_ID, "ps.v1", &data, Some(&anchor));
+        let payload = viz_set_wire(DEFAULT_PS_VIZ_ID, "ps.v1", &data, Some(&anchor), false);
         assert_eq!(
             parse_wire("viz.set", &payload),
             RattyAiCommand::VizSet {
@@ -2632,7 +2945,7 @@ mod tests {
     /// un-scrolls) a live view.
     #[test]
     fn watch_refresh_omits_the_anchor() {
-        let payload = viz_set_wire(DEFAULT_FS_VIZ_ID, "fs.v1", "e30", None);
+        let payload = viz_set_wire(DEFAULT_FS_VIZ_ID, "fs.v1", "e30", None, false);
         let RattyAiCommand::VizSet {
             x, y, cols, rows, ..
         } = parse_wire("viz.set", &payload)
@@ -2768,6 +3081,8 @@ mod tests {
         assert_eq!(DEFAULT_FS_VIZ_ID, 0x8000_0101);
         assert_eq!(DEFAULT_GIT_VIZ_ID, 0x8000_0102);
         assert_eq!(DEFAULT_NET_VIZ_ID, 0x8000_0103);
+        assert_eq!(DEFAULT_HISTORY_VIZ_ID, 0x8000_0104);
+        assert_eq!(DEFAULT_CHART_VIZ_ID, 0x8000_0105);
         assert_eq!(MAX_COLLECTOR_TOP, 64, "viz.md: --top hard cap");
         assert_eq!(MAX_FS_WALK_ENTRIES, 4096, "viz.md: fs walk cap");
         assert_eq!(MAX_STATE_BYTES, 32);
@@ -3070,7 +3385,27 @@ mod tests {
                 .collect(),
             top,
         );
-        for (kind, snapshot) in [("ps", ps), ("fs", fs), ("git", git), ("net", net)] {
+        // History: every kept entry a worst-case label with worst-case
+        // numerics, plus the truncation caveat in the provenance.
+        let history = history_snapshot(
+            &label,
+            "shell",
+            (0..top * 2)
+                .map(|i| HistoryEntry {
+                    t: Some(-f64::MAX),
+                    dur: f64::MAX,
+                    cmd: format!("{label}{i}"),
+                })
+                .collect(),
+            top,
+        );
+        for (kind, snapshot) in [
+            ("ps", ps),
+            ("fs", fs),
+            ("git", git),
+            ("net", net),
+            ("history", history),
+        ] {
             let bytes = serde_json::to_vec(&snapshot).expect("encodes");
             assert!(
                 bytes.len() <= osc::MAX_VIZ_PAYLOAD_BYTES,
@@ -3083,5 +3418,134 @@ mod tests {
             let encoded = query::b64url_encode(&bytes);
             assert!(encoded.len() <= osc::MAX_VIZ_PAYLOAD_BYTES.div_ceil(3) * 4);
         }
+    }
+
+    // ── History collector ──
+
+    #[test]
+    fn history_parses_zsh_bash_and_plain_lines() {
+        let text = "\
+: 1700000000:2;cargo build\n\
+: 1700000010:0;ls -la\n\
+#1700000020\n\
+git status\n\
+plain command\n\
+: 1e999:0;hostile stamp degrades to untimed\n";
+        let entries = parse_history_lines(text);
+        assert_eq!(entries.len(), 5);
+        assert_eq!(entries[0].t, Some(1_700_000_000.0));
+        assert_eq!(entries[0].dur, 2.0);
+        assert_eq!(entries[0].cmd, "cargo build");
+        assert_eq!(entries[2].t, Some(1_700_000_020.0), "bash stamp binds");
+        assert_eq!(entries[2].cmd, "git status");
+        assert_eq!(entries[3].t, None, "plain lines are untimed");
+        assert_eq!(
+            entries[4].t, None,
+            "a non-finite zsh stamp degrades to an untimed entry"
+        );
+        assert!(entries[4].cmd.starts_with(": 1e999"));
+    }
+
+    #[test]
+    fn history_snapshot_keeps_real_times_or_declares_sequence_positions() {
+        let timed = vec![
+            HistoryEntry {
+                t: Some(100.0),
+                dur: 2.0,
+                cmd: "first".into(),
+            },
+            HistoryEntry {
+                t: Some(110.0),
+                dur: 0.0,
+                cmd: "second".into(),
+            },
+        ];
+        let snapshot = history_snapshot("/h", "zsh", timed, 64);
+        let events = &snapshot["lanes"][0]["events"];
+        assert_eq!(events[0]["t"], serde_json::json!(100.0));
+        assert_eq!(events[0]["dur"], serde_json::json!(2.0));
+        assert_eq!(events[0]["state"], serde_json::json!("neutral"));
+        assert_eq!(
+            events[1]["state"],
+            serde_json::json!("active"),
+            "the newest entry reads active"
+        );
+        let source = snapshot["capture"]["source"].as_str().expect("source");
+        assert!(source.contains("history/zsh"), "{source}");
+        assert!(!source.contains("sequence positions"), "{source}");
+
+        // One untimed entry drops the whole snapshot to sequence
+        // positions, declared in the provenance.
+        let mixed = vec![
+            HistoryEntry {
+                t: Some(100.0),
+                dur: 2.0,
+                cmd: "timed".into(),
+            },
+            HistoryEntry {
+                t: None,
+                dur: 0.0,
+                cmd: "untimed".into(),
+            },
+        ];
+        let snapshot = history_snapshot("/h", "bash", mixed, 64);
+        let events = &snapshot["lanes"][0]["events"];
+        assert_eq!(events[0]["t"], serde_json::json!(0.0));
+        assert_eq!(events[1]["t"], serde_json::json!(1.0));
+        let source = snapshot["capture"]["source"].as_str().expect("source");
+        assert!(source.contains("untimed; sequence positions"), "{source}");
+    }
+
+    #[test]
+    fn history_event_ids_are_unique_and_snapshots_decode() {
+        // Identical repeated commands at the same instant must not
+        // collapse to one domain key.
+        let entries = vec![
+            HistoryEntry {
+                t: None,
+                dur: 0.0,
+                cmd: "ls".into(),
+            },
+            HistoryEntry {
+                t: None,
+                dur: 0.0,
+                cmd: "ls".into(),
+            },
+        ];
+        let snapshot = history_snapshot("/h", "shell", entries, 64);
+        let events = snapshot["lanes"][0]["events"].as_array().expect("events");
+        // Untimed entries take sequence positions, so their hashes differ;
+        // ids must be unique regardless.
+        let ids: std::collections::HashSet<&str> = events
+            .iter()
+            .map(|event| event["id"].as_str().expect("id"))
+            .collect();
+        assert_eq!(ids.len(), events.len(), "event ids are unique");
+        // The emitted snapshot decodes with the terminal's own decoder.
+        let bytes = serde_json::to_vec(&snapshot).expect("encodes");
+        let encoded = query::b64url_encode(&bytes);
+        viz_wire::decode_viz_payload("timeline.v1", &encoded)
+            .expect("a collector snapshot always decodes");
+    }
+
+    // ── Authored charts ──
+
+    #[test]
+    fn chart_kind_shorthands_resolve_and_unknown_kinds_fail() {
+        assert_eq!(resolve_chart_kind("bar").expect("bar"), "chart.bar.v1");
+        assert_eq!(resolve_chart_kind("line").expect("line"), "chart.line.v1");
+        assert_eq!(
+            resolve_chart_kind("gauge").expect("gauge"),
+            "chart.gauge.v1"
+        );
+        assert_eq!(
+            resolve_chart_kind("timeline").expect("timeline"),
+            "timeline.v1"
+        );
+        assert_eq!(
+            resolve_chart_kind("chart.bar.v1").expect("full name"),
+            "chart.bar.v1"
+        );
+        assert!(resolve_chart_kind("pie").is_err(), "unregistered kind");
     }
 }

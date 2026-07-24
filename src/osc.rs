@@ -75,6 +75,20 @@ pub const MAX_VIZ_ITEMS_PER_SNAPSHOT: usize = 256;
 /// Bounds stored-string memory and keeps every projection record small
 /// enough for size-bounded reply pages.
 pub const MAX_VIZ_LABEL_BYTES: usize = 128;
+
+/// Upper bound on the series in a `chart.line.v1` snapshot and the lanes in
+/// a `timeline.v1` snapshot. More than a handful of series is unreadable in
+/// a cell-anchored footprint anyway; the bound keeps a hostile emitter from
+/// packing the byte budget with empty track groups.
+pub const MAX_VIZ_SERIES_PER_SNAPSHOT: usize = 8;
+
+/// Upper bound on the points in one `chart.line.v1` series.
+pub const MAX_VIZ_POINTS_PER_SERIES: usize = 256;
+
+/// Upper bound on the points across every series of one `chart.line.v1`
+/// snapshot. Sized so a max-point payload of short labels still encodes
+/// under [`MAX_VIZ_PAYLOAD_BYTES`]; the byte cap remains the hard wall.
+pub const MAX_VIZ_POINTS_PER_SNAPSHOT: usize = 1024;
 /// Classification of a registered semantic sound kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SoundKindClass {
@@ -231,35 +245,15 @@ pub enum RattyAiCommand {
     },
 
     // ── Data visualization ──
-    /// Render inline data as a chart.
-    Chart {
-        /// Chart kind.
-        kind: String,
-        /// Anchor column.
-        x: u16,
-        /// Anchor row.
-        y: u16,
-        /// Scale.
-        scale: f32,
-        /// Serialized data (e.g. JSON array).
-        data: String,
-    },
-    /// Render piped input as a 3D timeline.
-    Timeline {
-        /// Anchor column.
-        x: u16,
-        /// Anchor row.
-        y: u16,
-        /// Scale.
-        scale: f32,
-        /// Timeline source text.
-        input: String,
-    },
-    /// Capture a screenshot to a path.
-    Screenshot {
-        /// Output path.
-        path: String,
-    },
+    //
+    // The M3.5 stub actions `chart`, `timeline`, `history`, and
+    // `screenshot { path }` are retired (#20): charts and timelines are
+    // registered `viz.set` payload *kinds* (`chart.bar.v1`,
+    // `chart.line.v1`, `chart.gauge.v1`, `timeline.v1`), history is a
+    // trusted `ratty-ai` collector publishing `timeline.v1` — the
+    // terminal never reads shell history on wire command — and screen
+    // capture, when it lands, will be pathless capture-to-artifact: the
+    // wire never chooses or writes filesystem paths.
     /// Publish or refresh a data-visualization snapshot (`viz.set`).
     ///
     /// The payload is trusted-collector data lowered onto the wire by the
@@ -340,21 +334,20 @@ pub enum RattyAiCommand {
         pane: u8,
     },
 
-    // ── History & bookmarks ──
-    /// Visualize command history.
-    History {
-        /// How many recent entries.
-        last: usize,
-        /// Whether to visualize.
-        visualize: bool,
-    },
-    /// Bookmark the current state.
+    // ── View bookmarks ──
+    /// Store the current public view state (mode, warp) under a
+    /// caller-namespaced name. An existing name rejects `already-exists`
+    /// unless `mode=replace` (#16's collision rule).
     Bookmark {
         /// Bookmark name.
         name: String,
+        /// Whether `mode=replace` was supplied.
+        replace: bool,
     },
-    /// Jump to a bookmark.
-    Jump {
+    /// Atomically reapply a stored view bookmark through normal command
+    /// lowering (`bookmark.jump`). Never restores objects, macros, or
+    /// private scene state.
+    BookmarkJump {
         /// Bookmark name.
         name: String,
     },
@@ -612,23 +605,9 @@ fn parse_action(action: &str, p: &Payload) -> Option<RattyAiCommand> {
             mood: p.string_or("mood", "focused"),
         },
 
-        // Data viz
-        "chart" => RattyAiCommand::Chart {
-            kind: p.string_or("kind", "bar"),
-            x: p.u16("x", 0),
-            y: p.u16("y", 0),
-            scale: p.f32("scale", 1.0),
-            data: p.string_or("data", "[]"),
-        },
-        "timeline" => RattyAiCommand::Timeline {
-            x: p.u16("x", 0),
-            y: p.u16("y", 0),
-            scale: p.f32("scale", 1.0),
-            input: p.string_or("input", ""),
-        },
-        "screenshot" => RattyAiCommand::Screenshot {
-            path: p.string_or("path", "ratty-screenshot.png"),
-        },
+        // Data viz — charts and timelines ride `viz.set` as registered
+        // payload kinds; the retired `chart`/`timeline`/`screenshot`
+        // stub actions fail parse like any unknown action.
         "viz.set" => RattyAiCommand::VizSet {
             id: p.parse_req("id")?,
             kind: p.string("kind")?,
@@ -668,15 +647,24 @@ fn parse_action(action: &str, p: &Payload) -> Option<RattyAiCommand> {
             pane: p.parse_req("pane")?,
         },
 
-        // History
-        "history" => RattyAiCommand::History {
-            last: p.usize("last", 50),
-            visualize: p.flag("visualize"),
-        },
-        "bookmark" => RattyAiCommand::Bookmark {
-            name: p.string("name")?,
-        },
-        "jump" => RattyAiCommand::Jump {
+        // View bookmarks — the retired `history` and `jump` stub actions
+        // fail parse like any unknown action (`ratty-ai history` is a
+        // collector now, and jumping is `bookmark.jump`).
+        "bookmark" => {
+            // `mode` is a closed vocabulary: absent stores fresh,
+            // `replace` overwrites; anything else is a bad command, not
+            // a silently-ignored qualifier.
+            let replace = match p.string("mode").as_deref() {
+                None => false,
+                Some("replace") => true,
+                Some(_) => return None,
+            };
+            RattyAiCommand::Bookmark {
+                name: p.string("name")?,
+                replace,
+            }
+        }
+        "bookmark.jump" => RattyAiCommand::BookmarkJump {
             name: p.string("name")?,
         },
 
@@ -860,10 +848,6 @@ impl Payload {
     }
 
     fn u16(&self, key: &str, default: u16) -> u16 {
-        self.opt(key).unwrap_or(default)
-    }
-
-    fn usize(&self, key: &str, default: usize) -> usize {
         self.opt(key).unwrap_or(default)
     }
 
@@ -1202,9 +1186,6 @@ mod tests {
             "ratty:think;state=start",
             "ratty:confidence;level=0.9",
             "ratty:mood;mood=excited",
-            "ratty:chart;data=%5B1%2C2%5D",
-            "ratty:timeline;input=x",
-            "ratty:screenshot;path=s.png",
             "ratty:viz.set;id=2147483648&kind=ps.v1&data=e30",
             "ratty:viz.effect;id=2147483648&key=1234&effect=died",
             "ratty:viz.remove;id=2147483648",
@@ -1212,9 +1193,9 @@ mod tests {
             "ratty:pane.focus;pane=2",
             "ratty:pane.resize;pane=1&width=80",
             "ratty:pane.close;pane=2",
-            "ratty:history;last=50&visualize=true",
             "ratty:bookmark;name=x",
-            "ratty:jump;name=x",
+            "ratty:bookmark;name=x&mode=replace",
+            "ratty:bookmark.jump;name=x",
             "ratty:user.join;name=alice&color=%2300ff00",
             "ratty:user.leave;name=alice",
             "ratty:user.cursor;name=alice&x=1&y=2",
@@ -1238,5 +1219,37 @@ mod tests {
         for case in cases {
             assert!(parse_command(case).is_some(), "failed to parse `{case}`");
         }
+    }
+
+    /// The M3.5 stub actions retired by #20 fail parse like any unknown
+    /// action (a `tok=` caller gets `bad-command`), and the bookmark
+    /// `mode=` qualifier is a closed vocabulary.
+    #[test]
+    fn retired_actions_and_bad_bookmark_modes_fail_parse() {
+        for case in [
+            "ratty:chart;data=%5B1%2C2%5D",
+            "ratty:timeline;input=x",
+            "ratty:screenshot;path=s.png",
+            "ratty:history;last=50",
+            "ratty:jump;name=x",
+            "ratty:bookmark;name=x&mode=append",
+        ] {
+            assert!(parse_command(case).is_none(), "`{case}` must not parse");
+        }
+        let stored = parse_command("ratty:bookmark;name=dock&mode=replace").expect("parses");
+        assert_eq!(
+            stored,
+            RattyAiCommand::Bookmark {
+                name: "dock".to_string(),
+                replace: true,
+            }
+        );
+        let jump = parse_command("ratty:bookmark.jump;name=dock").expect("parses");
+        assert_eq!(
+            jump,
+            RattyAiCommand::BookmarkJump {
+                name: "dock".to_string(),
+            }
+        );
     }
 }

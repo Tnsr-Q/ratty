@@ -121,8 +121,16 @@ The 778 analog of the RGP support reply; keys are append-only.
               "ids_per_session": 4096, "errors_per_namespace": 32,
               "viz_per_namespace": 32, "viz_payload_bytes": 32768,
               "viz_items": 256, "sound_voices": 16,
-              "sound_plays_per_sec": 4 } }
+              "sound_plays_per_sec": 4, "viz_series": 8,
+              "viz_points_per_series": 256, "viz_points": 1024,
+              "bookmarks_per_namespace": 16, "bookmark_name_bytes": 64 },
+  "viz_kinds": ["ps.v1", "fs.v1", "git.v1", "net.v1", "chart.bar.v1",
+                "chart.line.v1", "chart.gauge.v1", "timeline.v1"] }
 ```
+
+`viz_kinds` (M3.6, append-only like every key) advertises the registered
+visualization payload kinds, so an emitter can feature-detect a kind
+before publishing instead of learning from a `bad-kind` reject.
 
 ### 2. `state.scene` — scene-global public state
 
@@ -188,6 +196,7 @@ used to be only a terminal-side `warn!`.
 
 ### 9. `state.viz` — visualization records *(paginated)*
 
+
 The read side of the `viz.*` family (see the
 [Ratty Visualization Protocol](viz.md)), under the standard three-tier
 scope: the caller's own visualizations appear in full — the public
@@ -198,6 +207,29 @@ and footprint, `item_count`). A hidden foreign visualization's
 existence is not readable. Payload read-back is deliberately
 summary-level in v1: `item_count`, never item dumps or raw payloads.
 Sorted by id.
+
+### 10. `state.bookmarks` — the caller's view bookmarks
+
+The read side of the view-bookmark commands (M3.6). Bookmarks store only
+versioned public view state — the presentation mode and plane warp, the
+things wire commands can set — under names scoped to the caller's
+ingress namespace:
+
+```json
+{ "items": [ { "name": "dock", "v": 1, "mode": "2d", "warp": 0.5 } ] }
+```
+
+Sorted by name; never paginated (the 16-per-namespace cap keeps the
+reply under budget). Bookmarks are private to their namespace — there is
+no foreign-visibility tier. The write side rides OSC 777:
+`ratty:bookmark;name=<s>[&mode=replace]` stores (an existing name
+rejects `already-exists` without `mode=replace`; a fresh name past the
+cap rejects `namespace-cap`), and `ratty:bookmark.jump;name=<s>`
+validates the stored snapshot and atomically reapplies it **through
+normal command lowering** — the handler relowers the equivalent
+`mode`/`warp` commands onto the ordinary command stream, so a jump can
+never restore objects, macros, or private scene state. `reset` clears
+every bookmark silently.
 
 ## Error codes
 

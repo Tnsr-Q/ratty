@@ -129,7 +129,8 @@ impl Plugin for RattyAiPlugin {
                     .after(apply_ai_object_commands)
                     .after(crate::effects::apply_ai_effect_commands)
                     .after(crate::viz::apply_viz_commands)
-                    .after(crate::sound::apply_sound_commands),
+                    .after(crate::sound::apply_sound_commands)
+                    .after(crate::bookmarks::apply_bookmark_commands),
             );
     }
 }
@@ -231,6 +232,10 @@ pub fn apply_ai_commands(
             RattyAiCommand::SoundPlay { .. }
             | RattyAiCommand::SoundAmbientSet { .. }
             | RattyAiCommand::SoundAmbientStop { .. } => {}
+            // View bookmarks are handled by crate::bookmarks, which reads
+            // the same AiCommand messages independently and owns their
+            // acks.
+            RattyAiCommand::Bookmark { .. } | RattyAiCommand::BookmarkJump { .. } => {}
             other => {
                 debug!("ratty-ai: command received, handler not yet built: {other:?}");
                 reject(
@@ -566,7 +571,7 @@ pub fn apply_ai_object_commands(
 }
 
 /// Maps a CLI mode string to a presentation mode.
-fn parse_mode(mode: &str) -> Option<TerminalPresentationMode> {
+pub(crate) fn parse_mode(mode: &str) -> Option<TerminalPresentationMode> {
     match mode {
         "2d" | "flat" | "flat2d" => Some(TerminalPresentationMode::Flat2d),
         "3d" | "plane" | "plane3d" => Some(TerminalPresentationMode::Plane3d),

@@ -170,6 +170,41 @@ tool (`cargo build --manifest-path tools/silk/Cargo.toml`). The *cast* side
 has no such skew: sound frames are just more `"o"` bytes, which older players
 pass through and non-sound terminals ignore.
 
+## Data visualizations inside Silk
+
+The typed `viz` step compiles to one OSC 777 `viz.set` frame — the same
+generic bytes every emitter uses, no new wire authority (see
+[viz.md](viz.md) for the wire protocol and kind schemas):
+
+```json
+{ "at": 2.0, "viz": {
+    "id": 2147483720, "kind": "chart.bar.v1",
+    "x": 4, "y": 2, "cols": 30, "rows": 10,
+    "data": { "title": "queue depth", "max": 10.0,
+              "items": [ { "key": "a", "value": 3.0 } ] } } }
+```
+
+- `id` (required) is a caller-owned id in the AI range; two viz steps
+  sharing an id upsert the same visualization, so the choice is the
+  author's, never a compiler default. `kind` and the inline
+  schema-conforming `data` are required; `x`/`y` anchor the footprint's
+  top-left cell, `cols`/`rows` size it, `replace: true` allows a kind
+  change on a live id.
+- **Compiled through the terminal's own decoder.** The compiler includes
+  the shared viz schema module and validates the exact bytes that ride
+  the wire — a compiled cast can never carry a viz payload ratty
+  rejects — and `silk validate` re-runs the same decoder over the
+  actual frames.
+- **Authored provenance is explicit.** A `data` without `capture` is
+  stamped `{"source": "authored", "ts": "authored"}` — deterministic, so
+  compiled casts stay byte-reproducible — and a capture the author
+  supplied is never overwritten. Ratty never implies liveness a
+  transmission did not claim.
+- There is no `viz.effect`/`viz.remove` form and no `tok=` — a cast is
+  one-way bytes; teardown is the player's per-loop reset. Version skew
+  matches sound: a `viz` step needs a rebuilt silk, while the cast side
+  is just more `"o"` bytes older players pass through.
+
 ## Conformance
 
 **Players** MUST: parse the header; deliver `"o"` event data to the terminal

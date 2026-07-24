@@ -7,6 +7,7 @@
 #![warn(clippy::unwrap_used)]
 
 pub mod ai;
+pub mod bookmarks;
 pub mod cli;
 pub mod config;
 mod direct_render;
@@ -30,4 +31,6 @@ pub mod sound;
 pub mod systems;
 pub mod terminal;
 pub mod viz;
+mod viz_draw;
+pub mod viz_wire;
 pub mod web;

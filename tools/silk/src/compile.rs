@@ -14,10 +14,12 @@ use ratatui_ratty::{ObjectFormat, RattyGraphic, RattyGraphicSettings};
 
 use crate::cast::{Cast, Event, Header, XRatty};
 use crate::osc;
+use crate::query;
 use crate::scene::{
     AiArgs, CameraArgs, PlaceArgs, PrintArgs, RegisterArgs, Scene, SoundArgs, Step,
-    TWEENABLE_FIELDS, TweenArgs, UpdateArgs,
+    TWEENABLE_FIELDS, TweenArgs, UpdateArgs, VizArgs,
 };
+use crate::viz_wire;
 
 /// Compilation stats for reporting.
 pub struct Stats {
@@ -195,7 +197,7 @@ impl Compiler<'_> {
         if step.verb_count() != 1 {
             bail!(
                 "each step must have exactly one verb (print/register/place/\
-                 update/tween/camera/ai/sound/delete/marker/clear)"
+                 update/tween/camera/ai/sound/viz/delete/marker/clear)"
             );
         }
         if let Some(print) = &step.print {
@@ -214,6 +216,8 @@ impl Compiler<'_> {
             self.ai(step.at, ai)?;
         } else if let Some(sound) = &step.sound {
             self.sound(step.at, sound)?;
+        } else if let Some(viz) = &step.viz {
+            self.viz(step.at, viz)?;
         } else if let Some(delete) = &step.delete {
             match delete.id()? {
                 Some(id) => {
@@ -694,6 +698,89 @@ impl Compiler<'_> {
         self.out(at, osc::osc_sequence(action, payload));
         Ok(())
     }
+
+    /// Emits exactly one `viz.set` sequence. The inline data is validated
+    /// with the terminal's own decoder (`viz_wire::decode_viz_payload`)
+    /// against the exact bytes that ride the wire, so a compiled cast can
+    /// never carry a viz payload the terminal rejects. A missing
+    /// `capture` is stamped `authored` — deterministically, keeping
+    /// compiled casts byte-reproducible — and one the author supplied is
+    /// never overwritten.
+    fn viz(&mut self, at: f64, viz: &VizArgs) -> Result<()> {
+        let Some(id) = viz.id else {
+            bail!("viz.id is required (a caller-owned id in the AI range)");
+        };
+        if osc::ai_object_namespace(id).is_none() {
+            bail!(
+                "viz.id {id:#010x} is below the AI-owned range \
+                 ({:#010x}..); transmissions own ids there",
+                osc::AI_OBJECT_ID_MIN
+            );
+        }
+        let Some(kind) = &viz.kind else {
+            bail!(
+                "viz.kind is required (registered: {:?})",
+                viz_wire::REGISTERED_VIZ_KINDS
+            );
+        };
+        let Some(data) = &viz.data else {
+            bail!("viz.data is required (the kind's schema-conforming JSON, inline)");
+        };
+        if viz.x.is_some() != viz.y.is_some() {
+            bail!("viz.x and viz.y place together; got one without the other");
+        }
+        if (viz.cols.is_some() || viz.rows.is_some()) && viz.x.is_none() {
+            bail!("viz.cols/viz.rows need an anchor (supply viz.x and viz.y)");
+        }
+        if viz.cols == Some(0) || viz.rows == Some(0) {
+            bail!("viz.cols and viz.rows must be at least 1");
+        }
+        let mut data = data.clone();
+        if let Some(object) = data.as_object_mut()
+            && !object.contains_key("capture")
+        {
+            object.insert(
+                "capture".to_string(),
+                serde_json::json!({ "source": "authored", "ts": "authored" }),
+            );
+        }
+        let bytes = serde_json::to_vec(&data).context("encoding viz.data")?;
+        if bytes.len() > osc::MAX_VIZ_PAYLOAD_BYTES {
+            bail!(
+                "viz.data is {} bytes; the wire caps decoded payloads at {}",
+                bytes.len(),
+                osc::MAX_VIZ_PAYLOAD_BYTES
+            );
+        }
+        let encoded = query::b64url_encode(&bytes);
+        if let Err(error) = viz_wire::decode_viz_payload(kind, &encoded) {
+            bail!(
+                "viz step rejected by ratty's decoder ({}): {}",
+                error.code,
+                error.message
+            );
+        }
+        // base64url never needs escaping; the other values are numeric.
+        let mut payload = format!("id={id}&kind={}&data={encoded}", osc::percent_encode(kind));
+        if let (Some(x), Some(y)) = (viz.x, viz.y) {
+            payload.push_str(&format!("&x={x}&y={y}"));
+        }
+        if let Some(cols) = viz.cols {
+            payload.push_str(&format!("&cols={cols}"));
+        }
+        if let Some(rows) = viz.rows {
+            payload.push_str(&format!("&rows={rows}"));
+        }
+        if viz.replace == Some(true) {
+            payload.push_str("&replace=true");
+        }
+        let command = format!("ratty:viz.set;{payload}");
+        if osc::parse_command(&command).is_none() {
+            bail!("viz step produced an unparseable command {command:?}");
+        }
+        self.out(at, osc::osc_sequence("viz.set", &payload));
+        Ok(())
+    }
 }
 
 /// Comma-separated registered sound kinds of one class, for error messages.
@@ -1017,7 +1104,11 @@ mod tests {
         )
         .unwrap();
         let cast = compile(&scene, Path::new(".")).unwrap();
-        let datas: Vec<&str> = cast.events.iter().map(|event| event.data.as_str()).collect();
+        let datas: Vec<&str> = cast
+            .events
+            .iter()
+            .map(|event| event.data.as_str())
+            .collect();
         assert_eq!(
             datas,
             [
@@ -1065,6 +1156,135 @@ mod tests {
     }
 
     #[test]
+    fn viz_step_emits_parseable_osc_777_and_stamps_authored_capture() {
+        let scene: Scene = serde_json::from_str(
+            r#"{
+                "meta": {"title": "t"},
+                "cast": [
+                    {"at": 0.0, "viz": {
+                        "id": 2147483720, "kind": "chart.bar.v1",
+                        "x": 4, "y": 2, "cols": 30, "rows": 10,
+                        "data": {"title": "queue", "max": 10.0,
+                                 "items": [{"key": "a", "value": 3.0}]}
+                    }}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let cast = compile(&scene, Path::new(".")).unwrap();
+        assert_eq!(cast.events.len(), 1);
+        let inner = cast.events[0]
+            .data
+            .strip_prefix("\x1b]777;")
+            .and_then(|s| s.strip_suffix('\x07'))
+            .expect("well-framed osc");
+        let Some(super::osc::RattyAiCommand::VizSet {
+            id,
+            kind,
+            data,
+            x,
+            y,
+            cols,
+            rows,
+            replace,
+        }) = super::osc::parse_command(inner)
+        else {
+            panic!("terminal parses silk's viz.set");
+        };
+        assert_eq!(id, 2_147_483_720);
+        assert_eq!(kind, "chart.bar.v1");
+        assert_eq!((x.as_deref(), y.as_deref()), (Some("4"), Some("2")));
+        assert_eq!((cols.as_deref(), rows.as_deref()), (Some("30"), Some("10")));
+        assert!(!replace);
+        // The payload decodes with the terminal's own decoder, and the
+        // compiler stamped deterministic authored provenance.
+        let payload = super::viz_wire::decode_viz_payload(&kind, &data)
+            .expect("compiled payload always decodes");
+        let capture = payload.capture();
+        assert_eq!(capture.source, "authored");
+        assert_eq!(capture.ts, "authored");
+    }
+
+    #[test]
+    fn viz_step_keeps_an_authored_capture_and_rejects_bad_values() {
+        // An author-supplied capture is never overwritten.
+        let scene: Scene = serde_json::from_str(
+            r#"{
+                "meta": {"title": "t"},
+                "cast": [
+                    {"at": 0.0, "viz": {
+                        "id": 2147483720, "kind": "chart.gauge.v1",
+                        "data": {"capture": {"source": "synthetic demo", "ts": "2026-07-23"},
+                                 "items": [{"key": "w", "value": 0.5}]}
+                    }}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let cast = compile(&scene, Path::new(".")).unwrap();
+        let inner = cast.events[0]
+            .data
+            .strip_prefix("\x1b]777;")
+            .and_then(|s| s.strip_suffix('\x07'))
+            .unwrap();
+        let Some(super::osc::RattyAiCommand::VizSet { kind, data, .. }) =
+            super::osc::parse_command(inner)
+        else {
+            panic!("parses");
+        };
+        let payload = super::viz_wire::decode_viz_payload(&kind, &data).expect("decodes");
+        assert_eq!(payload.capture().source, "synthetic demo");
+
+        for (viz_json, expected) in [
+            (
+                r#"{"kind": "chart.bar.v1", "data": {}}"#,
+                "viz.id is required",
+            ),
+            (
+                r#"{"id": 42, "kind": "chart.bar.v1", "data": {}}"#,
+                "below the AI-owned range",
+            ),
+            (r#"{"id": 2147483720, "data": {}}"#, "viz.kind is required"),
+            (
+                r#"{"id": 2147483720, "kind": "chart.bar.v1"}"#,
+                "viz.data is required",
+            ),
+            (
+                r#"{"id": 2147483720, "kind": "chart.pie.v1", "data": {}}"#,
+                "bad-kind",
+            ),
+            (
+                r#"{"id": 2147483720, "kind": "chart.bar.v1",
+                    "data": {"items": [{"key": "a", "value": -1.0}]}}"#,
+                "bad-payload",
+            ),
+            (
+                r#"{"id": 2147483720, "kind": "chart.bar.v1", "data": {}, "x": 4}"#,
+                "place together",
+            ),
+            (
+                r#"{"id": 2147483720, "kind": "chart.bar.v1", "data": {}, "cols": 10}"#,
+                "need an anchor",
+            ),
+            (
+                r#"{"id": 2147483720, "kind": "chart.bar.v1", "data": {},
+                    "x": 1, "y": 1, "cols": 0}"#,
+                "at least 1",
+            ),
+        ] {
+            let scene: Scene = serde_json::from_str(&format!(
+                r#"{{"meta": {{"title": "t"}}, "cast": [{{"at": 0.0, "viz": {viz_json}}}]}}"#
+            ))
+            .unwrap();
+            let error = compile(&scene, Path::new(".")).unwrap_err();
+            assert!(
+                format!("{error:#}").contains(expected),
+                "expected \"{expected}\" in: {error:#}"
+            );
+        }
+    }
+
+    #[test]
     fn sound_step_rejects_bad_values() {
         for (sound_json, expected) in [
             (r#"{}"#, "exactly one of"),
@@ -1088,9 +1308,8 @@ mod tests {
                 "non-negative",
             ),
         ] {
-            let json = format!(
-                r#"{{"meta":{{"title":"t"}},"cast":[{{"at":0.0,"sound":{sound_json}}}]}}"#
-            );
+            let json =
+                format!(r#"{{"meta":{{"title":"t"}},"cast":[{{"at":0.0,"sound":{sound_json}}}]}}"#);
             let scene: Scene = serde_json::from_str(&json).unwrap();
             let error = compile(&scene, Path::new(".")).unwrap_err();
             assert!(
@@ -1111,9 +1330,8 @@ mod tests {
             r#"{"play": "chime", "url": "https://x/boom.ogg"}"#,
             r#"{"ambient": "ambient.hum", "master_gain": 1.0}"#,
         ] {
-            let json = format!(
-                r#"{{"meta":{{"title":"t"}},"cast":[{{"at":0.0,"sound":{sound_json}}}]}}"#
-            );
+            let json =
+                format!(r#"{{"meta":{{"title":"t"}},"cast":[{{"at":0.0,"sound":{sound_json}}}]}}"#);
             assert!(
                 serde_json::from_str::<Scene>(&json).is_err(),
                 "scene with {sound_json} must fail to parse"

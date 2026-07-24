@@ -3,13 +3,14 @@
 Where `object.*` commands place individual 3D assets over OSC 777 and
 the [Ratty Query Protocol](query.md) (OSC 778) reads the scene back, the
 `viz.*` family carries *data visualizations*: typed, versioned snapshots
-of processes, filesystems, repositories, and network interfaces that the
-terminal renders as anchored keyed grids on the same surface the
+of processes, filesystems, repositories, network interfaces, charts, and
+timelines that the terminal renders anchored on the same surface the
 [Ratty Graphics Protocol](graphics.md) objects live on. Trusted
-collectors in the `ratty-ai` CLI (`ps`, `fs`, `git`, `net`, and the
-`kill` watcher) gather data locally under the invoking user's own
-permissions and lower it onto the wire; the terminal only ever renders
-what it is handed.
+collectors in the `ratty-ai` CLI (`ps`, `fs`, `git`, `net`, `history`,
+and the `kill` watcher) gather data locally under the invoking user's
+own permissions and lower it onto the wire; `ratty-ai chart` and silk's
+`viz` scene block publish authored data the same way; the terminal only
+ever renders what it is handed.
 
 ## Design goals
 
@@ -66,6 +67,10 @@ Limits, enforced at decode and advertised in the 778 `caps` reply:
   watchdog, so every payload the decode limit admits can actually ride
   one sequence.
 - One snapshot holds at most **256** keyed items (`viz_items`).
+- A `chart.line.v1` snapshot holds at most **8** series and a
+  `timeline.v1` snapshot at most **8** lanes (`viz_series`); a series
+  holds at most **256** points (`viz_points_per_series`) and a snapshot
+  at most **1024** points across every series (`viz_points`).
 - Any label string inside a payload (names, paths, states, capture
   fields) and any `viz.effect` key is capped at **128 bytes**.
 - A namespace holds at most **32** live visualizations
@@ -182,15 +187,30 @@ re-anchors it.
 
 ## Rendering model
 
-The v1 render vocabulary is deliberately small: every kind lowers onto
-a keyed grid of magnitude bars inside the anchored footprint — one
-small mesh per item, in every presentation mode. Bar heights are the
-snapshot's normalized magnitudes (cpu for `ps`, log-scaled size for
+Every kind lowers onto keyed children — one small mesh per item, in
+every presentation mode — colored from a small semantic palette
+(active / idle / alert / container / neutral).
+
+The telemetry kinds (`ps`/`fs`/`git`/`net`) render as a near-square
+grid of magnitude bars inside the anchored footprint. Bar heights are
+the snapshot's normalized magnitudes (cpu for `ps`, log-scaled size for
 `fs`, log-scaled rx+tx for `net`; `git` weights the checked-out branch
-over the rest), and colors come from a small semantic palette (active /
-idle / alert / container / neutral). Magnitudes normalize *within* the
-snapshot: the tallest bar is the snapshot's largest item, not an
-absolute unit. M3.6 grows real chart kinds on this same substrate.
+over the rest), normalized *within* the snapshot: the tallest bar is
+the snapshot's largest item, not an absolute unit.
+
+The chart kinds split their rendering per the #20 design: **static
+geometry — axes, gridlines, labels, gauge arcs, timeline tracks — draws
+as vector paths** (a vello underlay inside the terminal texture, with a
+built-in stroke font for labels, truncated to their pixel budget), while
+**every keyed item stays a mesh**: bars, series end-markers, gauge
+needle tips, and timeline event spans. Effects therefore work on chart
+kinds exactly as on the grid kinds — a `died` on a bar key shrinks the
+bar away until the next snapshot. Both halves are computed from the
+same plot normalization, so a mesh and the path under it can never
+drift apart. Chart magnitudes normalize against their declared axis
+when one is present (`chart.bar.v1 max`, gauge ranges, an explicit
+timeline window, `y_min`/`y_max`) — a stable watch axis — and within
+the snapshot otherwise.
 
 ## Payload kinds (v1)
 
@@ -269,26 +289,111 @@ can arrive additively as a future kind. Domain key: the interface name.
 knowledge the emitter never sent — while `rx_bytes`/`tx_bytes` default.
 Bars scale by log-scaled rx+tx; down interfaces color as alerts.
 
+### Chart kinds (M3.6)
+
+Rules shared by the four chart kinds, on top of the family rules above:
+numeric magnitudes are **f64** on the wire (timeline instants at
+unix-epoch scale lose whole minutes to an f32 mantissa) and must be
+finite — a JSON number overflowing f64, and any finite pair whose sum
+or span overflows (`t + dur`, `t1 - t0`, `y_max - y_min`,
+`max - min`), rejects `bad-payload`. The `state` vocabulary is the
+semantic palette by its wire names — `active`, `idle`, `alert`,
+`container`, `neutral` (the default) — and is **closed**: an unknown
+state rejects `bad-payload`, so an emitter learns about a typo from the
+ack, not from a silently gray chart.
+
+### `chart.bar.v1` — category bars
+
+```json
+{ "capture": { "source": "…", "ts": "…" },
+  "title": "queue depth", "unit": "msgs", "max": 100.0,
+  "items": [ { "key": "ingest", "label": "Ingest", "value": 42.0,
+               "state": "active" } ] }
+```
+
+Domain key: `key` (required); `label` defaults to it. `value` defaults
+`0` and must be non-negative — signed bars are a future kind, not a
+silent render surprise. `max`, when present, must be finite and
+positive and pins the axis across refreshes; when absent, bars
+normalize within the snapshot. `title`/`unit` are optional bounded
+labels.
+
+### `chart.line.v1` — point series
+
+```json
+{ "capture": { "source": "…", "ts": "…" }, "title": "hit rate",
+  "y_min": 0.0, "y_max": 1.0,
+  "series": [ { "name": "l1", "state": "active",
+                "points": [ { "x": 0.0, "y": 0.97 } ] } ] }
+```
+
+Domain key: the series `name` — `viz.effect` targets a whole series
+(its end-marker mesh animates; the polyline is data and only a
+snapshot changes it). Points require both coordinates and render as a
+polyline in the order given. `y_min`/`y_max` come together or not at
+all and pin the y-axis; x always spans the data. A series without an
+explicit `state` colors by position from the non-alert palette rotation
+so neighbors stay distinct — red stays an explicit claim. The
+`item_count` read-back is the series count.
+
+### `chart.gauge.v1` — value dials
+
+```json
+{ "capture": { "source": "…", "ts": "…" },
+  "items": [ { "key": "w3", "label": "worker 3", "value": 0.62,
+               "min": 0.0, "max": 1.0, "unit": "%",
+               "state": "active" } ] }
+```
+
+Domain key: `key`. `value` is **required** — a defaulted reading would
+claim knowledge the emitter never sent (the `net.v1 up` rule). `min`
+defaults `0`, `max` defaults `1`, and `min < max` is required. A value
+outside the range renders a clamped dial with the raw value printed
+honestly. Dials lay out in a row; the keyed mesh is the needle tip on
+the arc.
+
+### `timeline.v1` — lane events
+
+```json
+{ "capture": { "source": "…", "ts": "…" }, "title": "layer streaming",
+  "t0": 0.0, "t1": 60.0,
+  "lanes": [ { "name": "layer-0", "events": [
+      { "id": "e1", "label": "fetch", "t": 3.2, "dur": 1.4,
+        "state": "active" } ] } ] }
+```
+
+Domain key: the event `id`, unique across the whole snapshot (the
+first-occurrence-wins rule applies). `t` is required; `dur` defaults
+`0` (an instant event) and must be non-negative. `t0`/`t1` come
+together or not at all and pin the window; when absent it derives from
+the events (`min t` to `max t + dur`). An event wholly outside an
+explicit window renders nothing — clipping is presentation, and an
+effect on its id tolerates the absent child like any absent key. Axis
+instants in the unix-epoch range read as UTC clock time. The
+`item_count` read-back is the event count across every lane.
+
 ## Collectors (`ratty-ai`)
 
-The trusted side of the family: four snapshot collectors and the `kill`
-watcher, all gathering locally under the invoking user's own
-permissions and honoring `--dry-run` / `--ack` / `--json` / `--tty`
-like every other `ratty-ai` command.
+The trusted side of the family: five snapshot collectors, the `kill`
+watcher, and the authored `chart` publisher, all honoring `--dry-run` /
+`--ack` / `--json` / `--tty` like every other `ratty-ai` command.
 
 ```sh
-ratty-ai ps  [--id N] [--top 32] [--watch <secs>] [-x <col> -y <row>] [--cols N] [--rows N]
-ratty-ai fs  [PATH] [--depth 3] [--top 64] [--id N] [--watch <secs>] [-x … -y …]
-ratty-ai git [--repo PATH] [--id N] [--watch <secs>] [-x … -y …]
-ratty-ai net [--id N] [--top 64] [--watch <secs>] [-x … -y …]
-ratty-ai kill <pid> [--sigkill] [--timeout-ms 5000] [--id N]
+ratty-ai ps      [--id N] [--top 32] [--watch <secs>] [-x <col> -y <row>] [--cols N] [--rows N]
+ratty-ai fs      [PATH] [--depth 3] [--top 64] [--id N] [--watch <secs>] [-x … -y …]
+ratty-ai git     [--repo PATH] [--id N] [--watch <secs>] [-x … -y …]
+ratty-ai net     [--id N] [--top 64] [--watch <secs>] [-x … -y …]
+ratty-ai history [--last 32] [--file PATH] [--id N] [--watch <secs>] [-x … -y …]
+ratty-ai chart   [--kind bar|line|gauge|timeline] [--data JSON] [--id N] [--replace] [-x … -y …]
+ratty-ai kill    <pid> [--sigkill] [--timeout-ms 5000] [--id N]
 ```
 
 - **Stable default slots.** Each collector defaults to a fixed id in
   namespace 0 of the AI partition, so bare invocations upsert a stable
   slot: `ps` 2147483904 (`0x8000_0100`), `fs` 2147483905
   (`0x8000_0101`), `git` 2147483906 (`0x8000_0102`), `net` 2147483907
-  (`0x8000_0103`). `--id` overrides.
+  (`0x8000_0103`), `history` 2147483908 (`0x8000_0104`), `chart`
+  2147483909 (`0x8000_0105`). `--id` overrides.
 - **`--top` is hard-capped at 64** on every collector: a hard cap
   chosen with ample provable headroom — a snapshot of 64 worst-case
   labels stays under the 32 KiB payload limit for all four kinds (pinned
@@ -311,6 +416,36 @@ ratty-ai kill <pid> [--sigkill] [--timeout-ms 5000] [--id N]
   symlinks, skips-but-counts unreadable directories, and records
   directory sizes honestly as 0 (unmeasured). `git` shells out to the
   `git` binary; a missing repo or binary exits 2.
+
+### `history` — shell history as a timeline
+
+`history` is a trusted CLI collector, not a renderer kind: it reads
+permitted shell-history data — under the invoking user's permissions —
+and normalizes it into a `timeline.v1` snapshot published through
+`viz.set`. **The terminal never reads shell history on wire command.**
+The file is explicit `--file`, else `$HISTFILE`, else `~/.zsh_history`,
+else `~/.bash_history`. zsh extended entries (`: start:elapsed;cmd`)
+keep their real start times and durations; bash `#epoch` stamps bind to
+their commands; when any kept entry is untimed the whole snapshot uses
+sequence positions instead — declared in `capture.source` (`untimed;
+sequence positions`) rather than silently mixing axes. Event ids are
+content-derived (hash of instant + command, occurrence-disambiguated)
+so identical commands never collapse onto one domain key; the newest
+entry renders `active`. A non-finite timestamp in a hostile history
+file degrades that entry to untimed.
+
+### `chart` — authored data, honestly labeled
+
+`chart` publishes author-supplied JSON (from `--data` or stdin) as any
+registered kind. The exact bytes that will ride the wire are validated
+with the terminal's own decoder before emission — the CLI includes the
+shared schema module — so it can never emit a payload the terminal
+rejects. A payload without `capture` is stamped
+`ratty-ai chart (authored)`; one the author supplied is never
+overwritten. Silk's `viz` scene block (see the
+[Silk protocol](silk.md)) is the same idea for transmissions,
+stamping `authored` deterministically so compiled casts stay
+byte-reproducible.
 
 ### `kill` — the closed loop
 
@@ -347,7 +482,9 @@ while visible, as public projections; a hidden foreign visualization's
 existence is not readable. Payload read-back is deliberately
 summary-level in v1: `item_count`, never item dumps or raw payloads.
 The `caps` reply advertises `viz_per_namespace`, `viz_payload_bytes`,
-and `viz_items`.
+`viz_items`, `viz_series`, `viz_points_per_series`, and `viz_points`,
+plus the registered kind list as `viz_kinds` — an emitter
+feature-detects a kind there instead of learning from `bad-kind`.
 
 ## Error codes
 
