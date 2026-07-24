@@ -148,6 +148,10 @@ charts and timelines — through the
 [Ratty Visualization Protocol](protocols/viz.md) (the OSC 777 `viz.*` family),
 and the same 777 channel carries semantic sound — one-shot event marks and a
 scene ambient bed — documented in the [Ratty Sound Protocol](protocols/sound.md).
+Agents can also record and replay their own choreography as named macros —
+the [Ratty Macros Protocol](protocols/macros.md) (the OSC 777 `macro.*`
+family), which taps the control channel and replays it through the same
+validation path.
 
 RGP supports:
 

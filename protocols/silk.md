@@ -205,6 +205,34 @@ generic bytes every emitter uses, no new wire authority (see
   matches sound: a `viz` step needs a rebuilt silk, while the cast side
   is just more `"o"` bytes older players pass through.
 
+## Macros inside Silk
+
+The `macro` block records the enclosed choreography as a session macro. It
+compiles to the `macro.record … macro.stop` bracket — the same generic
+bytes a live agent would emit, no new wire authority (see [macros.md](macros.md)
+for the wire protocol):
+
+```json
+{ "at": 1.0, "macro": { "name": "greet", "replace": false, "cast": [
+    { "at": 1.0, "ai": { "flash": "#00ff00" } },
+    { "at": 2.5, "sound": { "play": "chime" } }
+] } }
+```
+
+- `name` (required) is the session-registry name; `replace: true` overwrites
+  transactionally. The enclosed `cast` is ordinary Silk steps.
+- The compiler emits `macro.record` at the block's `at`, the enclosed
+  choreography at their own times, then `macro.stop` after the last enclosed
+  event — the bracket stays monotonic and the terminal records the enclosed
+  steps once, as they play.
+- A nested `macro` block (recursion) or an enclosed `reset` (it would cancel
+  the recording) is a **compile error**. The block adds no runtime authority
+  — it is pure sugar over the bracket, and the macros it defines die with the
+  session. Promotion to durable/trusted storage is an explicit human act,
+  never a transmission's.
+- Version skew matches sound/viz: a `macro` block needs a rebuilt silk, while
+  the cast side is just more `"o"` bytes older players pass through.
+
 ## Conformance
 
 **Players** MUST: parse the header; deliver `"o"` event data to the terminal
