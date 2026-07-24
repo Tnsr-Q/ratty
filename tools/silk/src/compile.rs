@@ -16,7 +16,7 @@ use crate::cast::{Cast, Event, Header, XRatty};
 use crate::osc;
 use crate::query;
 use crate::scene::{
-    AiArgs, CameraArgs, PlaceArgs, PrintArgs, RegisterArgs, Scene, SoundArgs, Step,
+    AiArgs, CameraArgs, MacroArgs, PlaceArgs, PrintArgs, RegisterArgs, Scene, SoundArgs, Step,
     TWEENABLE_FIELDS, TweenArgs, UpdateArgs, VizArgs,
 };
 use crate::viz_wire;
@@ -197,7 +197,7 @@ impl Compiler<'_> {
         if step.verb_count() != 1 {
             bail!(
                 "each step must have exactly one verb (print/register/place/\
-                 update/tween/camera/ai/sound/viz/delete/marker/clear)"
+                 update/tween/camera/ai/sound/viz/macro/delete/marker/clear)"
             );
         }
         if let Some(print) = &step.print {
@@ -218,6 +218,8 @@ impl Compiler<'_> {
             self.sound(step.at, sound)?;
         } else if let Some(viz) = &step.viz {
             self.viz(step.at, viz)?;
+        } else if let Some(macro_) = &step.macro_ {
+            self.macro_block(step.at, macro_)?;
         } else if let Some(delete) = &step.delete {
             match delete.id()? {
                 Some(id) => {
@@ -779,6 +781,62 @@ impl Compiler<'_> {
             bail!("viz step produced an unparseable command {command:?}");
         }
         self.out(at, osc::osc_sequence("viz.set", &payload));
+        Ok(())
+    }
+
+    /// Emits the `macro.record … macro.stop` bracket around the enclosed
+    /// choreography — pure sugar over the same wire. The enclosed steps
+    /// compile to their ordinary sequences and, played between the bracket,
+    /// are recorded by the terminal exactly once. Forbids a nested `macro`
+    /// block (no recursion) and a `reset` inside the block (it would cancel
+    /// the very recording), and keeps the bracket monotonic: `record` at the
+    /// block time, `stop` after the last enclosed event.
+    fn macro_block(&mut self, at: f64, block: &MacroArgs) -> Result<()> {
+        if block.name.is_empty() {
+            bail!("macro.name is required (non-empty)");
+        }
+        for step in &block.cast {
+            if step.verb_count() != 1 {
+                bail!("each macro step must have exactly one verb");
+            }
+            if step.macro_.is_some() {
+                bail!("a macro block may not nest another macro block (no recursion)");
+            }
+            if step.ai.as_ref().is_some_and(|ai| ai.reset.unwrap_or(false)) {
+                bail!("a reset inside a macro block would cancel the recording");
+            }
+            if step.at < at {
+                bail!(
+                    "macro step at={} precedes the block's record at={at} \
+                     (enclosed steps must play inside the bracket)",
+                    step.at
+                );
+            }
+        }
+
+        let mut record_payload = format!("name={}", osc::percent_encode(&block.name));
+        if block.replace {
+            record_payload.push_str("&mode=replace");
+        }
+        // Validate the bracket parses as the terminal would read it.
+        if osc::parse_command(&format!("ratty:macro.record;{record_payload}")).is_none() {
+            bail!(
+                "macro.record for \"{}\" produced an unparseable command",
+                block.name
+            );
+        }
+        self.out(at, osc::osc_sequence("macro.record", &record_payload));
+
+        // Compile the enclosed choreography in time order so the whole
+        // stream stays monotonic; the terminal captures it as it plays.
+        let mut enclosed: Vec<&Step> = block.cast.iter().collect();
+        enclosed.sort_by(|a, b| a.at.total_cmp(&b.at));
+        let mut stop_at = at;
+        for step in enclosed {
+            self.step(step)?;
+            stop_at = stop_at.max(step.at);
+        }
+        self.out(stop_at, osc::osc_sequence("macro.stop", ""));
         Ok(())
     }
 }
@@ -1394,5 +1452,75 @@ mod tests {
         let cast = compile(&scene, Path::new(".")).unwrap();
         let times: Vec<f64> = cast.events.iter().map(|event| event.time).collect();
         assert_eq!(times, [0.0, 1.0, 2.0]);
+    }
+
+    #[test]
+    fn macro_block_brackets_the_enclosed_choreography() {
+        let scene: Scene = serde_json::from_str(
+            r##"{
+                "meta": {"title": "t"},
+                "cast": [
+                    {"at": 1.0, "macro": {"name": "greet", "replace": true, "cast": [
+                        {"at": 1.0, "ai": {"flash": "#00ff00"}},
+                        {"at": 2.5, "ai": {"pulse": 0.5}}
+                    ]}}
+                ]
+            }"##,
+        )
+        .unwrap();
+        let cast = compile(&scene, Path::new(".")).unwrap();
+        // record at the block time, stop after the last enclosed event.
+        let record = cast
+            .events
+            .iter()
+            .find(|event| event.data.contains("macro.record"))
+            .expect("record emitted");
+        let stop = cast
+            .events
+            .iter()
+            .find(|event| event.data.contains("macro.stop"))
+            .expect("stop emitted");
+        assert_eq!(record.time, 1.0);
+        assert!(record.data.contains("name=greet"));
+        assert!(record.data.contains("mode=replace"));
+        assert_eq!(stop.time, 2.5, "stop follows the last enclosed event");
+        // The two enclosed effect commands sit inside the bracket in time.
+        let flash = cast
+            .events
+            .iter()
+            .find(|event| event.data.contains("flash"))
+            .expect("flash emitted");
+        assert!(record.time <= flash.time && flash.time <= stop.time);
+    }
+
+    #[test]
+    fn macro_block_rejects_nesting_and_reset() {
+        let nested: Scene = serde_json::from_str(
+            r#"{
+                "meta": {"title": "t"},
+                "cast": [
+                    {"at": 0.0, "macro": {"name": "outer", "cast": [
+                        {"at": 0.0, "macro": {"name": "inner", "cast": []}}
+                    ]}}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let error = compile(&nested, Path::new(".")).unwrap_err();
+        assert!(format!("{error:#}").contains("nest"));
+
+        let with_reset: Scene = serde_json::from_str(
+            r#"{
+                "meta": {"title": "t"},
+                "cast": [
+                    {"at": 0.0, "macro": {"name": "m", "cast": [
+                        {"at": 0.0, "ai": {"reset": true}}
+                    ]}}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let error = compile(&with_reset, Path::new(".")).unwrap_err();
+        assert!(format!("{error:#}").contains("cancel the recording"));
     }
 }
