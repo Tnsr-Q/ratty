@@ -223,10 +223,12 @@ Live object counts per agent namespace plus the transmission partition.
 
 `state.macros` lists the caller's session macros plus the trusted macros
 (each tagged `scope`, with `name`, `v`, `commands`, `privileged`, `hash`),
-paginated. `state.executions` projects the caller's own active recording or
-playback; a playback item carries its execution handle as `id` (the same
-handle its `started` ack reported). Both are the read side of the [Ratty
-Macros Protocol](macros.md) (OSC 777 `macro.*`).
+paginated. `state.executions` projects the caller's own executions: the
+active recording or playback (a playback item carries its execution
+handle as `id` — the same handle its `started` ack reported) plus the
+caller's own avatar utterances (active and queued, with their handles;
+see the [Ratty Avatar Protocol](avatar.md)). Executions are private
+per-agent; absence of a handle means finished or cancelled.
 
 ### 8. `state.errors` — the caller's rejection ring *(paginated)*
 
@@ -292,7 +294,8 @@ Append-only, kebab-case, carried in `code=`: `bad-envelope`,
 `no-anchor`, `already-exists`, `id-reused`, `session-budget`,
 `namespace-cap`, `bad-asset`, `bad-mode`, `bad-kind`, `kind-mismatch`,
 `audio-locked`, `deferred`, `rate-limited`, `voice-cap`, `not-permitted`,
-`stale-seq`, `agent-queue-full`, `text-too-long`, `internal` — plus the
+`stale-seq`, `agent-queue-full`, `text-too-long`, `unknown-model`,
+`unknown-anchor`, `unknown-gesture`, `internal` — plus the
 client-side `timeout` and `disposed`. `deferred`, `started`, and `queued`
 are the codes that qualify an `ok=1` ack rather than naming a rejection
 (see Command acks above, [sound.md](sound.md), and the long-running-ack

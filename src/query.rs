@@ -133,7 +133,9 @@ pub mod codes {
     /// play because the exclusive scene lock is held (#16 privileged macros).
     pub const SCENE_LOCKED: &str = "scene-locked";
     /// A stop-style command (`macro.stop`, `avatar.stop`) arrived with
-    /// nothing of the caller's live to finalize or cancel.
+    /// nothing of the caller's live to finalize or cancel — or a command
+    /// that needs a live target arrived with none (`avatar.speak`/
+    /// `avatar.gesture` while the avatar is hidden).
     pub const NOTHING_ACTIVE: &str = "nothing-active";
     /// A `sensor.publish` carried a sequence number at or below the
     /// sensor's current one; out-of-order samples are rejected rather than
@@ -152,6 +154,13 @@ pub mod codes {
     pub const AGENT_QUEUE_FULL: &str = "agent-queue-full";
     /// The utterance text exceeds the avatar text byte cap (#23).
     pub const TEXT_TOO_LONG: &str = "text-too-long";
+    /// An avatar model id not in the curated registry (#23 §3; wire
+    /// commands reference immutable registry ids only, never paths).
+    pub const UNKNOWN_MODEL: &str = "unknown-model";
+    /// An avatar anchor name not in the nine-anchor vocabulary (#23 §3).
+    pub const UNKNOWN_ANCHOR: &str = "unknown-anchor";
+    /// An avatar gesture name not in the choreography vocabulary (#23 §1).
+    pub const UNKNOWN_GESTURE: &str = "unknown-gesture";
 }
 
 /// Returns whether `token` is a valid correlation token: 1 to

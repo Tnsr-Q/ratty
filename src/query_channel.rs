@@ -312,6 +312,8 @@ pub struct OrganRegistries<'w> {
     bookmarks: Res<'w, crate::bookmarks::BookmarkRegistry>,
     macros: Res<'w, crate::macros::MacroRegistry>,
     reactive: Res<'w, crate::reactive::ReactiveRegistry>,
+    avatar: Res<'w, crate::avatar::AvatarState>,
+    config: Res<'w, crate::config::AppConfig>,
     time: Res<'w, Time>,
 }
 
@@ -389,6 +391,8 @@ pub fn answer_queries(
                     bookmarks: &organs.bookmarks,
                     macros: &organs.macros,
                     reactive: &organs.reactive,
+                    avatar: &organs.avatar,
+                    config: &organs.config,
                     now: organs.time.elapsed(),
                     grid: runtime.parser.screen().size(),
                 };
@@ -476,6 +480,9 @@ struct QueryCtx<'a> {
     bookmarks: &'a crate::bookmarks::BookmarkRegistry,
     macros: &'a crate::macros::MacroRegistry,
     reactive: &'a crate::reactive::ReactiveRegistry,
+    avatar: &'a crate::avatar::AvatarState,
+    /// Trusted config, for the `caps` capability-grant projection.
+    config: &'a crate::config::AppConfig,
     /// `Time::elapsed` at answer time, for sensor freshness projections.
     now: std::time::Duration,
     /// Live grid size as `(rows, cols)`, from the parser screen.
@@ -495,7 +502,7 @@ fn answer(
     };
 
     match envelope.op.as_str() {
-        "caps" => Ok(caps(ctx)),
+        "caps" => Ok(caps(ctx, source)),
         "state.scene" => Ok(scene_state(ctx)),
         "state.objects" => own_objects(ctx, source, &data),
         "state.visible_objects" => visible_objects(ctx, &data),
@@ -508,10 +515,21 @@ fn answer(
             crate::macros::macros_state_items(ctx.macros, source.namespace()),
             &data,
         ),
-        "state.executions" => Ok(crate::macros::executions_state_value(
-            ctx.macros,
-            source.namespace(),
-        )),
+        // The caller's own executions: the macro slot plus the caller's
+        // avatar utterances (own active and own queued). Private
+        // per-agent; absence of a handle is the completion signal (#18).
+        "state.executions" => {
+            let mut value =
+                crate::macros::executions_state_value(ctx.macros, source.namespace());
+            if let Some(items) = value["items"].as_array_mut() {
+                items.extend(
+                    ctx.avatar
+                        .speech
+                        .execution_items(source.namespace(), ctx.now),
+                );
+            }
+            Ok(value)
+        }
         "state.errors" => errors(ctx, source, &data),
         "state.viz" => viz_state(ctx, source, &data),
         "state.bookmarks" => Ok(bookmarks_state(ctx, source)),
@@ -533,7 +551,7 @@ fn answer(
 
 /// `caps`: protocol discovery — the 778 analog of the RGP support reply.
 /// Keys are append-only so older clients keep parsing newer replies.
-fn caps(ctx: &QueryCtx<'_>) -> Value {
+fn caps(ctx: &QueryCtx<'_>, source: IngressSource) -> Value {
     json!({
         "v": 1,
         "session": ctx.session.nonce_hex(),
@@ -568,8 +586,25 @@ fn caps(ctx: &QueryCtx<'_>) -> Value {
             "sensor_name_bytes": crate::reactive::MAX_SENSOR_SUFFIX_BYTES,
             "sensor_publishes_per_sec": crate::reactive::SENSOR_PUBLISHES_PER_SEC,
             "sensor_default_ttl_secs": crate::reactive::DEFAULT_SENSOR_TTL_SECS,
+            "avatar_text_bytes": crate::avatar::MAX_AVATAR_TEXT_BYTES,
+            "avatar_speaker_bytes": crate::avatar::MAX_AVATAR_SPEAKER_BYTES,
+            "avatar_utterance_min_ms": crate::avatar::MIN_UTTERANCE_MS,
+            "avatar_utterance_max_ms": crate::avatar::MAX_UTTERANCE_MS,
+            "avatar_queue_global": crate::avatar::MAX_PENDING_UTTERANCES_GLOBAL,
+            "avatar_queue_per_agent": crate::avatar::MAX_PENDING_UTTERANCES_PER_AGENT,
+            "avatar_offset_max_px": crate::avatar::AVATAR_OFFSET_MAX_PX,
         },
         "viz_kinds": crate::viz::REGISTERED_VIZ_KINDS,
+        "avatar_models": crate::osc::AVATAR_MODELS,
+        // #23 honesty: the scene-level capabilities THIS caller's ingress
+        // tier carries, derived from trusted config — discoverable before
+        // attempting, never a promise of anything else.
+        "trust": {
+            "avatar_scene": crate::capability::SceneCapability::AvatarScene
+                .granted_to(source, ctx.config),
+            "scene_ambient": crate::capability::SceneCapability::SceneAmbient
+                .granted_to(source, ctx.config),
+        },
         // #18 honesty: whether the config-gated native sensor adapter is
         // active in this process (always false on wasm), and the sensors
         // it is currently supplying. Both are live truth, never a promise.
@@ -634,6 +669,10 @@ fn scene_state(ctx: &QueryCtx<'_>) -> Value {
             },
             "voices": audio.voices,
         },
+        // Append-only (M3.10): the avatar organ's public state (#23 §2's
+        // five fields plus placement). No utterance text ever appears
+        // here — text is owner-scoped to `state.executions`.
+        "avatar": ctx.avatar.public_scene(),
     })
 }
 
@@ -1060,6 +1099,8 @@ mod tests {
         app.init_resource::<SoundState>();
         app.init_resource::<crate::bookmarks::BookmarkRegistry>();
         app.init_resource::<crate::macros::MacroRegistry>();
+        app.init_resource::<crate::avatar::AvatarState>();
+        app.init_resource::<crate::config::AppConfig>();
         app.init_resource::<Time>();
         app.insert_resource(TerminalPresentation {
             mode: TerminalPresentationMode::Flat2d,
@@ -1088,6 +1129,8 @@ mod tests {
                 crate::effects::apply_ai_effect_commands,
                 crate::bookmarks::apply_bookmark_commands,
                 crate::bookmarks::drain_bookmark_jumps,
+                crate::avatar::drive_avatar_speech,
+                crate::avatar::apply_avatar_commands,
                 answer_queries,
             )
                 .chain(),
@@ -1972,6 +2015,67 @@ mod tests {
             caps["limits"]["sound_plays_per_sec"],
             json!(crate::sound::SOUND_PLAYS_PER_SEC)
         );
+    }
+
+    #[test]
+    fn closed_loop_avatar_speak_over_777_and_778() {
+        // The M3.10 rider demo: write over 777, read back over 778 — one
+        // chunk carrying show, a long-running speak, and the two reads.
+        let (mut app, host) = test_app();
+        let set = "\x1b]777;ratty:avatar.set;tok=a1\x07";
+        let speak = "\x1b]777;ratty:avatar.speak;text=Deploy%20finished&tok=s1\x07";
+        let scene = query_sequence("q1", "state.scene", None);
+        let execs = query_sequence("q2", "state.executions", None);
+        host.feed_tx
+            .send(format!("{set}{speak}{scene}{execs}").into_bytes())
+            .expect("virtual feed accepts bytes");
+        app.update();
+
+        let replies = drain_replies(&host);
+        assert_eq!(replies.len(), 4, "two acks, two query replies");
+        assert!(replies[0].ok && replies[0].ack, "avatar.set committed");
+
+        let ack = &replies[1];
+        assert_eq!(ack.token, "s1");
+        assert!(ack.ack && ack.ok);
+        assert_eq!(ack.code.as_deref(), Some(codes::STARTED));
+        let data: Value = serde_json::from_slice(&ack.data).expect("ack data is JSON");
+        let handle = data["id"].as_str().expect("handle").to_string();
+        assert_eq!(data["position"], json!(0));
+
+        let scene = payload(&replies[2]);
+        assert_eq!(scene["avatar"]["visible"], json!(true));
+        assert_eq!(scene["avatar"]["speaking"], json!(true));
+        assert_eq!(scene["avatar"]["speaker"], json!(0));
+        assert_eq!(scene["avatar"]["execution"], json!(handle));
+        assert_eq!(scene["avatar"]["queue_depth"], json!(0));
+
+        let execs = payload(&replies[3]);
+        let items = execs["items"].as_array().expect("items");
+        assert!(
+            items
+                .iter()
+                .any(|item| item["id"] == json!(handle) && item["status"] == json!("active")),
+            "the started handle is inspectable via state.executions"
+        );
+    }
+
+    #[test]
+    fn caps_reports_trust_grants_and_avatar_limits() {
+        let (mut app, host) = test_app();
+        let reply = run_query(&mut app, &host, "q1", "caps", None);
+        let caps = payload(&reply);
+        assert_eq!(caps["trust"]["avatar_scene"], json!(true));
+        assert_eq!(caps["trust"]["scene_ambient"], json!(true));
+        assert_eq!(
+            caps["limits"]["avatar_text_bytes"],
+            json!(crate::avatar::MAX_AVATAR_TEXT_BYTES)
+        );
+        assert_eq!(
+            caps["limits"]["avatar_queue_global"],
+            json!(crate::avatar::MAX_PENDING_UTTERANCES_GLOBAL)
+        );
+        assert_eq!(caps["avatar_models"], json!(["mascot"]));
     }
 
     #[test]

@@ -7,6 +7,7 @@
 #![warn(clippy::unwrap_used)]
 
 pub mod ai;
+pub mod avatar;
 pub mod bookmarks;
 pub mod capability;
 pub mod cli;

@@ -115,6 +115,33 @@ pub const SOUND_KINDS: &[(&str, SoundKindClass)] = &[
     ("ambient.hum", SoundKindClass::Ambient),
 ];
 
+/// The shared wire vocabulary of avatar model registry ids (#23 §3).
+///
+/// Immutable and append-only: an id, once shipped, never changes meaning
+/// or disappears. Wire commands reference these ids only — never file
+/// names, paths, or URLs (#12). Which embedded asset backs an id is
+/// terminal-side detail the wire never sees (see
+/// `crate::avatar::AVATAR_REGISTRY`; a test pins the lockstep). The list
+/// lives in this shared module so `ratty-ai` validates ids without the
+/// terminal.
+pub const AVATAR_MODELS: &[&str] = &["mascot"];
+
+/// The scope of an `avatar.speech.clear` (#23 §2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpeechClearScope {
+    /// The caller's own pending utterance (no `ns=`/`scope=`).
+    Own,
+    /// One namespace's pending utterance (`ns=<n>`). Equal to the
+    /// caller's own namespace this is ownership-scoped like `Own`; any
+    /// other namespace is scene-global. Classification is conservative:
+    /// `ns=` classifies privileged even for the recorder's own namespace,
+    /// because the caller is unknown at classification time — a macro
+    /// author who wants an unprivileged recording uses the bare form.
+    Namespace(u8),
+    /// The whole queue plus the active utterance (`scope=all`).
+    All,
+}
+
 /// Looks up the class of a registered sound kind, or `None` when the kind
 /// is not registered.
 pub fn sound_kind_class(kind: &str) -> Option<SoundKindClass> {
@@ -423,25 +450,67 @@ pub enum RattyAiCommand {
         fade: Option<u32>,
     },
 
-    // ── Avatar ──
-    /// Show the AI avatar.
+    // ── Avatar (#23) ──
+    /// Show the avatar and/or update its HUD placement (`avatar.set`).
+    /// Partial-update semantics like `cursor`: every key is optional and
+    /// an invalid field rejects the whole command. Scene-global: requires
+    /// the avatar-scene capability.
     AvatarSet {
-        /// Avatar model.
-        model: String,
-        /// Screen position.
-        position: String,
+        /// Curated mascot registry id (see [`AVATAR_MODELS`]); never a
+        /// path (#12). Unknown ids reject `unknown-model` at apply.
+        model: Option<String>,
+        /// One of the nine named HUD anchors (`position=`). Unknown names
+        /// reject `unknown-anchor` at apply.
+        position: Option<String>,
+        /// Bounded pixel offset from the anchor, logical px, +y down;
+        /// clamped terminal-side.
+        dx: Option<f32>,
+        /// See `dx`.
+        dy: Option<f32>,
+        /// Independent HUD scale; clamped terminal-side.
+        scale: Option<f32>,
     },
-    /// Trigger an avatar gesture.
+    /// Show a hidden avatar without changing its representation
+    /// (`avatar.show`). Scene-global: requires the avatar-scene capability.
+    AvatarShow,
+    /// One-shot named root-transform choreography (`avatar.gesture`).
+    /// Ordinary tier. Unknown names reject `unknown-gesture` at apply.
     AvatarGesture {
-        /// Gesture name.
+        /// Choreography name (`bob`, `tilt`, `lean`, `nod`, `spin`).
         gesture: String,
     },
-    /// Make the avatar speak.
+    /// Present an utterance through the bubble/typewriter overlay
+    /// (`avatar.speak`). Ordinary tier; a long-running operation (#18):
+    /// the ack is the started/queued form with an execution handle.
     AvatarSpeak {
-        /// Speech text.
+        /// UTF-8 prose, byte-capped terminal-side (`text-too-long` over).
         text: String,
+        /// Optional visible speaker label (`from=`), byte-capped. A
+        /// presentation label only: attribution authority is always the
+        /// ingress-derived namespace — a stream cannot claim an identity.
+        from: Option<String>,
+        /// Display duration in seconds. Derived from the text when absent;
+        /// clamped terminal-side either way; pinned at admission.
+        duration: Option<f32>,
     },
-    /// Hide the avatar.
+    /// Cancel the caller's own current or queued utterance (`avatar.stop`).
+    AvatarStopSpeaking,
+    /// Cancel one utterance by execution handle (`avatar.cancel;id=`);
+    /// only the owner's handles are cancellable (`not-owner` otherwise).
+    AvatarCancel {
+        /// The execution handle from the started/queued ack.
+        execution_id: String,
+    },
+    /// Clear queued avatar speech (`avatar.speech.clear`). The bare form
+    /// is ownership-scoped; wider scopes are scene-global and require the
+    /// avatar-scene capability.
+    AvatarSpeechClear {
+        /// The clear scope.
+        scope: SpeechClearScope,
+    },
+    /// Hide the avatar globally (`avatar.hide`), cancelling the current
+    /// utterance and clearing the whole queue (#23 §2). Scene-global:
+    /// requires the avatar-scene capability.
     AvatarHide,
 
     // ── Macros ──
@@ -627,14 +696,33 @@ impl RattyAiCommand {
     }
 
     /// Whether this command mutates scene-global presentation state (mode,
-    /// warp, reset) rather than staying inside the caller's own object
-    /// namespace. A recording that contains one is classified *privileged*
-    /// and needs the exclusive scene lock to play (#16 privileged macros).
+    /// warp, reset, avatar scene control) rather than staying inside the
+    /// caller's own object namespace. A recording that contains one is
+    /// classified *privileged* and needs the exclusive scene lock to play
+    /// (#16 privileged macros).
     pub fn is_scene_global(&self) -> bool {
-        matches!(
-            self,
-            Self::SetMode { .. } | Self::SetWarp { .. } | Self::Reset
-        )
+        match self {
+            Self::SetMode { .. } | Self::SetWarp { .. } | Self::Reset => true,
+            // Avatar scene control (#23): representation, global
+            // visibility, and cross-agent queue authority are shared
+            // scene state.
+            Self::AvatarSet { .. } | Self::AvatarShow | Self::AvatarHide => true,
+            // Clearing one's own utterance is ownership-scoped; any wider
+            // scope is scene-global (arg-dependent classification has
+            // precedent: rule-safe `object.update` keys on x/y).
+            Self::AvatarSpeechClear { scope } => !matches!(scope, SpeechClearScope::Own),
+            _ => false,
+        }
+    }
+
+    /// Whether this command addresses live execution state by
+    /// session-scoped handle (or implicitly, the caller's own current
+    /// operation). Handles are transport-epoch metadata like `tok=`
+    /// correlation tokens — meaningless in a recording or a durable
+    /// trusted macro — so the recorder tap skips these and the trusted
+    /// loader refuses them (#18).
+    pub fn is_execution_control(&self) -> bool {
+        matches!(self, Self::AvatarStopSpeaking | Self::AvatarCancel { .. })
     }
 }
 
@@ -870,17 +958,44 @@ fn parse_action(action: &str, p: &Payload) -> Option<RattyAiCommand> {
             fade: p.opt("fade"),
         },
 
-        // Avatar
+        // Avatar (#23). Vocabulary validation (model/anchor/gesture names)
+        // stays at apply time so unknown names get their explicit ack
+        // codes, not a generic bad-command — the object.add split.
         "avatar.set" => RattyAiCommand::AvatarSet {
-            model: p.string_or("model", "ai-helper.glb"),
-            position: p.string_or("position", "top-right"),
+            model: p.string("model"),
+            position: p.string("position"),
+            dx: p.opt_strict("dx").ok()?,
+            dy: p.opt_strict("dy").ok()?,
+            scale: p.opt_strict("scale").ok()?,
         },
+        "avatar.show" => RattyAiCommand::AvatarShow,
         "avatar.gesture" => RattyAiCommand::AvatarGesture {
-            gesture: p.string_or("gesture", "wave"),
+            gesture: p.string("gesture")?,
         },
         "avatar.speak" => RattyAiCommand::AvatarSpeak {
             text: p.string("text")?,
+            from: p.string("from"),
+            // Strict: a typo'd duration is a bad command, never a
+            // silently absent field (the rule.set opt_strict posture).
+            duration: p.opt_strict("duration").ok()?,
         },
+        "avatar.stop" => RattyAiCommand::AvatarStopSpeaking,
+        "avatar.cancel" => RattyAiCommand::AvatarCancel {
+            execution_id: p.string("id")?,
+        },
+        "avatar.speech.clear" => {
+            // `ns=` and `scope=` are mutually exclusive closed
+            // vocabularies; `scope=` accepts only `all`.
+            let ns = p.string("ns");
+            let scope_key = p.string("scope");
+            let scope = match (ns, scope_key.as_deref()) {
+                (None, None) => SpeechClearScope::Own,
+                (Some(ns), None) => SpeechClearScope::Namespace(ns.parse().ok()?),
+                (None, Some("all")) => SpeechClearScope::All,
+                _ => return None,
+            };
+            RattyAiCommand::AvatarSpeechClear { scope }
+        }
         "avatar.hide" => RattyAiCommand::AvatarHide,
 
         // Macros
@@ -1610,14 +1725,97 @@ mod tests {
         let spawn = parse_command("ratty:object.add;id=2147483648&path=rat.obj").expect("parses");
         assert!(!spawn.is_control_plane(), "object.add records");
         assert!(!spawn.is_scene_global(), "object.add stays namespaced");
-        // Scene-global commands mark a recording privileged.
+        // Scene-global commands mark a recording privileged — including
+        // avatar scene control (#23).
         for global in [
             parse_command("ratty:mode;3d").expect("parses"),
             parse_command("ratty:warp;intensity=0.5").expect("parses"),
             parse_command("ratty:reset").expect("parses"),
+            parse_command("ratty:avatar.set;model=mascot").expect("parses"),
+            parse_command("ratty:avatar.show").expect("parses"),
+            parse_command("ratty:avatar.hide").expect("parses"),
+            parse_command("ratty:avatar.speech.clear;ns=0").expect("parses"),
+            parse_command("ratty:avatar.speech.clear;scope=all").expect("parses"),
         ] {
             assert!(global.is_scene_global(), "{global:?} is scene-global");
         }
+        // Ownership-scoped avatar commands stay unprivileged choreography.
+        for own in [
+            parse_command("ratty:avatar.speak;text=hi").expect("parses"),
+            parse_command("ratty:avatar.gesture;gesture=bob").expect("parses"),
+            parse_command("ratty:avatar.speech.clear").expect("parses"),
+        ] {
+            assert!(!own.is_scene_global(), "{own:?} stays ownership-scoped");
+            assert!(!own.is_control_plane(), "{own:?} records");
+        }
+        // Execution control addresses session-scoped handles: skipped by
+        // the recorder tap and refused by the trusted loader (#18).
+        for exec in [
+            parse_command("ratty:avatar.stop").expect("parses"),
+            parse_command("ratty:avatar.cancel;id=abc-1").expect("parses"),
+        ] {
+            assert!(exec.is_execution_control(), "{exec:?} is execution control");
+        }
+        // No avatar command is in the reactive-rule allowlist (#21).
+        for avatar in [
+            "ratty:avatar.set;model=mascot",
+            "ratty:avatar.show",
+            "ratty:avatar.hide",
+            "ratty:avatar.gesture;gesture=bob",
+            "ratty:avatar.speak;text=hi",
+            "ratty:avatar.stop",
+            "ratty:avatar.cancel;id=abc-1",
+            "ratty:avatar.speech.clear",
+        ] {
+            let command = parse_command(avatar).expect("parses");
+            assert!(
+                !command.is_rule_safe_action(),
+                "{command:?} must not be rule-safe"
+            );
+        }
+    }
+
+    #[test]
+    fn avatar_wire_grammar_parses_and_rejects_strictly() {
+        // Partial update: every key optional.
+        assert_eq!(
+            parse_command("ratty:avatar.set"),
+            Some(RattyAiCommand::AvatarSet {
+                model: None,
+                position: None,
+                dx: None,
+                dy: None,
+                scale: None,
+            })
+        );
+        assert_eq!(
+            parse_command("ratty:avatar.set;model=mascot&position=bottom-right&dx=12&dy=-4&scale=2"),
+            Some(RattyAiCommand::AvatarSet {
+                model: Some("mascot".to_string()),
+                position: Some("bottom-right".to_string()),
+                dx: Some(12.0),
+                dy: Some(-4.0),
+                scale: Some(2.0),
+            })
+        );
+        // A typo'd numeric field is a bad command, never silently absent.
+        assert_eq!(parse_command("ratty:avatar.set;dx=abc"), None);
+        assert_eq!(parse_command("ratty:avatar.speak;text=hi&duration=zzz"), None);
+        // speak requires text; cancel requires id; gesture requires gesture.
+        assert_eq!(parse_command("ratty:avatar.speak"), None);
+        assert_eq!(parse_command("ratty:avatar.cancel"), None);
+        assert_eq!(parse_command("ratty:avatar.gesture"), None);
+        // speech.clear: ns= and scope= are mutually exclusive; scope only
+        // accepts `all`; ns must be a u8.
+        assert_eq!(
+            parse_command("ratty:avatar.speech.clear;ns=3"),
+            Some(RattyAiCommand::AvatarSpeechClear {
+                scope: SpeechClearScope::Namespace(3),
+            })
+        );
+        assert_eq!(parse_command("ratty:avatar.speech.clear;ns=3&scope=all"), None);
+        assert_eq!(parse_command("ratty:avatar.speech.clear;scope=some"), None);
+        assert_eq!(parse_command("ratty:avatar.speech.clear;ns=999"), None);
     }
 
     #[test]

@@ -684,27 +684,67 @@ enum UserAction {
 
 #[derive(Subcommand)]
 enum AvatarAction {
-    /// Show the avatar.
+    /// Show the avatar and/or update its placement (partial update;
+    /// requires the avatar-scene capability).
     Set {
-        /// Avatar model.
-        #[arg(short, long, default_value = "ai-helper.glb")]
-        model: String,
-        /// Screen position.
-        #[arg(short, long, default_value = "top-right")]
-        position: String,
+        /// Curated model registry id (e.g. `mascot`) — never a path.
+        #[arg(short, long)]
+        model: Option<String>,
+        /// One of the nine named anchors (default stays `bottom-right`
+        /// terminal-side).
+        #[arg(short, long)]
+        position: Option<String>,
+        /// Anchor x offset, logical px (clamped terminal-side).
+        #[arg(long)]
+        dx: Option<f32>,
+        /// Anchor y offset, logical px, +y down (clamped terminal-side).
+        #[arg(long)]
+        dy: Option<f32>,
+        /// HUD scale (clamped terminal-side).
+        #[arg(short, long)]
+        scale: Option<f32>,
     },
-    /// Trigger a gesture.
+    /// Show a hidden avatar without changing its representation
+    /// (requires the avatar-scene capability).
+    Show,
+    /// Trigger a named root-transform choreography.
     Gesture {
         /// Gesture.
         #[arg(value_enum)]
         gesture: GestureArg,
     },
-    /// Speak text.
+    /// Speak text (a long-running operation: with --ack the started or
+    /// queued reply carries the execution handle, position, and eta).
     Speak {
-        /// Speech text.
+        /// Speech text (≤ 1000 UTF-8 bytes).
         text: String,
+        /// Visible speaker label (presentation only, ≤ 64 bytes).
+        #[arg(long)]
+        from: Option<String>,
+        /// Display duration in seconds (derived from the text when
+        /// absent; clamped 0.75–15 terminal-side).
+        #[arg(short, long)]
+        duration: Option<f32>,
     },
-    /// Hide the avatar.
+    /// Cancel your own current or queued utterance.
+    Stop,
+    /// Cancel one utterance by execution handle (owner-only).
+    Cancel {
+        /// The execution handle from the started/queued ack.
+        id: String,
+    },
+    /// Clear queued speech: bare = your own pending utterance; --ns or
+    /// --all are scene-wide (require the avatar-scene capability).
+    SpeechClear {
+        /// Clear one namespace's pending utterance.
+        #[arg(long, conflicts_with = "all")]
+        ns: Option<u8>,
+        /// Cancel the whole queue including the active utterance.
+        #[arg(long)]
+        all: bool,
+    },
+    /// Hide the avatar globally, cancelling all speech (requires the
+    /// avatar-scene capability).
     Hide,
 }
 
@@ -779,12 +819,11 @@ enum MoodArg {
 
 #[derive(Clone, Copy, ValueEnum)]
 enum GestureArg {
-    Point,
-    Think,
-    Celebrate,
-    Wave,
+    Bob,
+    Tilt,
+    Lean,
     Nod,
-    Shake,
+    Spin,
 }
 
 /// Accumulates a `k=v&…` payload with every value percent-encoded, so the
@@ -993,19 +1032,49 @@ fn command_to_osc(command: &Commands) -> (String, String) {
             }
         },
         Commands::Avatar(action) => match action {
-            AvatarAction::Set { model, position } => (
+            AvatarAction::Set {
+                model,
+                position,
+                dx,
+                dy,
+                scale,
+            } => (
                 "avatar.set".into(),
-                p().field("model", model)
-                    .field("position", position)
+                p().opt("model", model.as_deref())
+                    .opt("position", position.as_deref())
+                    .opt("dx", *dx)
+                    .opt("dy", *dy)
+                    .opt("scale", *scale)
                     .build(),
             ),
+            AvatarAction::Show => ("avatar.show".into(), String::new()),
             AvatarAction::Gesture { gesture } => (
                 "avatar.gesture".into(),
                 p().field("gesture", gesture_str(*gesture)).build(),
             ),
-            AvatarAction::Speak { text } => {
-                ("avatar.speak".into(), p().field("text", text).build())
+            AvatarAction::Speak {
+                text,
+                from,
+                duration,
+            } => (
+                "avatar.speak".into(),
+                p().field("text", text)
+                    .opt("from", from.as_deref())
+                    .opt("duration", *duration)
+                    .build(),
+            ),
+            AvatarAction::Stop => ("avatar.stop".into(), String::new()),
+            AvatarAction::Cancel { id } => {
+                ("avatar.cancel".into(), p().field("id", id).build())
             }
+            AvatarAction::SpeechClear { ns, all } => (
+                "avatar.speech.clear".into(),
+                if *all {
+                    p().field("scope", "all").build()
+                } else {
+                    p().opt("ns", *ns).build()
+                },
+            ),
             AvatarAction::Hide => ("avatar.hide".into(), String::new()),
         },
         Commands::Macro(action) => match action {
@@ -1104,12 +1173,11 @@ fn mood_str(mood: MoodArg) -> &'static str {
 
 fn gesture_str(gesture: GestureArg) -> &'static str {
     match gesture {
-        GestureArg::Point => "point",
-        GestureArg::Think => "think",
-        GestureArg::Celebrate => "celebrate",
-        GestureArg::Wave => "wave",
+        GestureArg::Bob => "bob",
+        GestureArg::Tilt => "tilt",
+        GestureArg::Lean => "lean",
         GestureArg::Nod => "nod",
-        GestureArg::Shake => "shake",
+        GestureArg::Spin => "spin",
     }
 }
 

@@ -338,7 +338,9 @@ impl MacroRegistry {
     /// This is the trusted-tier entry point (config / CLI / UI / controller);
     /// the wire can never reach it. A macro carrying any macro-control
     /// command is rejected (no recursion, belt-and-suspenders beside the tap
-    /// that already refuses to capture `macro.*`).
+    /// that already refuses to capture `macro.*`), and so is one carrying
+    /// execution control — a session-scoped handle is meaningless in a
+    /// durable artifact (#18).
     pub fn insert_trusted(
         &mut self,
         name: String,
@@ -350,6 +352,13 @@ impl MacroRegistry {
             .any(|step| step.command.is_macro_control())
         {
             return Err("a trusted macro may not contain macro-control commands");
+        }
+        if steps_source
+            .steps
+            .iter()
+            .any(|step| step.command.is_execution_control())
+        {
+            return Err("a trusted macro may not contain execution-control commands");
         }
         self.trusted.insert(
             name,
@@ -736,6 +745,7 @@ impl Plugin for MacrosPlugin {
                     .before(crate::sound::apply_sound_commands)
                     .before(crate::effects::apply_ai_effect_commands)
                     .before(crate::bookmarks::apply_bookmark_commands)
+                    .before(crate::avatar::apply_avatar_commands)
                     .run_if(|registry: Res<MacroRegistry>| registry.has_active_playback()),
             );
     }
@@ -861,11 +871,16 @@ pub fn apply_macro_commands(
             other => {
                 // Recorder tap. macro.* and reset are handled above and never
                 // reach here; the control-plane class (rule.*/sensor.*) is
-                // excluded (#21), and so are rule-*fired* commands — reactive
+                // excluded (#21), execution control (avatar.stop/cancel) is
+                // excluded because session-scoped handles are transport-epoch
+                // metadata (#18), and so are rule-*fired* commands — reactive
                 // noise is not authored choreography. Everything else is
                 // recordable, captured into the caller's own active
                 // recording (if any).
-                if other.is_control_plane() || *origin == CommandOrigin::Rule {
+                if other.is_control_plane()
+                    || other.is_execution_control()
+                    || *origin == CommandOrigin::Rule
+                {
                     continue;
                 }
                 registry.capture(*source, other, now);
@@ -1063,6 +1078,49 @@ mod tests {
         let macro_ = registry.resolve(0, "m", None).expect("registry op ok");
         assert_eq!(macro_.step_count(), 1);
         assert!(macro_.is_privileged(), "mode is scene-global → privileged");
+    }
+
+    #[test]
+    fn avatar_commands_classify_and_filter_like_their_classes() {
+        // avatar.set is scene-global → a macro containing it is privileged;
+        // avatar.speak is ordinary choreography → recordable but not
+        // rule-safe; execution control never enters a trusted macro (#18).
+        let mut registry = MacroRegistry::default();
+        registry.test_record(
+            NS0,
+            "scene",
+            &[RattyAiCommand::AvatarSet {
+                model: Some("mascot".to_string()),
+                position: None,
+                dx: None,
+                dy: None,
+                scale: None,
+            }],
+        );
+        let scene = registry.resolve(0, "scene", None).expect("stored");
+        assert!(scene.is_privileged(), "avatar.set → privileged");
+
+        registry.test_record(
+            NS0,
+            "speech",
+            &[RattyAiCommand::AvatarSpeak {
+                text: "hi".to_string(),
+                from: None,
+                duration: None,
+            }],
+        );
+        let speech = registry.resolve(0, "speech", None).expect("stored");
+        assert!(!speech.is_privileged(), "speak is ownership-scoped");
+        assert!(!speech.is_rule_safe(), "speak consumes the shared voice");
+
+        registry.test_record(NS0, "cancelier", &[RattyAiCommand::AvatarStopSpeaking]);
+        let cancelier = registry.resolve(0, "cancelier", None).expect("stored");
+        assert_eq!(
+            registry
+                .insert_trusted("t".to_string(), &cancelier)
+                .expect_err("execution control refused"),
+            "a trusted macro may not contain execution-control commands"
+        );
     }
 
     #[test]
