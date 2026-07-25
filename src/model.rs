@@ -19,6 +19,46 @@ use crate::paths::{expand_path, runtime_asset_root};
 #[folder = "assets/objects/"]
 struct EmbeddedObjects;
 
+/// Seeds every embedded `.glb`/`.gltf` object into Bevy's built-in
+/// `embedded://` in-memory asset source, so glTF scenes load identically
+/// on native and wasm — no filesystem staging, no web bail. Must run
+/// after `AssetPlugin` inserts the `EmbeddedAssetRegistry` resource and
+/// before the first embedded scene load; `TerminalPlugin::build`
+/// satisfies both (both entry points add it after `DefaultPlugins`).
+///
+/// # Panics
+///
+/// Panics when the `EmbeddedAssetRegistry` resource is missing, i.e. the
+/// plugin-order contract above is broken — a startup wiring bug, never a
+/// runtime condition.
+pub fn seed_embedded_scene_assets(world: &mut World) {
+    use bevy::asset::io::embedded::EmbeddedAssetRegistry;
+    let registry = world.resource::<EmbeddedAssetRegistry>();
+    for name in EmbeddedObjects::iter() {
+        let is_scene = Path::new(name.as_ref())
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| {
+                ext.eq_ignore_ascii_case("glb") || ext.eq_ignore_ascii_case("gltf")
+            });
+        if !is_scene {
+            continue;
+        }
+        let file = EmbeddedObjects::get(&name).expect("iterated names resolve");
+        let asset_path = PathBuf::from("objects").join(name.as_ref());
+        match file.data {
+            // Release builds embed statically: zero-copy insert. Debug
+            // builds read from disk (rust-embed), so the bytes are owned.
+            std::borrow::Cow::Borrowed(bytes) => {
+                registry.insert_asset(asset_path.clone(), &asset_path, bytes);
+            }
+            std::borrow::Cow::Owned(bytes) => {
+                registry.insert_asset(asset_path.clone(), &asset_path, bytes);
+            }
+        }
+    }
+}
+
 /// Marker for the spawned cursor model root.
 #[derive(Component)]
 pub struct CursorModel;
@@ -277,10 +317,10 @@ pub fn load_object_source(path: &Path) -> anyhow::Result<(String, ObjectSource)>
 /// Returns whether `name` resolves to an embedded object asset that this
 /// build can actually load.
 ///
-/// The format check matters on wasm, where glTF scenes cannot be staged:
-/// an existence-only check would let a `.glb` cursor swap pass validation
-/// and then degrade to the fallback cube. Callers use this to reject
-/// unsupported wire asset names up front.
+/// Every embedded format loads on both targets: OBJ/STL parse in memory,
+/// and glTF scenes ride the memory-backed `embedded://` asset source
+/// (see [`seed_embedded_scene_assets`]) — no filesystem on either target.
+/// Callers use this to reject unknown wire asset names up front.
 pub fn embedded_object_loadable(name: &str) -> bool {
     let Some(file_name) = Path::new(name)
         .file_name()
@@ -296,10 +336,7 @@ pub fn embedded_object_loadable(name: &str) -> bool {
         .and_then(|ext| ext.to_str())
         .map(|ext| ext.to_ascii_lowercase())
         .unwrap_or_default();
-    // glTF scenes cannot be staged on wasm; OBJ/STL load everywhere.
-    let gltf_loadable = cfg!(not(target_arch = "wasm32"));
-    matches!(extension.as_str(), "obj" | "stl")
-        || (gltf_loadable && matches!(extension.as_str(), "glb" | "gltf"))
+    matches!(extension.as_str(), "obj" | "stl" | "glb" | "gltf")
 }
 
 /// Loads an object source from the embedded asset registry only.
@@ -317,8 +354,8 @@ pub fn embedded_object_loadable(name: &str) -> bool {
 /// # Errors
 ///
 /// Returns an error when the name is not embedded, the format is
-/// unsupported (glTF is native-only here — the web build cannot stage scene
-/// assets), or the asset fails to parse.
+/// unsupported, or the asset fails to parse. Embedded glTF scenes load on
+/// both targets through the `embedded://` memory source.
 pub fn load_embedded_object_source(
     name: &str,
     options: ObjectLoadOptions,
@@ -342,22 +379,21 @@ pub fn load_embedded_object_source(
         }
         "obj" => load_obj_meshes_from_bytes(file_name, &file.data, options.normalize)
             .map(|meshes| (source, ObjectSource::Obj(meshes))),
-        #[cfg(not(target_arch = "wasm32"))]
-        "glb" | "gltf" => {
-            let candidate = format!("objects/{file_name}");
-            let asset_path = ensure_scene_asset_path(&candidate, Some((file_name, &file.data)))?;
-            Ok((source, ObjectSource::Gltf(asset_path)))
-        }
-        #[cfg(target_arch = "wasm32")]
-        "glb" | "gltf" => bail!("format {extension} is not supported in the web build yet"),
+        // Embedded scenes ride the memory-backed `embedded://` source
+        // (seeded at plugin build) — identical on native and wasm.
+        "glb" | "gltf" => Ok((
+            source,
+            ObjectSource::Gltf(format!("embedded://objects/{file_name}")),
+        )),
         _ => bail!("unsupported object format for {file_name}"),
     }
 }
 
 /// Loads an object source from a path with explicit load options.
 ///
-/// The web build has no filesystem: only ratty-embedded assets resolve, and
-/// only in-memory formats (OBJ, STL).
+/// The web build has no filesystem: only ratty-embedded assets resolve.
+/// OBJ/STL parse in memory; embedded glTF scenes ride the `embedded://`
+/// memory source.
 ///
 /// # Errors
 ///
@@ -389,7 +425,11 @@ pub fn load_object_source_with_options(
             .map(|mesh| (format!("embedded:{file_name}"), ObjectSource::Stl(mesh))),
         "obj" => load_obj_meshes_from_bytes(file_name, &file.data, options.normalize)
             .map(|meshes| (format!("embedded:{file_name}"), ObjectSource::Obj(meshes))),
-        _ => bail!("format {extension} is not supported in the web build yet (obj, stl)"),
+        "glb" | "gltf" => Ok((
+            format!("embedded:{file_name}"),
+            ObjectSource::Gltf(format!("embedded://objects/{file_name}")),
+        )),
+        _ => bail!("unsupported object format for {file_name} (obj, stl, glb, gltf)"),
     }
 }
 
@@ -464,14 +504,10 @@ pub fn load_object_source_with_options(
                 .map(|mesh| (format!("embedded:{file_name}"), ObjectSource::Stl(mesh))),
             "obj" => load_obj_meshes_from_bytes(file_name, &file.data, options.normalize)
                 .map(|meshes| (format!("embedded:{file_name}"), ObjectSource::Obj(meshes))),
-            "glb" | "gltf" => {
-                let asset_path =
-                    ensure_scene_asset_path(&candidate, Some((file_name, &file.data)))?;
-                Ok((
-                    format!("embedded:{file_name}"),
-                    ObjectSource::Gltf(asset_path),
-                ))
-            }
+            "glb" | "gltf" => Ok((
+                format!("embedded:{file_name}"),
+                ObjectSource::Gltf(format!("embedded://objects/{file_name}")),
+            )),
             _ => bail!("unsupported object format for {}", candidate),
         };
     }
@@ -784,4 +820,57 @@ fn build_meshes(
 
     ensure!(!output.is_empty(), "no mesh content inside {source}");
     Ok(output)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn embedded_gltf_resolves_to_the_embedded_source_on_every_target() {
+        // The same cfg-free branch compiles on native and wasm: embedded
+        // scenes ride the memory-backed embedded:// source, never the
+        // filesystem.
+        let (source, object) =
+            load_embedded_object_source("SpinyMouse.glb", ObjectLoadOptions::default())
+                .expect("embedded mascot resolves");
+        assert_eq!(source, "embedded:SpinyMouse.glb");
+        match object {
+            ObjectSource::Gltf(path) => {
+                assert_eq!(path, "embedded://objects/SpinyMouse.glb");
+            }
+            _ => panic!("expected a Gltf source"),
+        }
+        assert!(embedded_object_loadable("SpinyMouse.glb"));
+        assert!(embedded_object_loadable("Ferris.glb"));
+        assert!(embedded_object_loadable("CairoSpinyMouse.obj"));
+        assert!(!embedded_object_loadable("missing.glb"));
+    }
+
+    #[test]
+    fn seeder_registers_embedded_scenes_under_the_loader_paths() {
+        use bevy::asset::io::embedded::EmbeddedAssetRegistry;
+        let mut world = World::new();
+        world.insert_resource(EmbeddedAssetRegistry::default());
+        seed_embedded_scene_assets(&mut world);
+        let registry = world.resource::<EmbeddedAssetRegistry>();
+        // remove_asset proves insertion under the exact path the loader
+        // emits (embedded://objects/<file>).
+        assert!(
+            registry
+                .remove_asset(Path::new("objects/SpinyMouse.glb"))
+                .is_some()
+        );
+        assert!(
+            registry
+                .remove_asset(Path::new("objects/Ferris.glb"))
+                .is_some()
+        );
+        // Non-scene formats parse in memory and are never seeded.
+        assert!(
+            registry
+                .remove_asset(Path::new("objects/CairoSpinyMouse.obj"))
+                .is_none()
+        );
+    }
 }
