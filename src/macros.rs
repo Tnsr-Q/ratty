@@ -74,7 +74,7 @@ use bevy::ecs::message::{MessageReader, MessageWriter};
 use bevy::prelude::*;
 use serde_json::{Value, json};
 
-use crate::ai::AiCommand;
+use crate::ai::{AiCommand, CommandOrigin};
 use crate::osc::{MacroScope, RattyAiCommand};
 use crate::query::codes;
 use crate::query_channel::{AckOutcome, AiDiagnostics, ack_commit, reject};
@@ -133,6 +133,11 @@ pub struct Macro {
     /// Whether the macro contains a scene-global command and so needs the
     /// exclusive scene lock to play (classified at record time).
     privileged: bool,
+    /// Whether every captured step is a rule-safe action (#21) — the
+    /// classification, computed at finalize beside `privileged`, that
+    /// gates `macro.play` as a reactive rule action. A rule-safe macro is
+    /// never privileged (scene-global commands are not rule-safe).
+    rule_safe: bool,
     /// Content id (hex) over the canonical steps — stable for equal content,
     /// used as the immutable `hash=` play reference. Not a cryptographic
     /// hash; a within-session collision across ≤32 macros is astronomically
@@ -156,6 +161,12 @@ impl Macro {
         self.privileged
     }
 
+    /// Whether every step is a rule-safe action, so a reactive rule may
+    /// fire this macro (#21).
+    pub fn is_rule_safe(&self) -> bool {
+        self.rule_safe
+    }
+
     /// The macro's immutable content id (the `hash=` play reference).
     pub fn hash(&self) -> &str {
         &self.hash
@@ -173,6 +184,9 @@ struct ActiveRecording {
     steps: Vec<MacroStep>,
     /// Set once any scene-global command is captured.
     privileged: bool,
+    /// Cleared once any non-rule-safe action is captured (starts true; an
+    /// empty macro is trivially rule-safe).
+    rule_safe: bool,
     /// Set to a rejection code once a limit is exceeded; a poisoned
     /// recording captures nothing more and is discarded at `macro.stop`.
     poisoned: Option<&'static str>,
@@ -185,6 +199,10 @@ struct ActivePlayback {
     /// the `macro.play` arrived through, so replay runs under the caller's
     /// current authority.
     source: IngressSource,
+    /// The causal origin stamped on every re-injected step: `Macro` for a
+    /// caller-started playback, `Rule` when a reactive rule started it —
+    /// the inherited execution context of #21.
+    origin: CommandOrigin,
     /// The pinned macro version resolved at start.
     macro_: Arc<Macro>,
     /// Clock multiplier (validated finite and positive, clamped at
@@ -320,6 +338,12 @@ impl MacroRegistry {
                 v: steps_source.v,
                 steps: steps_source.steps.clone(),
                 privileged: steps_source.privileged,
+                // Derived state stays derived: recompute rather than trust
+                // the caller's flag.
+                rule_safe: steps_source
+                    .steps
+                    .iter()
+                    .all(|step| step.command.is_rule_safe_action()),
                 hash: steps_source.hash.clone(),
             }),
         );
@@ -368,8 +392,15 @@ impl MacroRegistry {
     }
 
     /// Resolves a macro by name under the given scope. `None` resolves the
-    /// caller's session registry first, then the trusted registry.
-    fn resolve(&self, namespace: u8, name: &str, scope: Option<MacroScope>) -> Option<Arc<Macro>> {
+    /// caller's session registry first, then the trusted registry. Shared
+    /// with the reactive organ, which pins a `macro.play` rule action at
+    /// `rule.set` (#21).
+    pub(crate) fn resolve(
+        &self,
+        namespace: u8,
+        name: &str,
+        scope: Option<MacroScope>,
+    ) -> Option<Arc<Macro>> {
         let session = || self.session.get(&(namespace, name.to_string()));
         let trusted = || self.trusted.get(name);
         match scope {
@@ -382,8 +413,8 @@ impl MacroRegistry {
 
     /// Resolves a macro by its immutable content id, searching the caller's
     /// session macros then the trusted registry (never another agent's
-    /// session).
-    fn resolve_by_hash(&self, namespace: u8, hash: &str) -> Option<Arc<Macro>> {
+    /// session). Shared with the reactive organ (#21).
+    pub(crate) fn resolve_by_hash(&self, namespace: u8, hash: &str) -> Option<Arc<Macro>> {
         self.session
             .iter()
             .filter(|((entry_namespace, _), _)| *entry_namespace == namespace)
@@ -438,6 +469,7 @@ impl MacroRegistry {
                 started: now,
                 steps: Vec::new(),
                 privileged: false,
+                rule_safe: true,
                 poisoned: None,
             }),
         );
@@ -466,6 +498,9 @@ impl MacroRegistry {
         if command.is_scene_global() {
             rec.privileged = true;
         }
+        if !command.is_rule_safe_action() {
+            rec.rule_safe = false;
+        }
         rec.steps.push(MacroStep {
             offset,
             command: command.clone(),
@@ -492,6 +527,7 @@ impl MacroRegistry {
                     v: MACRO_VERSION,
                     steps: rec.steps,
                     privileged: rec.privileged,
+                    rule_safe: rec.rule_safe,
                     hash,
                 });
                 self.session.insert((namespace, name), macro_);
@@ -517,6 +553,7 @@ impl MacroRegistry {
     fn start_playback(
         &mut self,
         source: IngressSource,
+        origin: CommandOrigin,
         name: &str,
         hash: Option<&str>,
         rate: f32,
@@ -548,6 +585,16 @@ impl MacroRegistry {
                 "no macro resolves under the given name/hash and scope".to_string(),
             ));
         };
+        // A rule-fired macro.play re-checks rule-safety at fire time: the
+        // registry may have changed since the rule pinned its target (#21).
+        if origin == CommandOrigin::Rule && !macro_.rule_safe {
+            return Err((
+                codes::NOT_PERMITTED,
+                "a rule may only play a rule-safe macro (every step in the \
+                 allowlisted choreography class)"
+                    .to_string(),
+            ));
+        }
         let scene_locked = if macro_.privileged {
             if self.scene_lock.is_some() {
                 return Err((
@@ -565,6 +612,13 @@ impl MacroRegistry {
             namespace,
             SlotState::Playing(ActivePlayback {
                 source,
+                // A rule-started playback keeps firing under the rule's
+                // causal context; everything else replays as `Macro`.
+                origin: if origin == CommandOrigin::Rule {
+                    CommandOrigin::Rule
+                } else {
+                    CommandOrigin::Macro
+                },
                 macro_,
                 rate,
                 instant,
@@ -583,6 +637,25 @@ impl MacroRegistry {
         self.session.clear();
         self.slots.clear();
         self.scene_lock = None;
+    }
+}
+
+#[cfg(test)]
+impl MacroRegistry {
+    /// Test-only: records and finalizes a macro from the given commands at
+    /// t=0, for cross-organ tests (the reactive rule-action pinning).
+    pub(crate) fn test_record(
+        &mut self,
+        source: IngressSource,
+        name: &str,
+        commands: &[RattyAiCommand],
+    ) {
+        self.start_recording(source, name, false, Duration::ZERO)
+            .expect("test recording starts");
+        for command in commands {
+            self.capture(source, command, Duration::ZERO);
+        }
+        self.stop(source).expect("test recording finalizes");
     }
 }
 
@@ -649,6 +722,7 @@ pub fn apply_macro_commands(
     for AiCommand {
         source,
         ack_token,
+        origin,
         command,
     } in commands.read()
     {
@@ -690,6 +764,7 @@ pub fn apply_macro_commands(
                 scope,
             } => match registry.start_playback(
                 *source,
+                *origin,
                 name,
                 hash.as_deref(),
                 *rate,
@@ -728,10 +803,12 @@ pub fn apply_macro_commands(
             }
             other => {
                 // Recorder tap. macro.* and reset are handled above and never
-                // reach here; the control-plane class (react/rule.*) is
-                // excluded (#21). Everything else is recordable choreography,
-                // captured into the caller's own active recording (if any).
-                if other.is_control_plane() {
+                // reach here; the control-plane class (rule.*/sensor.*) is
+                // excluded (#21), and so are rule-*fired* commands — reactive
+                // noise is not authored choreography. Everything else is
+                // recordable, captured into the caller's own active
+                // recording (if any).
+                if other.is_control_plane() || *origin == CommandOrigin::Rule {
                     continue;
                 }
                 registry.capture(*source, other, now);
@@ -767,6 +844,7 @@ pub fn drive_macro_playback(
             commands.write(AiCommand {
                 source: playback.source,
                 ack_token: None,
+                origin: playback.origin,
                 command,
             });
         }
@@ -797,6 +875,7 @@ pub fn macros_state_items(registry: &MacroRegistry, namespace: u8) -> Vec<(u64, 
                 "v": macro_.version(),
                 "commands": macro_.step_count(),
                 "privileged": macro_.is_privileged(),
+                "rule_safe": macro_.is_rule_safe(),
                 "hash": macro_.hash(),
             }),
         ));
@@ -810,6 +889,7 @@ pub fn macros_state_items(registry: &MacroRegistry, namespace: u8) -> Vec<(u64, 
                 "v": macro_.version(),
                 "commands": macro_.step_count(),
                 "privileged": macro_.is_privileged(),
+                "rule_safe": macro_.is_rule_safe(),
                 "hash": macro_.hash(),
             }),
         ));
@@ -936,7 +1016,16 @@ mod tests {
             .expect_err("second op is busy");
         assert_eq!(code, codes::BUSY);
         let (code, _) = registry
-            .start_playback(NS0, "a", None, 1.0, false, None, t(0.0))
+            .start_playback(
+                NS0,
+                CommandOrigin::Wire,
+                "a",
+                None,
+                1.0,
+                false,
+                None,
+                t(0.0),
+            )
             .expect_err("play while recording is busy");
         assert_eq!(code, codes::BUSY);
     }
@@ -1067,7 +1156,16 @@ mod tests {
         registry.stop(NS0).expect("registry op ok");
 
         registry
-            .start_playback(NS0, "seq", None, 1.0, false, None, t(10.0))
+            .start_playback(
+                NS0,
+                CommandOrigin::Wire,
+                "seq",
+                None,
+                1.0,
+                false,
+                None,
+                t(10.0),
+            )
             .expect("registry op ok");
         let SlotState::Playing(pb) = registry.slots.get_mut(&0).expect("registry op ok") else {
             panic!("playing");
@@ -1093,7 +1191,16 @@ mod tests {
         }
         registry.stop(NS0).expect("registry op ok");
         registry
-            .start_playback(NS0, "big", None, 1.0, true, None, t(0.0))
+            .start_playback(
+                NS0,
+                CommandOrigin::Wire,
+                "big",
+                None,
+                1.0,
+                true,
+                None,
+                t(0.0),
+            )
             .expect("registry op ok");
         let SlotState::Playing(pb) = registry.slots.get_mut(&0).expect("registry op ok") else {
             panic!("playing");
@@ -1113,7 +1220,16 @@ mod tests {
         registry.stop(NS0).expect("registry op ok");
         for bad in [0.0, -1.0, f32::NAN, f32::INFINITY] {
             let (code, _) = registry
-                .start_playback(NS0, "m", None, bad, false, None, t(0.0))
+                .start_playback(
+                    NS0,
+                    CommandOrigin::Wire,
+                    "m",
+                    None,
+                    bad,
+                    false,
+                    None,
+                    t(0.0),
+                )
                 .expect_err("bad rate");
             assert_eq!(code, codes::BAD_PAYLOAD);
         }
@@ -1128,7 +1244,16 @@ mod tests {
         registry.capture(NS0, &mode("3d"), t(0.0));
         registry.stop(NS0).expect("registry op ok");
         registry
-            .start_playback(NS0, "warp", None, 1.0, false, None, t(0.0))
+            .start_playback(
+                NS0,
+                CommandOrigin::Wire,
+                "warp",
+                None,
+                1.0,
+                false,
+                None,
+                t(0.0),
+            )
             .expect("registry op ok");
         assert_eq!(
             registry.scene_lock,
@@ -1160,12 +1285,30 @@ mod tests {
         // modelled by pinning the lock field directly.)
         registry.scene_lock = Some(5);
         let (code, _) = registry
-            .start_playback(NS0, "warp", None, 1.0, false, None, t(0.0))
+            .start_playback(
+                NS0,
+                CommandOrigin::Wire,
+                "warp",
+                None,
+                1.0,
+                false,
+                None,
+                t(0.0),
+            )
             .expect_err("privileged play blocked by the held lock");
         assert_eq!(code, codes::SCENE_LOCKED);
         // A non-privileged macro is unaffected by the held scene lock.
         registry
-            .start_playback(NS0, "plain", None, 1.0, false, None, t(0.0))
+            .start_playback(
+                NS0,
+                CommandOrigin::Wire,
+                "plain",
+                None,
+                1.0,
+                false,
+                None,
+                t(0.0),
+            )
             .expect("a non-privileged macro ignores the scene lock");
     }
 
@@ -1199,6 +1342,7 @@ mod tests {
             hash: content_hash(&steps, false),
             steps,
             privileged: false,
+            rule_safe: true,
         };
         let trusted_hash = trusted.hash().to_string();
         registry
@@ -1248,6 +1392,7 @@ mod tests {
                 command: RattyAiCommand::MacroStop,
             }],
             privileged: false,
+            rule_safe: false,
             hash: "z".to_string(),
         };
         assert!(
@@ -1262,6 +1407,7 @@ mod tests {
                 command: spawn(0x8000_0001),
             }],
             privileged: false,
+            rule_safe: false,
             hash: "g".to_string(),
         };
         registry
@@ -1307,6 +1453,100 @@ mod tests {
         assert_eq!(items[0].1["commands"], 1);
     }
 
+    #[test]
+    fn rule_safety_is_sealed_at_finalize_and_gates_rule_origin_playback() {
+        let mut registry = MacroRegistry::default();
+        // A macro of pure choreography (flash) is rule-safe.
+        registry
+            .start_recording(NS0, "soft", false, t(0.0))
+            .expect("registry op ok");
+        registry.capture(
+            NS0,
+            &RattyAiCommand::Flash {
+                color: "#ff0000".to_string(),
+                duration: 0.4,
+            },
+            t(0.0),
+        );
+        registry.stop(NS0).expect("registry op ok");
+        let soft = registry.resolve(0, "soft", None).expect("registry op ok");
+        assert!(soft.is_rule_safe(), "pure choreography is rule-safe");
+        assert!(!soft.is_privileged());
+
+        // A spawn (respawn-class) breaks rule-safety; so does anything
+        // scene-global.
+        registry
+            .start_recording(NS0, "hard", false, t(0.0))
+            .expect("registry op ok");
+        registry.capture(NS0, &spawn(0x8000_0001), t(0.0));
+        registry.stop(NS0).expect("registry op ok");
+        let hard = registry.resolve(0, "hard", None).expect("registry op ok");
+        assert!(!hard.is_rule_safe(), "spawn is not rule-safe");
+
+        // A rule-fired play of the unsafe macro rejects at fire time; the
+        // safe macro plays and its steps inherit the rule origin.
+        let (code, _) = registry
+            .start_playback(
+                NS0,
+                CommandOrigin::Rule,
+                "hard",
+                None,
+                1.0,
+                false,
+                None,
+                t(0.0),
+            )
+            .expect_err("rule-origin play of a non-rule-safe macro rejects");
+        assert_eq!(code, codes::NOT_PERMITTED);
+        registry
+            .start_playback(
+                NS0,
+                CommandOrigin::Rule,
+                "soft",
+                None,
+                1.0,
+                false,
+                None,
+                t(0.0),
+            )
+            .expect("registry op ok");
+        let SlotState::Playing(pb) = registry.slots.get(&0).expect("slot exists") else {
+            panic!("playing");
+        };
+        assert_eq!(
+            pb.origin,
+            CommandOrigin::Rule,
+            "a rule-started playback inherits the rule's causal context"
+        );
+    }
+
+    #[test]
+    fn insert_trusted_recomputes_rule_safety_from_the_steps() {
+        let mut registry = MacroRegistry::default();
+        let steps = vec![MacroStep {
+            offset: 0.0,
+            command: spawn(0x8000_0001),
+        }];
+        // The caller's flag lies; the registry recomputes from the steps.
+        let lying = Macro {
+            v: MACRO_VERSION,
+            hash: content_hash(&steps, false),
+            steps,
+            privileged: false,
+            rule_safe: true,
+        };
+        registry
+            .insert_trusted("promoted".to_string(), &lying)
+            .expect("registry op ok");
+        assert!(
+            !registry
+                .resolve(0, "promoted", Some(MacroScope::Trusted))
+                .expect("registry op ok")
+                .is_rule_safe(),
+            "derived state stays derived"
+        );
+    }
+
     fn app_test() -> App {
         let mut app = App::new();
         app.init_resource::<MacroRegistry>();
@@ -1324,6 +1564,7 @@ mod tests {
             .write(AiCommand {
                 source: IngressSource::Local,
                 ack_token: ack.map(str::to_string),
+                origin: CommandOrigin::Wire,
                 command,
             });
         app.update();
@@ -1357,7 +1598,20 @@ mod tests {
         // no applier here; the tap captures it directly.
         send(&mut app, None, spawn(0x8000_0001));
 
-        // stop finalizes the macro with the single captured command.
+        // A rule-fired command in the same stream is reactive noise, not
+        // authored choreography: the tap must skip it (#21).
+        app.world_mut()
+            .resource_mut::<Messages<AiCommand>>()
+            .write(AiCommand {
+                source: IngressSource::Local,
+                ack_token: None,
+                origin: CommandOrigin::Rule,
+                command: spawn(0x8000_0002),
+            });
+        app.update();
+
+        // stop finalizes the macro with the single captured command — the
+        // rule-origin spawn was never captured.
         send(&mut app, Some("s"), RattyAiCommand::MacroStop);
         assert!(drain_acks(&mut app)[0].ok, "stop finalizes");
         assert_eq!(

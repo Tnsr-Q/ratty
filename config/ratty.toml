@@ -76,3 +76,24 @@ blue = "#3b8eea"
 magenta = "#d670d6"
 cyan = "#29b8db"
 white = "#ffffff"
+
+# The reactive organ (#21). Everything under [reactive] is trusted-tier:
+# no wire command can write it. The native system-sensor adapter
+# (sys.cpu / sys.memory / sys.battery) is OFF by default — enabling it is
+# a deliberate grant, and registering a rule never makes ratty inspect
+# the host. Trusted rules survive `ratty:reset` and cannot be mutated
+# from the wire; the `action` string uses the same grammar as the wire's
+# `do=` value.
+#
+# [reactive]
+# system_sensors = true
+# system_sample_secs = 2.0
+#
+# [[reactive.rules]]
+# name = "cpu-alarm"
+# sensor = "sys.cpu"
+# above = 85
+# clear = 70
+# debounce = 3.0
+# cooldown = 30.0
+# action = "flash;color=%23ff0000&duration=0.4"

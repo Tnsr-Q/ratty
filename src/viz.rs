@@ -916,6 +916,7 @@ pub fn apply_viz_commands(
         source,
         ack_token,
         command,
+        ..
     } in commands.read()
     {
         // Every rejection below both warns and lands in the caller's
@@ -1499,6 +1500,7 @@ mod tests {
             .write(AiCommand {
                 source: IngressSource::Local,
                 ack_token: Some("t".to_string()),
+                origin: crate::ai::CommandOrigin::Wire,
                 command,
             });
         app.update();
@@ -1776,6 +1778,7 @@ mod tests {
             .write(AiCommand {
                 source: IngressSource::Local,
                 ack_token: Some("reset-tok".to_string()),
+                origin: crate::ai::CommandOrigin::Wire,
                 command: RattyAiCommand::Reset,
             });
         app.update();

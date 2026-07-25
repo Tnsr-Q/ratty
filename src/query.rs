@@ -129,6 +129,10 @@ pub mod codes {
     pub const SCENE_LOCKED: &str = "scene-locked";
     /// `macro.stop` arrived with no active recording or playback to finalize.
     pub const NOTHING_ACTIVE: &str = "nothing-active";
+    /// A `sensor.publish` carried a sequence number at or below the
+    /// sensor's current one; out-of-order samples are rejected rather than
+    /// silently reordering the sensor's history (#21 sample integrity).
+    pub const STALE_SEQ: &str = "stale-seq";
 }
 
 /// Returns whether `token` is a valid correlation token: 1 to

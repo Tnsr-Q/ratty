@@ -450,20 +450,86 @@ enum Commands {
     /// Record and replay command macros.
     #[command(subcommand)]
     Macro(MacroAction),
-    /// Register a system-metric-driven effect.
-    React {
-        /// CPU% threshold.
-        #[arg(long)]
-        on_cpu_high: Option<f32>,
-        /// Memory% threshold.
-        #[arg(long)]
-        on_memory_high: Option<f32>,
-        /// Battery% threshold.
-        #[arg(long)]
-        on_battery_low: Option<f32>,
-        /// Effect name.
+    /// The reactive organ: declarative rules over sensors (#21).
+    #[command(subcommand)]
+    Rule(RuleAction),
+    /// Caller-owned wire sensors feeding reactive rules.
+    #[command(subcommand)]
+    Sensor(SensorAction),
+}
+
+#[derive(Subcommand)]
+enum RuleAction {
+    /// Register a rule: a sensor trigger plus one choreography action.
+    Set {
+        /// Rule name.
         #[arg(short, long)]
-        effect: String,
+        name: String,
+        /// Referenced sensor (`sys.*` or the caller's own `agent.<ns>.*`).
+        #[arg(short, long)]
+        sensor: String,
+        /// Activate at or above this value (exactly one of
+        /// --above/--below).
+        #[arg(long)]
+        above: Option<f32>,
+        /// Activate at or below this value.
+        #[arg(long)]
+        below: Option<f32>,
+        /// Hysteresis release threshold (defaults to the activation
+        /// threshold).
+        #[arg(long)]
+        clear: Option<f32>,
+        /// Seconds the raw condition must hold before activation.
+        #[arg(long)]
+        debounce: Option<f32>,
+        /// Minimum seconds between fires.
+        #[arg(long)]
+        cooldown: Option<f32>,
+        /// Overwrite an existing rule of the same name.
+        #[arg(long)]
+        replace: bool,
+        /// The action, in wire grammar: `<action>[;<payload>]`, e.g.
+        /// `flash;color=%23ff0000&duration=0.4` or `sound.play;kind=chime`.
+        #[arg(long = "do")]
+        action: String,
+    },
+    /// Remove a session rule.
+    Remove {
+        /// Rule name.
+        name: String,
+    },
+    /// Enable a session rule.
+    Enable {
+        /// Rule name.
+        name: String,
+    },
+    /// Disable a session rule (freezes its transition state).
+    Disable {
+        /// Rule name.
+        name: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum SensorAction {
+    /// Publish a sample (the sensor registers on first use).
+    Publish {
+        /// Sensor name suffix; the terminal prefixes `agent.<ns>.`.
+        name: String,
+        /// The sample value.
+        value: f32,
+        /// Freshness lifetime in seconds; past it, dependent rules go
+        /// dormant.
+        #[arg(long)]
+        ttl: Option<f32>,
+        /// Strictly-increasing sequence number (omit to auto-increment).
+        #[arg(long)]
+        seq: Option<u64>,
+    },
+    /// Remove a wire sensor (dependent rules fall back to unbound).
+    Remove {
+        /// Sensor name suffix.
+        name: String,
     },
 }
 
@@ -972,19 +1038,57 @@ fn command_to_osc(command: &Commands) -> (String, String) {
             ),
             MacroAction::Run { path } => ("macro.run".into(), p().field("path", path).build()),
         },
-        Commands::React {
-            on_cpu_high,
-            on_memory_high,
-            on_battery_low,
-            effect,
-        } => (
-            "react".into(),
-            p().field("effect", effect)
-                .opt("cpu_high", *on_cpu_high)
-                .opt("memory_high", *on_memory_high)
-                .opt("battery_low", *on_battery_low)
-                .build(),
-        ),
+        Commands::Rule(action) => match action {
+            RuleAction::Set {
+                name,
+                sensor,
+                above,
+                below,
+                clear,
+                debounce,
+                cooldown,
+                replace,
+                action,
+            } => {
+                let mut payload = p()
+                    .field("name", name)
+                    .field("sensor", sensor)
+                    .opt("above", *above)
+                    .opt("below", *below)
+                    .opt("clear", *clear)
+                    .opt("debounce", *debounce)
+                    .opt("cooldown", *cooldown);
+                if *replace {
+                    payload = payload.field("mode", "replace");
+                }
+                // The builder percent-encodes the whole action spec, which
+                // is exactly the nested `do=` grammar contract.
+                ("rule.set".into(), payload.field("do", action).build())
+            }
+            RuleAction::Remove { name } => ("rule.remove".into(), p().field("name", name).build()),
+            RuleAction::Enable { name } => ("rule.enable".into(), p().field("name", name).build()),
+            RuleAction::Disable { name } => {
+                ("rule.disable".into(), p().field("name", name).build())
+            }
+        },
+        Commands::Sensor(action) => match action {
+            SensorAction::Publish {
+                name,
+                value,
+                ttl,
+                seq,
+            } => (
+                "sensor.publish".into(),
+                p().field("name", name)
+                    .field("value", value)
+                    .opt("ttl", *ttl)
+                    .opt("seq", *seq)
+                    .build(),
+            ),
+            SensorAction::Remove { name } => {
+                ("sensor.remove".into(), p().field("name", name).build())
+            }
+        },
     }
 }
 
@@ -2881,6 +2985,74 @@ mod tests {
                 rate: 2.0,
                 instant: true,
                 scope: Some(osc::MacroScope::Trusted),
+            }
+        );
+    }
+
+    #[test]
+    fn rule_and_sensor_round_trips_with_a_nested_action() {
+        // The full trigger vocabulary plus a payload-carrying nested
+        // action: the CLI's percent-encoding of `do=` must survive the
+        // terminal's split-then-decode and re-parse into the exact action.
+        assert_eq!(
+            round_trip(&Commands::Rule(RuleAction::Set {
+                name: "cpu-alarm".into(),
+                sensor: "sys.cpu".into(),
+                above: Some(85.0),
+                below: None,
+                clear: Some(70.0),
+                debounce: Some(3.0),
+                cooldown: Some(30.0),
+                replace: true,
+                action: "flash;color=%23ff0000&duration=0.4".into(),
+            })),
+            RattyAiCommand::RuleSet {
+                name: "cpu-alarm".into(),
+                sensor: "sys.cpu".into(),
+                above: Some(85.0),
+                below: None,
+                clear: Some(70.0),
+                debounce: Some(3.0),
+                cooldown: Some(30.0),
+                replace: true,
+                action: Box::new(RattyAiCommand::Flash {
+                    color: "#ff0000".into(),
+                    duration: 0.4,
+                }),
+            }
+        );
+        assert_eq!(
+            round_trip(&Commands::Rule(RuleAction::Remove { name: "x".into() })),
+            RattyAiCommand::RuleRemove { name: "x".into() }
+        );
+        assert_eq!(
+            round_trip(&Commands::Rule(RuleAction::Enable { name: "x".into() })),
+            RattyAiCommand::RuleEnable { name: "x".into() }
+        );
+        assert_eq!(
+            round_trip(&Commands::Rule(RuleAction::Disable { name: "x".into() })),
+            RattyAiCommand::RuleDisable { name: "x".into() }
+        );
+        assert_eq!(
+            round_trip(&Commands::Sensor(SensorAction::Publish {
+                name: "tokens".into(),
+                value: 42.5,
+                ttl: Some(30.0),
+                seq: Some(7),
+            })),
+            RattyAiCommand::SensorPublish {
+                name: "tokens".into(),
+                value: 42.5,
+                ttl: Some(30.0),
+                seq: Some(7),
+            }
+        );
+        assert_eq!(
+            round_trip(&Commands::Sensor(SensorAction::Remove {
+                name: "tokens".into(),
+            })),
+            RattyAiCommand::SensorRemove {
+                name: "tokens".into(),
             }
         );
     }

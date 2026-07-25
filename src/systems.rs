@@ -202,6 +202,7 @@ pub fn pump_pty_output(
                     ai_commands.write(crate::ai::AiCommand {
                         source,
                         ack_token,
+                        origin: crate::ai::CommandOrigin::Wire,
                         command,
                     });
                 }

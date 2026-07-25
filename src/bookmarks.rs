@@ -23,7 +23,7 @@ use std::collections::HashMap;
 use bevy::ecs::message::{MessageReader, MessageWriter};
 use bevy::prelude::*;
 
-use crate::ai::AiCommand;
+use crate::ai::{AiCommand, CommandOrigin};
 use crate::osc::RattyAiCommand;
 use crate::query::codes;
 use crate::query_channel::{AckOutcome, AiDiagnostics, ack_commit};
@@ -151,6 +151,7 @@ pub fn apply_bookmark_commands(
         source,
         ack_token,
         command,
+        ..
     } in commands.read()
     {
         macro_rules! reject {
@@ -288,6 +289,7 @@ pub fn drain_bookmark_jumps(
         commands.write(AiCommand {
             source,
             ack_token: None,
+            origin: CommandOrigin::Bookmark,
             command,
         });
     }
@@ -322,6 +324,7 @@ mod tests {
             .write(AiCommand {
                 source: IngressSource::Local,
                 ack_token: Some("t".to_string()),
+                origin: CommandOrigin::Wire,
                 command,
             });
         app.update();
@@ -444,6 +447,7 @@ mod tests {
             .write(AiCommand {
                 source: IngressSource::Local,
                 ack_token: Some("reset-tok".to_string()),
+                origin: CommandOrigin::Wire,
                 command: RattyAiCommand::Reset,
             });
         app.update();

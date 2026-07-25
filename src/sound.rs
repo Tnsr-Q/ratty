@@ -458,6 +458,7 @@ pub fn apply_sound_commands(
         source,
         ack_token,
         command,
+        ..
     } in commands.read()
     {
         // Every rejection warns (matching the other appliers), lands in
@@ -1091,6 +1092,7 @@ mod tests {
             .write(AiCommand {
                 source: IngressSource::Local,
                 ack_token: Some(token.to_string()),
+                origin: crate::ai::CommandOrigin::Wire,
                 command,
             });
         app.update();

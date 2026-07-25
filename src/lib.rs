@@ -24,6 +24,7 @@ pub mod plugin;
 pub mod present;
 pub mod query;
 pub mod query_channel;
+pub mod reactive;
 pub mod rendering;
 pub mod rgp;
 pub mod runtime;

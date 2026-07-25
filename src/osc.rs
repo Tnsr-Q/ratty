@@ -488,17 +488,73 @@ pub enum RattyAiCommand {
         path: String,
     },
 
-    // ── Reactive ──
-    /// Register a system-metric-driven effect.
-    React {
-        /// Effect name.
-        effect: String,
-        /// CPU% threshold.
-        cpu_high: Option<f32>,
-        /// Memory% threshold.
-        memory_high: Option<f32>,
-        /// Battery% threshold.
-        battery_low: Option<f32>,
+    // ── Reactive (#21) ──
+    /// Register (or `mode=replace`) a declarative rule: a sensor-referencing
+    /// trigger plus one allowlisted choreography action (`rule.set`).
+    RuleSet {
+        /// Rule name, unique within the caller's session tier.
+        name: String,
+        /// Referenced sensor: `sys.*` or the caller's own `agent.<ns>.*`.
+        /// The sensor may not exist yet — the rule registers unbound and
+        /// binds automatically when a compatible sensor appears.
+        sensor: String,
+        /// Activation threshold: active when the sample is at or above it.
+        /// Exactly one of `above`/`below` is present (enforced at parse).
+        above: Option<f32>,
+        /// Activation threshold: active when the sample is at or below it.
+        below: Option<f32>,
+        /// Hysteresis release threshold. Defaults to the activation
+        /// threshold (no hysteresis); validated on the correct side of it.
+        clear: Option<f32>,
+        /// Seconds the raw condition must hold before the rule activates.
+        debounce: Option<f32>,
+        /// Minimum seconds between fires; a transition inside the cooldown
+        /// is latched but its fire is suppressed (and counted).
+        cooldown: Option<f32>,
+        /// Whether `mode=replace` was supplied (#16's collision rule).
+        replace: bool,
+        /// The allowlisted action fired on an inactive→active transition,
+        /// in the same `<action>[;<payload>]` grammar as the wire itself
+        /// (carried percent-encoded in `do=`). Parsed structurally here;
+        /// the allowlist is the registry's semantic check.
+        action: Box<RattyAiCommand>,
+    },
+    /// Remove one of the caller's session rules (`rule.remove`).
+    RuleRemove {
+        /// Rule name.
+        name: String,
+    },
+    /// Enable one of the caller's session rules (`rule.enable`).
+    RuleEnable {
+        /// Rule name.
+        name: String,
+    },
+    /// Disable one of the caller's session rules (`rule.disable`). The
+    /// rule's transition state freezes exactly as sensor dormancy freezes
+    /// it; the stored rule is untouched.
+    RuleDisable {
+        /// Rule name.
+        name: String,
+    },
+    /// Publish (upserting on first use) a caller-owned wire sensor sample
+    /// inside the caller's `agent.<ns>.*` namespace (`sensor.publish`).
+    SensorPublish {
+        /// Sensor name suffix; the terminal prefixes `agent.<ns>.`.
+        name: String,
+        /// The sample value (validated finite at apply).
+        value: f32,
+        /// Freshness lifetime in seconds; a sample older than its TTL makes
+        /// dependent rules dormant rather than supplying a false value.
+        ttl: Option<f32>,
+        /// Optional caller-supplied sequence number; must be strictly
+        /// increasing per sensor (stale/duplicate sequences reject).
+        seq: Option<u64>,
+    },
+    /// Remove one of the caller's wire sensors (`sensor.remove`);
+    /// dependent rules fall back to the unbound state.
+    SensorRemove {
+        /// Sensor name suffix.
+        name: String,
     },
 }
 
@@ -518,14 +574,56 @@ impl RattyAiCommand {
         )
     }
 
+    /// Whether this is a reactive-control command (`rule.*` / `sensor.*`).
+    /// Rule mutation is control, never choreography; sensor samples are
+    /// trigger *input* — recording either into a macro would let a replay
+    /// mutate rules or feed the evaluator stale telemetry, so the whole
+    /// family is control-plane (#21).
+    pub fn is_reactive_control(&self) -> bool {
+        matches!(
+            self,
+            Self::RuleSet { .. }
+                | Self::RuleRemove { .. }
+                | Self::RuleEnable { .. }
+                | Self::RuleDisable { .. }
+                | Self::SensorPublish { .. }
+                | Self::SensorRemove { .. }
+        )
+    }
+
     /// Whether this command belongs to the control-plane class excluded from
     /// macro recording (#16 plus the #21 amendment): macro-control commands
-    /// and rule/reactive registration (`react`). Query and transport
+    /// and reactive control (`rule.*` / `sensor.*`). Query and transport
     /// envelopes are OSC 778, never `RattyAiCommand`s, so they are excluded
     /// by construction, and `tok=` correlation tokens are transport metadata
     /// stripped before capture. Everything else is recordable choreography.
     pub fn is_control_plane(&self) -> bool {
-        self.is_macro_control() || matches!(self, Self::React { .. })
+        self.is_macro_control() || self.is_reactive_control()
+    }
+
+    /// Whether this command belongs to the rule-action allowlist's directly
+    /// safe class (#21): scene-choreography with no spawn/remove/re-anchor
+    /// blast radius — the effects/presence family, `sound.play`,
+    /// `viz.effect`, and live-field `object.update` (no `x`/`y`: re-anchor
+    /// is respawn-class). `macro.play` is the one indirect action and is
+    /// deliberately *not* here: a rule may fire it only when the pinned
+    /// macro is itself rule-safe (every step in this class), which is
+    /// registry state checked at `rule.set` and again at fire time. A macro
+    /// is classified **rule-safe** at finalize exactly as *privileged* is:
+    /// every captured step satisfies this predicate.
+    pub fn is_rule_safe_action(&self) -> bool {
+        match self {
+            Self::Flash { .. }
+            | Self::Pulse { .. }
+            | Self::Tint { .. }
+            | Self::Think { .. }
+            | Self::Confidence { .. }
+            | Self::Mood { .. }
+            | Self::SoundPlay { .. }
+            | Self::VizEffect { .. } => true,
+            Self::UpdateObject { x, y, .. } => x.is_none() && y.is_none(),
+            _ => false,
+        }
     }
 
     /// Whether this command mutates scene-global presentation state (mode,
@@ -836,16 +934,74 @@ fn parse_action(action: &str, p: &Payload) -> Option<RattyAiCommand> {
             path: p.string("path")?,
         },
 
-        // Reactive
-        "react" => RattyAiCommand::React {
-            effect: p.string("effect")?,
-            cpu_high: p.opt("cpu_high"),
-            memory_high: p.opt("memory_high"),
-            battery_low: p.opt("battery_low"),
+        // Reactive (#21). (The M3 `react` stub action is retired: nothing
+        // ever handled it, so its removal breaks no working caller.)
+        "rule.set" => {
+            // `mode` is the same closed vocabulary as `macro.record`.
+            let replace = match p.string("mode").as_deref() {
+                None => false,
+                Some("replace") => true,
+                Some(_) => return None,
+            };
+            // Trigger numbers parse strictly: a typo'd threshold is a bad
+            // command, never a silently-absent field (the `Payload::opt`
+            // hazard would turn `above=8O` into "no threshold").
+            let above: Option<f32> = p.opt_strict("above").ok()?;
+            let below: Option<f32> = p.opt_strict("below").ok()?;
+            // Exactly one comparison side.
+            if above.is_some() == below.is_some() {
+                return None;
+            }
+            RattyAiCommand::RuleSet {
+                name: p.string("name")?,
+                sensor: p.string("sensor")?,
+                above,
+                below,
+                clear: p.opt_strict("clear").ok()?,
+                debounce: p.opt_strict("debounce").ok()?,
+                cooldown: p.opt_strict("cooldown").ok()?,
+                replace,
+                action: Box::new(parse_rule_action(&p.string("do")?)?),
+            }
+        }
+        "rule.remove" => RattyAiCommand::RuleRemove {
+            name: p.string("name")?,
+        },
+        "rule.enable" => RattyAiCommand::RuleEnable {
+            name: p.string("name")?,
+        },
+        "rule.disable" => RattyAiCommand::RuleDisable {
+            name: p.string("name")?,
+        },
+        "sensor.publish" => RattyAiCommand::SensorPublish {
+            name: p.string("name")?,
+            value: p.parse_req("value")?,
+            ttl: p.opt_strict("ttl").ok()?,
+            seq: p.opt_strict("seq").ok()?,
+        },
+        "sensor.remove" => RattyAiCommand::SensorRemove {
+            name: p.string("name")?,
         },
 
         _ => return None,
     })
+}
+
+/// Parses a `do=` rule action: the same `<action>[;<payload>]` grammar as
+/// the wire itself (percent-encoding shields the inner `;`/`&`/`=` from the
+/// outer payload). Rejecting the `rule.*`/`sensor.*` families **by name,
+/// before the recursive parse**, both encodes "rules cannot create or
+/// modify rules" (#21) and structurally bounds `do=` nesting at one level;
+/// every other action parses here and faces the registry's allowlist.
+///
+/// Exposed so trusted config rules lower their `action` strings through the
+/// identical grammar.
+pub fn parse_rule_action(spec: &str) -> Option<RattyAiCommand> {
+    let (action, payload) = spec.split_once(';').unwrap_or((spec, ""));
+    if action.starts_with("rule.") || action.starts_with("sensor.") {
+        return None;
+    }
+    parse_action(action, &Payload::parse(payload))
 }
 
 /// Builds the full OSC 777 sequence (BEL-terminated) for an action and its
@@ -941,6 +1097,17 @@ impl Payload {
 
     fn opt<T: std::str::FromStr>(&self, key: &str) -> Option<T> {
         self.params.get(key).and_then(|s| s.parse().ok())
+    }
+
+    /// A strictly-parsed optional value: `Ok(None)` when the key is absent,
+    /// `Ok(Some(v))` when it parses, `Err(())` when present but malformed —
+    /// for fields where [`Payload::opt`]'s silent fallback would turn a
+    /// typo into a semantically different command.
+    fn opt_strict<T: std::str::FromStr>(&self, key: &str) -> Result<Option<T>, ()> {
+        match self.params.get(key) {
+            None => Ok(None),
+            Some(raw) => raw.parse().map(Some).map_err(|_| ()),
+        }
     }
 
     fn parse_req<T: std::str::FromStr>(&self, key: &str) -> Option<T> {
@@ -1322,16 +1489,25 @@ mod tests {
             "ratty:macro.play;hash=deadbeef",
             "ratty:macro.export;name=deploy&to=d.ratty",
             "ratty:macro.run;path=d.ratty",
-            "ratty:react;effect=warp-intense&cpu_high=90",
+            "ratty:rule.set;name=cpu-alarm&sensor=sys.cpu&above=85&do=flash",
+            "ratty:rule.set;name=quiet&sensor=agent.0.tokens&below=5&clear=10&debounce=2&cooldown=30&do=sound.play%3Bkind%3Dchime",
+            "ratty:rule.set;name=cpu-alarm&sensor=sys.cpu&above=85&mode=replace&do=think",
+            "ratty:rule.remove;name=cpu-alarm",
+            "ratty:rule.enable;name=cpu-alarm",
+            "ratty:rule.disable;name=cpu-alarm",
+            "ratty:sensor.publish;name=tokens&value=42.5",
+            "ratty:sensor.publish;name=tokens&value=42.5&ttl=30&seq=7",
+            "ratty:sensor.remove;name=tokens",
         ];
         for case in cases {
             assert!(parse_command(case).is_some(), "failed to parse `{case}`");
         }
     }
 
-    /// The M3.5 stub actions retired by #20 fail parse like any unknown
-    /// action (a `tok=` caller gets `bad-command`), and the bookmark
-    /// `mode=` qualifier is a closed vocabulary.
+    /// The M3.5 stub actions retired by #20 and the `react` stub retired by
+    /// #21 fail parse like any unknown action (a `tok=` caller gets
+    /// `bad-command`), and the bookmark `mode=` qualifier is a closed
+    /// vocabulary.
     #[test]
     fn retired_actions_and_bad_bookmark_modes_fail_parse() {
         for case in [
@@ -1340,6 +1516,7 @@ mod tests {
             "ratty:screenshot;path=s.png",
             "ratty:history;last=50",
             "ratty:jump;name=x",
+            "ratty:react;effect=warp-intense&cpu_high=90",
             "ratty:bookmark;name=x&mode=append",
             // macro.play `mode`/`scope` are closed vocabularies, and one of
             // name= or hash= is required.
@@ -1411,15 +1588,21 @@ mod tests {
 
     #[test]
     fn command_classes_gate_recording_and_privilege() {
-        // Macro-control and reactive registration are control-plane: never
-        // captured into a recording.
+        // Macro-control and reactive control (rule.*/sensor.*) are
+        // control-plane: never captured into a recording (#16, #21).
         for control in [
             parse_command("ratty:macro.record;name=x").expect("parses"),
             parse_command("ratty:macro.stop").expect("parses"),
             parse_command("ratty:macro.play;name=x").expect("parses"),
             parse_command("ratty:macro.export;name=x&to=x").expect("parses"),
             parse_command("ratty:macro.run;path=x").expect("parses"),
-            parse_command("ratty:react;effect=warp&cpu_high=90").expect("parses"),
+            parse_command("ratty:rule.set;name=x&sensor=sys.cpu&above=85&do=flash")
+                .expect("parses"),
+            parse_command("ratty:rule.remove;name=x").expect("parses"),
+            parse_command("ratty:rule.enable;name=x").expect("parses"),
+            parse_command("ratty:rule.disable;name=x").expect("parses"),
+            parse_command("ratty:sensor.publish;name=x&value=1").expect("parses"),
+            parse_command("ratty:sensor.remove;name=x").expect("parses"),
         ] {
             assert!(control.is_control_plane(), "{control:?} is control-plane");
         }
@@ -1434,6 +1617,106 @@ mod tests {
             parse_command("ratty:reset").expect("parses"),
         ] {
             assert!(global.is_scene_global(), "{global:?} is scene-global");
+        }
+    }
+
+    #[test]
+    fn rule_set_parses_trigger_action_and_closed_vocabularies() {
+        // The nested `do=` action rides percent-encoded and re-parses under
+        // the ordinary wire grammar.
+        let rule = parse_command(
+            "ratty:rule.set;name=cpu-alarm&sensor=sys.cpu&above=85&clear=70&debounce=3&cooldown=30&do=flash%3Bcolor%3D%2523ff0000%26duration%3D0.4",
+        )
+        .expect("parses");
+        assert_eq!(
+            rule,
+            RattyAiCommand::RuleSet {
+                name: "cpu-alarm".to_string(),
+                sensor: "sys.cpu".to_string(),
+                above: Some(85.0),
+                below: None,
+                clear: Some(70.0),
+                debounce: Some(3.0),
+                cooldown: Some(30.0),
+                replace: false,
+                action: Box::new(RattyAiCommand::Flash {
+                    color: "#ff0000".to_string(),
+                    duration: 0.4,
+                }),
+            }
+        );
+        for bad in [
+            // The trigger requires exactly one comparison side.
+            "ratty:rule.set;name=x&sensor=sys.cpu&do=flash",
+            "ratty:rule.set;name=x&sensor=sys.cpu&above=85&below=5&do=flash",
+            // Trigger numbers parse strictly — a typo is a bad command.
+            "ratty:rule.set;name=x&sensor=sys.cpu&above=8O&do=flash",
+            "ratty:rule.set;name=x&sensor=sys.cpu&above=85&debounce=fast&do=flash",
+            "ratty:rule.set;name=x&sensor=sys.cpu&above=85&mode=append&do=flash",
+            // The action is required and must itself parse.
+            "ratty:rule.set;name=x&sensor=sys.cpu&above=85",
+            "ratty:rule.set;name=x&sensor=sys.cpu&above=85&do=warpspeed",
+            // Rules cannot create or modify rules, or feed sensors — the
+            // rule.*/sensor.* families are rejected by name before the
+            // recursive parse (this also bounds `do=` nesting at one).
+            "ratty:rule.set;name=x&sensor=sys.cpu&above=85&do=rule.remove%3Bname%3Dx",
+            "ratty:rule.set;name=x&sensor=sys.cpu&above=85&do=sensor.publish%3Bname%3Dx%26value%3D1",
+            // Strict sequence numbers on sensor.publish.
+            "ratty:sensor.publish;name=x&value=1&seq=abc",
+            "ratty:sensor.publish;name=x&value=hot",
+            "ratty:sensor.publish;name=x",
+        ] {
+            assert!(parse_command(bad).is_none(), "`{bad}` must not parse");
+        }
+        // `macro.play` parses as a rule action (its rule-safety is registry
+        // state validated at rule.set and fire time, not parse state).
+        let indirect = parse_command(
+            "ratty:rule.set;name=x&sensor=sys.cpu&above=85&do=macro.play%3Bname%3Dcelebrate",
+        )
+        .expect("parses");
+        let RattyAiCommand::RuleSet { action, .. } = indirect else {
+            panic!("rule.set parses");
+        };
+        assert!(matches!(*action, RattyAiCommand::MacroPlay { .. }));
+    }
+
+    #[test]
+    fn rule_safe_action_class_is_pinned() {
+        for safe in [
+            "ratty:flash;color=%23ff0000",
+            "ratty:pulse;intensity=0.5",
+            "ratty:tint;color=%230000ff",
+            "ratty:think;state=start",
+            "ratty:confidence;level=0.9",
+            "ratty:mood;mood=excited",
+            "ratty:sound.play;kind=chime",
+            "ratty:viz.effect;id=2147483648&key=k&effect=highlight",
+            "ratty:object.update;id=2147483648&spin=2&scale=1.5&brightness=0.8",
+        ] {
+            let command = parse_command(safe).expect("parses");
+            assert!(command.is_rule_safe_action(), "{command:?} is rule-safe");
+        }
+        for unsafe_ in [
+            // Re-anchor is respawn-class: x/y disqualify object.update.
+            "ratty:object.update;id=2147483648&x=10",
+            "ratty:object.add;id=2147483648&path=rat.obj",
+            "ratty:object.remove;id=2147483648",
+            "ratty:object.clear",
+            "ratty:viz.set;id=2147483648&kind=ps.v1&data=e30",
+            "ratty:viz.remove;id=2147483648",
+            "ratty:sound.ambient.set;kind=ambient.hum",
+            "ratty:mode;3d",
+            "ratty:warp;intensity=0.5",
+            "ratty:reset",
+            "ratty:bookmark.jump;name=x",
+            // macro.play is the indirect action: not in the direct class.
+            "ratty:macro.play;name=x",
+        ] {
+            let command = parse_command(unsafe_).expect("parses");
+            assert!(
+                !command.is_rule_safe_action(),
+                "{command:?} is not directly rule-safe"
+            );
         }
     }
 }

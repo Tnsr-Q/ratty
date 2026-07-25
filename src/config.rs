@@ -49,6 +49,8 @@ pub struct AppConfig {
     pub cursor: CursorConfig,
     /// Audio settings.
     pub audio: AudioConfig,
+    /// Reactive organ settings.
+    pub reactive: ReactiveConfig,
 }
 
 impl AppConfig {
@@ -455,6 +457,64 @@ impl Default for AudioConfig {
             allow_scene_ambient: true,
         }
     }
+}
+
+/// Reactive organ configuration: the trusted tier of #21.
+///
+/// Everything here is config-only — no wire command can write it. The
+/// native system-sensor adapter is a capability *grant*: enabling it is a
+/// trusted-config act, and registering a rule never makes ratty inspect
+/// the host. Trusted rules are persistent (they survive `reset`), cannot
+/// be mutated from the wire, and are fixed for the process lifetime
+/// (config has no hot-reload).
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct ReactiveConfig {
+    /// Grants the native system-sensor adapter (`sys.cpu`, `sys.memory`,
+    /// `sys.battery`). Off by default — the locked #21 posture — and
+    /// meaningless on wasm, where the adapter does not exist and the caps
+    /// listing reports its absence honestly.
+    pub system_sensors: bool,
+    /// System sensor sampling cadence in seconds; clamped at read time to
+    /// the bounds advertised by the reactive organ. `None` uses the
+    /// default (~2s).
+    pub system_sample_secs: Option<f32>,
+    /// Persistent trusted rules, seeded into the rule registry at startup.
+    pub rules: Vec<TrustedRuleConfig>,
+}
+
+/// One persistent trusted rule (`[[reactive.rules]]`).
+///
+/// Field semantics mirror the wire `rule.set` exactly; the `action` string
+/// uses the same `<action>[;<payload>]` grammar as the wire's `do=` value
+/// and faces the same allowlist. A rule that fails semantic validation is
+/// seeded disabled and marked invalid (queryable via `state.rules`) rather
+/// than aborting startup or vanishing silently.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TrustedRuleConfig {
+    /// Rule name, unique within the trusted tier.
+    pub name: String,
+    /// Referenced sensor (`sys.*` or any `agent.<ns>.*`).
+    pub sensor: String,
+    /// Activation threshold: active at or above. Exactly one of
+    /// `above`/`below` must be set.
+    #[serde(default)]
+    pub above: Option<f32>,
+    /// Activation threshold: active at or below.
+    #[serde(default)]
+    pub below: Option<f32>,
+    /// Hysteresis release threshold (defaults to the activation threshold).
+    #[serde(default)]
+    pub clear: Option<f32>,
+    /// Seconds the raw condition must hold before activation.
+    #[serde(default)]
+    pub debounce: Option<f32>,
+    /// Minimum seconds between fires.
+    #[serde(default)]
+    pub cooldown: Option<f32>,
+    /// The allowlisted action, in wire grammar (e.g.
+    /// `flash;color=%23ff0000&duration=0.4`).
+    pub action: String,
 }
 
 /// Cursor configuration.
