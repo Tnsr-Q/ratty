@@ -164,14 +164,34 @@ estimate). Embedded glTF loads through the in-memory `embedded://` asset
 source on **both** targets — the avatar never answers `unsupported` on
 the web.
 
-## Presentation status
+## Presentation
 
-This document covers the organ's wire contract, queue, and trust
-surface. The presentation layer — the screen-fixed mascot at the nine
-HUD anchors, the real-text bubble/typewriter overlay, and the
-speaking-duration glow — is specified in
-[docs/design/m3.10-avatar.md](../docs/design/m3.10-avatar.md) §1 and
-lands with the rendering substrate.
+The avatar is **presence furniture, fixed through terminal scrolling and
+camera movement, in every mode** — structurally: the mascot renders
+through its own fixed-pose orthographic camera on an isolated render
+layer, and the bubble draws through its own vello scene → texture →
+screen-space overlay quad; the RGP `c`-verb machinery only ever writes
+the terminal plane camera, so neither can warp, yaw, zoom, or
+Möbius-twist. The camera stack is 0 flat-2D → 1 terminal-3D → 5 bubble →
+6 mascot → 10 effects wash (the mood wash still tints the avatar like
+everything else).
+
+- **Bubble**: real shaped prose (parley + the embedded DejaVu faces,
+  identical on native and wasm — mixed case, full Unicode, wrapped),
+  with an accent-bordered scrim, a tail toward the mascot, and a bold
+  **attribution chip visible from frame one**. The typewriter reveal is
+  cluster-bounded: ligatures never half-draw, RTL reveals in reading
+  order, combining marks appear atomically, and progress (a byte offset)
+  survives a mid-utterance resize or DPI change. Over-tall text clips
+  behind a visible marker; the full text stays queryable.
+- **Gestures** (`bob`, `tilt`, `lean`, `nod`, `spin`): named
+  root-transform choreographies plus a persistent subtle idle bob — no
+  skinning, no animation graph in M3, so a later skinned milestone
+  replaces the mascot behind the same verbs.
+- **Speaking glow**: a radial disc behind the mascot, driven by exactly
+  the utterance envelope (250 ms ramp, gentle pulse, 400 ms fade).
+- Idle cost is zero: the overlay texture pair shrinks to 1×1 and the
+  quad hides when nothing is speaking.
 
 ## CLI
 

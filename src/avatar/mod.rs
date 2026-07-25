@@ -53,6 +53,15 @@ use crate::capability::SceneCapability;
 use crate::config::AppConfig;
 use crate::osc::{RattyAiCommand, SpeechClearScope};
 use crate::query::codes;
+mod present;
+mod text;
+
+pub use present::{
+    AVATAR_BASE_SIZE_PX, AVATAR_BUBBLE_LAYER, AVATAR_FONT_LOGICAL_PX, AVATAR_MARGIN_PX,
+    AVATAR_MASCOT_LAYER, AvatarBubbleCamera, AvatarMascotCamera, AvatarMascotRoot,
+    AvatarOverlayImages, AvatarOverlayQuad,
+};
+
 use crate::query_channel::{
     AckOutcome, AiDiagnostics, QuerySession, ack_commit, ack_commit_long_running, reject,
 };
@@ -976,6 +985,7 @@ pub struct AvatarPlugin;
 impl Plugin for AvatarPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<AvatarState>()
+            .add_systems(Startup, present::setup_avatar)
             .add_systems(
                 Update,
                 drive_avatar_speech
@@ -985,6 +995,18 @@ impl Plugin for AvatarPlugin {
             .add_systems(
                 Update,
                 apply_avatar_commands.after(crate::systems::pump_pty_output),
+            )
+            .add_systems(
+                Update,
+                (
+                    present::sync_avatar_mascot,
+                    present::propagate_avatar_layer,
+                    present::animate_avatar_mascot,
+                    present::sync_avatar_overlay,
+                )
+                    .chain()
+                    .after(apply_avatar_commands)
+                    .after(crate::systems::handle_window_resize),
             );
     }
 }

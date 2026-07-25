@@ -257,6 +257,7 @@ pub(crate) struct PresentationParams<'w, 's> {
             With<Camera2d>,
             Without<TerminalPlaneCamera>,
             Without<crate::effects::AiEffectCamera>,
+            Without<crate::avatar::AvatarBubbleCamera>,
         ),
     >,
     camera_3d: Query<'w, 's, &'static mut Camera, (With<TerminalPlaneCamera>, Without<Camera2d>)>,

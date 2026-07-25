@@ -14,6 +14,7 @@ pub mod cli;
 pub mod config;
 mod direct_render;
 pub mod effects;
+mod fonts;
 pub mod inline;
 pub mod keyboard;
 pub mod kitty;

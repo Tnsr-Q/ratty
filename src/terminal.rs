@@ -362,14 +362,10 @@ pub fn texture_logical_size(texture_size: UVec2, render_scale: f32) -> Vec2 {
     Vec2::new(width, height)
 }
 
-/// Embedded default monospace fonts for targets without a system font
-/// source (the web build). DejaVu Sans Mono is also the native default
-/// family, so web rendering matches native defaults. License:
-/// `assets/fonts/LICENSE-DejaVu.txt`.
+// The embedded fallback fonts live in `crate::fonts`, shared with the
+// avatar bubble substrate so the blob exists once per face.
 #[cfg(target_arch = "wasm32")]
-const EMBEDDED_MONO_REGULAR: &[u8] = include_bytes!("../assets/fonts/DejaVuSansMono.ttf");
-#[cfg(target_arch = "wasm32")]
-const EMBEDDED_MONO_BOLD: &[u8] = include_bytes!("../assets/fonts/DejaVuSansMono-Bold.ttf");
+use crate::fonts::{EMBEDDED_MONO_BOLD, EMBEDDED_MONO_REGULAR};
 
 fn build_terminal_renderer(
     font: &FontConfig,
