@@ -48,6 +48,32 @@ pub const MAX_AI_OBJECTS_PER_NAMESPACE: usize = 64;
 /// on fresh ids would grow the ledger without bound.
 pub const MAX_AI_OBJECT_IDS_PER_SESSION: usize = 4096;
 
+/// Why a command entered the stream — its *causal* origin, orthogonal to
+/// the authority-bearing [`IngressSource`] (a rule-fired command still runs
+/// under its owner's namespace and authority). Injectors stamp their own
+/// variant; two consumers read it:
+///
+/// - the macro recorder tap skips [`CommandOrigin::Rule`] commands, so an
+///   active recording never absorbs reactive fire noise as authored
+///   choreography, and
+/// - the reactive organ refuses rule-consumable input (sensor publishes,
+///   rule mutations) that did not arrive as [`CommandOrigin::Wire`] — the
+///   #21 chain-depth-one guard, belt-and-suspenders beside the structural
+///   closure (sensor/rule commands are control-plane, so neither macros
+///   nor rule actions can ever carry them).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandOrigin {
+    /// Parsed at live ingress (the PTY or the wasm virtual channel).
+    Wire,
+    /// Re-injected by a caller-started macro playback.
+    Macro,
+    /// Relowered by a bookmark jump.
+    Bookmark,
+    /// Fired by a reactive rule — directly, or replayed by a rule-started
+    /// macro playback (the causal execution context is inherited, #21).
+    Rule,
+}
+
 /// A `ratty-ai` control command delivered to the Bevy world.
 ///
 /// Wraps [`RattyAiCommand`] (which stays dependency-free so the `ratty-ai`
@@ -61,8 +87,11 @@ pub struct AiCommand {
     /// one handler system owns each command's ack (see the per-variant
     /// comments in the handlers); commands without a token stay
     /// fire-and-forget. Correlation tokens are transport metadata — the
-    /// future macro recorder must never capture them.
+    /// macro recorder never captures them, and injected commands are
+    /// always token-less.
     pub ack_token: Option<String>,
+    /// The causal origin of the command (see [`CommandOrigin`]).
+    pub origin: CommandOrigin,
     /// The parsed command.
     pub command: RattyAiCommand,
 }
@@ -131,7 +160,9 @@ impl Plugin for RattyAiPlugin {
                     .after(crate::viz::apply_viz_commands)
                     .after(crate::sound::apply_sound_commands)
                     .after(crate::bookmarks::apply_bookmark_commands)
-                    .after(crate::macros::apply_macro_commands),
+                    .after(crate::macros::apply_macro_commands)
+                    .after(crate::reactive::apply_reactive_commands)
+                    .after(crate::reactive::evaluate_rules),
             );
     }
 }
@@ -160,6 +191,7 @@ pub fn apply_ai_commands(
         source,
         ack_token,
         command,
+        ..
     } in commands.read()
     {
         match command {
@@ -245,6 +277,15 @@ pub fn apply_ai_commands(
             | RattyAiCommand::MacroPlay { .. }
             | RattyAiCommand::MacroExport { .. }
             | RattyAiCommand::MacroRun { .. } => {}
+            // The reactive organ (crate::reactive::apply_reactive_commands)
+            // reads the same AiCommand messages independently and owns the
+            // rule.*/sensor.* acks.
+            RattyAiCommand::RuleSet { .. }
+            | RattyAiCommand::RuleRemove { .. }
+            | RattyAiCommand::RuleEnable { .. }
+            | RattyAiCommand::RuleDisable { .. }
+            | RattyAiCommand::SensorPublish { .. }
+            | RattyAiCommand::SensorRemove { .. } => {}
             other => {
                 debug!("ratty-ai: command received, handler not yet built: {other:?}");
                 reject(
@@ -285,6 +326,7 @@ pub fn apply_ai_object_commands(
         source,
         ack_token,
         command,
+        ..
     } in commands.read()
     {
         // Every rejection below both warns (unchanged behavior) and lands
@@ -640,6 +682,7 @@ mod tests {
             .write(AiCommand {
                 source: IngressSource::Local,
                 ack_token: None,
+                origin: CommandOrigin::Wire,
                 command,
             });
         app.update();

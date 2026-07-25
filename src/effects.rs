@@ -381,6 +381,7 @@ pub(crate) fn apply_ai_effect_commands(
         source,
         ack_token,
         command,
+        ..
     } in commands.read()
     {
         match command {

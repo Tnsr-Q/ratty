@@ -27,9 +27,11 @@ else.
   never silently forced through.
 - **Capture the channel, not the transport.** Terminal text, raw OSC bytes,
   and PTY input are never captured. Neither is the control-plane class —
-  `macro.*` itself, reactive/`rule.*` registration, and query/transport
-  envelopes (which are OSC 778 and never reach this channel). Ack `tok=`
-  correlation tokens are transport metadata and are dropped before capture.
+  `macro.*` itself, the reactive `rule.*`/`sensor.*` families (#21), and
+  query/transport envelopes (which are OSC 778 and never reach this
+  channel) — nor rule-*fired* commands (rule-origin provenance; reactive
+  noise is not authored choreography). Ack `tok=` correlation tokens are
+  transport metadata and are dropped before capture.
 - **The wire never touches the filesystem.** `macro.export;to=` and
   `macro.run;path=` are rejected `wire-filesystem-access`. The terminal byte
   stream is untrusted (see [#12](graphics.md)); promotion to durable storage
@@ -70,9 +72,17 @@ Every parsed control command falls into exactly one recording class:
 
 | Class | Members | Recorded? | Privilege |
 | --- | --- | --- | --- |
-| **Control-plane** | `macro.*`, reactive/`rule.*` registration | never | — |
+| **Control-plane** | `macro.*`, the reactive `rule.*`/`sensor.*` families | never | — |
 | **Scene-global** | `mode`, `warp`, `reset` | yes | marks the macro **privileged** |
 | **Choreography** | everything else (objects, cursor, viz, sound, effects, bookmarks, presence…) | yes | stays inside the caller's namespace |
+
+A second classification, **rule-safe** (#21, computed at finalize beside
+*privileged*), marks a macro whose every step is in the reactive organ's
+direct action allowlist — the [Ratty Reactive Protocol](reactive.md) allows
+`macro.play` as a rule action only for rule-safe macros, pinned by content
+hash at `rule.set` and re-checked at fire time. A rule-safe macro is never
+privileged. A rule-started playback replays its steps under the rule's
+causal origin, so they are likewise never captured into a recording.
 
 A macro that captured **any** scene-global command is classified
 *privileged* at record time. A privileged macro must acquire the terminal's
@@ -129,7 +139,8 @@ read scope:
 
 - **`state.macros`** — the caller's session macros plus the trusted macros,
   each tagged `scope` (`session`/`trusted`), with `name`, `v`, `commands`
-  (captured count), `privileged`, and `hash` (the immutable id). Paginated.
+  (captured count), `privileged`, `rule_safe`, and `hash` (the immutable
+  id). Paginated.
 - **`state.executions`** — the caller's *own* active recording or playback
   (executions are private per-agent, never projected to other callers):
   `kind` (`recording`/`playback`), `commands`, `privileged`,

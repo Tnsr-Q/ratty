@@ -25,6 +25,7 @@
 use std::collections::{HashMap, VecDeque};
 
 use bevy::ecs::message::{Message, MessageReader, MessageWriter};
+use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 use serde_json::{Value, json};
 
@@ -50,9 +51,7 @@ const REPLY_PAYLOAD_BUDGET: usize = 2700;
 
 /// The v1 query ops this build answers, advertised by `caps`.
 ///
-/// `state.macros` and `state.executions` are answered honestly empty until
-/// the macro subsystem (M3.7) lands; new ops are added here additively and
-/// never grow new CLI subcommands.
+/// New ops are added here additively and never grow new CLI subcommands.
 pub const SUPPORTED_OPS: &[&str] = &[
     "caps",
     "state.scene",
@@ -65,6 +64,8 @@ pub const SUPPORTED_OPS: &[&str] = &[
     "state.errors",
     "state.viz",
     "state.bookmarks",
+    "state.rules",
+    "state.sensors",
 ];
 
 /// One OSC 778 item drained from the parser, delivered to the Bevy world.
@@ -248,6 +249,19 @@ pub(crate) fn reject(
     }
 }
 
+/// The per-organ registries a query projection may read, bundled into one
+/// [`SystemParam`] so [`answer_queries`] stays under the system-parameter
+/// arity limit as organs accumulate.
+#[derive(SystemParam)]
+pub struct OrganRegistries<'w> {
+    viz: Res<'w, crate::viz::VizRegistry>,
+    sound: Res<'w, SoundState>,
+    bookmarks: Res<'w, crate::bookmarks::BookmarkRegistry>,
+    macros: Res<'w, crate::macros::MacroRegistry>,
+    reactive: Res<'w, crate::reactive::ReactiveRegistry>,
+    time: Res<'w, Time>,
+}
+
 /// Answers queued OSC 778 queries and flushes command acks.
 ///
 /// Ordered after `pump_pty_output` and every command-applying system so a
@@ -269,10 +283,7 @@ pub fn answer_queries(
     stage_tween: Res<StageTween>,
     cursor: Res<CursorSettings>,
     effects: Res<AiEffects>,
-    viz: Res<crate::viz::VizRegistry>,
-    sound: Res<SoundState>,
-    bookmarks: Res<crate::bookmarks::BookmarkRegistry>,
-    macros: Res<crate::macros::MacroRegistry>,
+    organs: OrganRegistries,
 ) {
     // Acks first: a same-chunk "command with tok= then query" reads its
     // ack before the query reply, in mutation order.
@@ -310,10 +321,12 @@ pub fn answer_queries(
                     stage_tween: &stage_tween,
                     cursor: &cursor,
                     effects: &effects,
-                    viz: &viz,
-                    sound: &sound,
-                    bookmarks: &bookmarks,
-                    macros: &macros,
+                    viz: &organs.viz,
+                    sound: &organs.sound,
+                    bookmarks: &organs.bookmarks,
+                    macros: &organs.macros,
+                    reactive: &organs.reactive,
+                    now: organs.time.elapsed(),
                     grid: runtime.parser.screen().size(),
                 };
                 match answer(envelope, *source, &ctx) {
@@ -399,6 +412,9 @@ struct QueryCtx<'a> {
     sound: &'a SoundState,
     bookmarks: &'a crate::bookmarks::BookmarkRegistry,
     macros: &'a crate::macros::MacroRegistry,
+    reactive: &'a crate::reactive::ReactiveRegistry,
+    /// `Time::elapsed` at answer time, for sensor freshness projections.
+    now: std::time::Duration,
     /// Live grid size as `(rows, cols)`, from the parser screen.
     grid: (u16, u16),
 }
@@ -436,6 +452,18 @@ fn answer(
         "state.errors" => errors(ctx, source, &data),
         "state.viz" => viz_state(ctx, source, &data),
         "state.bookmarks" => Ok(bookmarks_state(ctx, source)),
+        // The caller's wire rules plus the trusted rules, and the system
+        // sensors plus the caller's own wire sensors (both paginated).
+        "state.rules" => paginate(
+            ctx,
+            crate::reactive::rules_state_items(ctx.reactive, source.namespace(), ctx.now),
+            &data,
+        ),
+        "state.sensors" => paginate(
+            ctx,
+            crate::reactive::sensors_state_items(ctx.reactive, source.namespace(), ctx.now),
+            &data,
+        ),
         _ => Err(codes::UNSUPPORTED_OP),
     }
 }
@@ -470,8 +498,22 @@ fn caps(ctx: &QueryCtx<'_>) -> Value {
             "commands_per_macro": crate::macros::MAX_COMMANDS_PER_MACRO,
             "macro_recording_secs": crate::macros::MAX_RECORDING_SECS,
             "macro_playback_per_frame": crate::macros::MAX_PLAYBACK_COMMANDS_PER_FRAME,
+            "rules_per_namespace": crate::reactive::MAX_RULES_PER_NAMESPACE,
+            "rule_name_bytes": crate::reactive::MAX_RULE_NAME_BYTES,
+            "rule_fires_per_frame": crate::reactive::MAX_RULE_FIRES_PER_FRAME,
+            "sensors_per_namespace": crate::reactive::MAX_SENSORS_PER_NAMESPACE,
+            "sensor_name_bytes": crate::reactive::MAX_SENSOR_SUFFIX_BYTES,
+            "sensor_publishes_per_sec": crate::reactive::SENSOR_PUBLISHES_PER_SEC,
+            "sensor_default_ttl_secs": crate::reactive::DEFAULT_SENSOR_TTL_SECS,
         },
         "viz_kinds": crate::viz::REGISTERED_VIZ_KINDS,
+        // #18 honesty: whether the config-gated native sensor adapter is
+        // active in this process (always false on wasm), and the sensors
+        // it is currently supplying. Both are live truth, never a promise.
+        "sensors": {
+            "system_adapter": ctx.reactive.system_sensors_enabled(),
+            "system": ctx.reactive.live_system_sensors(),
+        },
     })
 }
 
@@ -968,15 +1010,19 @@ mod tests {
         app.add_message::<QueryRequest>();
         app.add_message::<AckOutcome>();
         app.init_resource::<crate::bookmarks::PendingBookmarkJumps>();
+        app.init_resource::<crate::reactive::ReactiveRegistry>();
         app.add_systems(
             Update,
             (
                 pump_pty_output,
                 crate::macros::apply_macro_commands,
                 crate::macros::drive_macro_playback,
+                crate::reactive::apply_reactive_commands,
+                crate::reactive::evaluate_rules,
                 apply_ai_object_commands,
                 crate::viz::apply_viz_commands,
                 apply_sound_commands,
+                crate::effects::apply_ai_effect_commands,
                 crate::bookmarks::apply_bookmark_commands,
                 crate::bookmarks::drain_bookmark_jumps,
                 answer_queries,
@@ -1125,6 +1171,26 @@ mod tests {
             caps["limits"]["viz_items"],
             json!(crate::viz::MAX_VIZ_ITEMS_PER_SNAPSHOT)
         );
+        assert_eq!(
+            caps["limits"]["rules_per_namespace"],
+            json!(crate::reactive::MAX_RULES_PER_NAMESPACE)
+        );
+        assert_eq!(
+            caps["limits"]["sensors_per_namespace"],
+            json!(crate::reactive::MAX_SENSORS_PER_NAMESPACE)
+        );
+        assert_eq!(
+            caps["limits"]["rule_fires_per_frame"],
+            json!(crate::reactive::MAX_RULE_FIRES_PER_FRAME)
+        );
+        assert_eq!(
+            caps["limits"]["sensor_publishes_per_sec"],
+            json!(crate::reactive::SENSOR_PUBLISHES_PER_SEC)
+        );
+        // #18 honesty: no config grant in the default test app, so the
+        // native adapter reports absent and supplies nothing.
+        assert_eq!(caps["sensors"]["system_adapter"], json!(false));
+        assert_eq!(caps["sensors"]["system"], json!([]));
     }
 
     #[test]
@@ -1418,6 +1484,93 @@ mod tests {
             json!(true),
             "a captured scene-global command marks the macro privileged"
         );
+    }
+
+    #[test]
+    fn rules_and_sensors_start_empty() {
+        let (mut app, host) = test_app();
+        for (token, op) in [("q1", "state.rules"), ("q2", "state.sensors")] {
+            let reply = run_query(&mut app, &host, token, op, None);
+            assert!(reply.ok);
+            assert_eq!(payload(&reply)["items"], json!([]));
+        }
+    }
+
+    /// The M3.8 closed loop: register a rule and publish its sensor over
+    /// OSC 777 in one chunk, watch the fire lower the same frame, and read
+    /// the rule/sensor state back over OSC 778.
+    #[test]
+    fn closed_loop_rule_set_sensor_publish_fire_over_777_and_778() {
+        let (mut app, host) = test_app();
+        let chunk = "\x1b]777;ratty:rule.set;name=hot&sensor=agent.0.load&above=80&do=think&tok=r1\x07\
+             \x1b]777;ratty:sensor.publish;name=load&value=95&tok=p1\x07";
+        host.feed_tx
+            .send(chunk.as_bytes().to_vec())
+            .expect("virtual feed accepts bytes");
+        app.update();
+        let replies = drain_replies(&host);
+        assert_eq!(replies.len(), 2, "one ack per tok= command");
+        assert!(replies[0].ok && replies[0].ack, "rule.set commits");
+        assert!(replies[1].ok && replies[1].ack, "sensor.publish commits");
+        // The transition fired `think` and the effects applier lowered it
+        // in the same frame.
+        assert!(
+            app.world().resource::<AiEffects>().public_state().thinking,
+            "the fired action lowered the same frame"
+        );
+
+        let reply = run_query(&mut app, &host, "q1", "state.rules", None);
+        assert!(reply.ok);
+        let page = payload(&reply);
+        let items = page["items"].as_array().expect("items array");
+        assert_eq!(items.len(), 1);
+        let rule = &items[0];
+        assert_eq!(rule["name"], json!("hot"));
+        assert_eq!(rule["scope"], json!("session"));
+        assert_eq!(rule["sensor"], json!("agent.0.load"));
+        assert_eq!(rule["action"], json!("think"));
+        assert_eq!(rule["bound"], json!(true));
+        assert_eq!(rule["dormant"], json!(false));
+        assert_eq!(rule["active"], json!(true));
+        assert_eq!(rule["fires"], json!(1));
+
+        let reply = run_query(&mut app, &host, "q2", "state.sensors", None);
+        assert!(reply.ok);
+        let page = payload(&reply);
+        let items = page["items"].as_array().expect("items array");
+        assert_eq!(items.len(), 1);
+        let sensor = &items[0];
+        assert_eq!(sensor["name"], json!("agent.0.load"));
+        assert_eq!(sensor["value"], json!(95.0));
+        assert_eq!(sensor["seq"], json!(1));
+        assert_eq!(sensor["fresh"], json!(true));
+        assert_eq!(sensor["source"], json!("wire"));
+        assert_eq!(sensor["rules"], json!(1));
+    }
+
+    /// A denied rule action rejects with its code over the ack path and
+    /// lands in the caller's error ring — the wire contract for the #21
+    /// allowlist.
+    #[test]
+    fn rule_set_with_a_denied_action_acks_not_permitted() {
+        let (mut app, host) = test_app();
+        let chunk =
+            "\x1b]777;ratty:rule.set;name=bad&sensor=sys.cpu&above=85&do=object.clear&tok=t1\x07";
+        host.feed_tx
+            .send(chunk.as_bytes().to_vec())
+            .expect("virtual feed accepts bytes");
+        app.update();
+        let replies = drain_replies(&host);
+        assert_eq!(replies.len(), 1);
+        assert!(!replies[0].ok);
+        assert_eq!(replies[0].code.as_deref(), Some(codes::NOT_PERMITTED));
+
+        let reply = run_query(&mut app, &host, "q1", "state.errors", None);
+        let page = payload(&reply);
+        let items = page["items"].as_array().expect("items array");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["action"], json!("rule.set"));
+        assert_eq!(items[0]["code"], json!(codes::NOT_PERMITTED));
     }
 
     /// A synthetic `ps.v1` snapshot as its wire `data=` value.
