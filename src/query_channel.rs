@@ -101,6 +101,10 @@ pub struct AckOutcome {
     /// success qualifier (e.g. `deferred` for a pre-unlock ambient set)
     /// when `ok` is true. The wire carries `code=` independently of `ok=`.
     pub code: Option<&'static str>,
+    /// Structured ack payload (the reply's `data=`), used by long-running
+    /// operations to carry the execution handle, queue position, and
+    /// estimated wait (#18). `None` for every immediate-mutation ack.
+    pub payload: Option<serde_json::Value>,
 }
 
 /// Session identity for the query channel.
@@ -113,12 +117,15 @@ pub struct AckOutcome {
 #[derive(Resource)]
 pub struct QuerySession {
     nonce: u64,
+    /// Monotone counter for execution handles minted this session (#18).
+    next_execution: u64,
 }
 
 impl Default for QuerySession {
     fn default() -> Self {
         Self {
             nonce: random_u64(),
+            next_execution: 0,
         }
     }
 }
@@ -127,6 +134,25 @@ impl QuerySession {
     /// The session nonce as fixed-width hex (the `caps` `session` field).
     pub fn nonce_hex(&self) -> String {
         format!("{:016x}", self.nonce)
+    }
+
+    /// Mints a session-unique execution handle: `<nonce-hex>-<seq>` (#18).
+    /// Handles use the base64url alphabet (hex, `-`, digits) so they ride
+    /// wire payload values and JSON unescaped. The random nonce prefix
+    /// makes cross-restart collisions negligible; within a session the
+    /// counter is monotone and handles are never reused.
+    pub fn mint_execution_id(&mut self) -> String {
+        self.next_execution += 1;
+        format!("{:016x}-{}", self.nonce, self.next_execution)
+    }
+
+    /// Whether `id` was minted by THIS session. A handle from a previous
+    /// process fails here and answers `unknown-id` — explicit staleness,
+    /// mirroring how session-scoped pagination cursors fail decode instead
+    /// of silently returning wrong data.
+    pub fn owns_execution_id(&self, id: &str) -> bool {
+        id.strip_prefix(&self.nonce_hex())
+            .is_some_and(|rest| rest.starts_with('-'))
     }
 }
 
@@ -202,6 +228,7 @@ pub(crate) fn ack_commit(
             token: token.clone(),
             ok: true,
             code: None,
+            payload: None,
         });
     }
 }
@@ -222,6 +249,31 @@ pub(crate) fn ack_commit_qualified(
             token: token.clone(),
             ok: true,
             code: Some(code),
+            payload: None,
+        });
+    }
+}
+
+/// Writes the single ack for an admitted long-running operation (#18):
+/// `ok=1`, a status qualifier code ([`codes::STARTED`] / [`codes::QUEUED`]),
+/// and a structured `data=` payload carrying the execution handle, queue
+/// position, and estimated wait. Exactly one ack per command, emitted at
+/// admission — completion is observed by polling `state.executions`, never
+/// pushed (`t=e` stays reserved).
+pub(crate) fn ack_commit_long_running(
+    acks: &mut MessageWriter<AckOutcome>,
+    source: IngressSource,
+    ack_token: &Option<String>,
+    status: &'static str,
+    payload: serde_json::Value,
+) {
+    if let Some(token) = ack_token {
+        acks.write(AckOutcome {
+            source,
+            token: token.clone(),
+            ok: true,
+            code: Some(status),
+            payload: Some(payload),
         });
     }
 }
@@ -245,6 +297,7 @@ pub(crate) fn reject(
             token: token.clone(),
             ok: false,
             code: Some(code),
+            payload: None,
         });
     }
 }
@@ -292,9 +345,19 @@ pub fn answer_queries(
         token,
         ok,
         code,
+        payload,
     } in acks.read()
     {
-        send_reply(&runtime, *source, token, true, *ok, *code, None);
+        let json = payload.as_ref().map(serde_json::Value::to_string);
+        send_reply(
+            &runtime,
+            *source,
+            token,
+            true,
+            *ok,
+            *code,
+            json.as_deref().map(str::as_bytes),
+        );
     }
 
     for QueryRequest { source, item } in queries.read() {
@@ -1909,5 +1972,23 @@ mod tests {
             caps["limits"]["sound_plays_per_sec"],
             json!(crate::sound::SOUND_PLAYS_PER_SEC)
         );
+    }
+
+    #[test]
+    fn execution_handles_are_session_scoped_and_never_reused() {
+        let mut session = QuerySession::default();
+        let first = session.mint_execution_id();
+        let second = session.mint_execution_id();
+        assert_ne!(first, second, "handles are never reused in a session");
+        assert!(first.starts_with(&session.nonce_hex()));
+        assert!(session.owns_execution_id(&first));
+        assert!(session.owns_execution_id(&second));
+        // A handle minted by another process (different nonce) is foreign:
+        // it answers unknown-id with an honest previous-session message
+        // instead of silently matching.
+        let foreign = format!("{:016x}-1", u64::MAX);
+        assert!(!session.owns_execution_id(&foreign));
+        // A bare nonce with no counter suffix is not a handle.
+        assert!(!session.owns_execution_id(&session.nonce_hex()));
     }
 }

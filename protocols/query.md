@@ -75,13 +75,37 @@ its error ack (`code=bad-command`).
 > both meanings, so the ack key is `tok=`.
 
 `code=` is an *outcome* code, not only a rejection code: an `ok=1` ack
-may carry a qualifier the caller should read. Today the only qualifier
-is `deferred` (a pre-unlock `sound.ambient.set` committed as retained
-state — see the [Ratty Sound Protocol](sound.md)); clients must ignore
-unknown codes on successful acks.
+may carry a qualifier the caller should read. The qualifiers today are
+`deferred` (a pre-unlock `sound.ambient.set` committed as retained
+state — see the [Ratty Sound Protocol](sound.md)), `started`, and
+`queued` (below); clients must ignore unknown codes on successful acks.
+
+### Long-running acks (`started` / `queued`)
+
+A **long-running operation** (`macro.play` today; `avatar.speak` when the
+avatar organ lands) still gets exactly one ack, emitted when admission is
+decided. On `ok=1` the qualifier `code=` is `started` (executing now) or
+`queued` (admitted to a bounded queue), and `data=` decodes to a flat
+JSON object (keys append-only):
+
+- `"id"` — the **execution handle**: `<session-nonce-hex>-<seq>`, unique
+  within a session and detectably stale across restarts (a previous
+  session's handle answers `unknown-id`).
+- `"position"` — how many executions hold the resource before this one;
+  `0` for `started`.
+- `"eta_ms"` — estimated wait/duration in milliseconds, **or**
+  `"eta_frames"` for `macro.play;mode=instant`, whose per-frame budget is
+  the only honest unit at admission.
+
+Estimates are pinned at admission: cancellations shorten them and later
+admissions may lengthen them; poll `state.executions` for live values.
+**There is no completion event** — `t=e` stays reserved; a handle absent
+from `state.executions` has finished or was cancelled (handles are
+live-state references, never tombstoned, and never reused in a session).
 
 Correlation tokens are transport metadata: the [macros organ](macros.md)
-records canonical commands and never captures them.
+records canonical commands and never captures them. Execution handles
+are transport-epoch metadata in the same sense.
 
 ## Read scope
 
@@ -200,8 +224,9 @@ Live object counts per agent namespace plus the transmission partition.
 `state.macros` lists the caller's session macros plus the trusted macros
 (each tagged `scope`, with `name`, `v`, `commands`, `privileged`, `hash`),
 paginated. `state.executions` projects the caller's own active recording or
-playback. Both are the read side of the [Ratty Macros
-Protocol](macros.md) (OSC 777 `macro.*`).
+playback; a playback item carries its execution handle as `id` (the same
+handle its `started` ack reported). Both are the read side of the [Ratty
+Macros Protocol](macros.md) (OSC 777 `macro.*`).
 
 ### 8. `state.errors` — the caller's rejection ring *(paginated)*
 
@@ -267,9 +292,11 @@ Append-only, kebab-case, carried in `code=`: `bad-envelope`,
 `no-anchor`, `already-exists`, `id-reused`, `session-budget`,
 `namespace-cap`, `bad-asset`, `bad-mode`, `bad-kind`, `kind-mismatch`,
 `audio-locked`, `deferred`, `rate-limited`, `voice-cap`, `not-permitted`,
-`stale-seq`, `internal` — plus the client-side `timeout` and `disposed`. `deferred` is
-the one code that qualifies an `ok=1` ack rather than naming a rejection
-(see Command acks above and [sound.md](sound.md)).
+`stale-seq`, `agent-queue-full`, `text-too-long`, `internal` — plus the
+client-side `timeout` and `disposed`. `deferred`, `started`, and `queued`
+are the codes that qualify an `ok=1` ack rather than naming a rejection
+(see Command acks above, [sound.md](sound.md), and the long-running-ack
+section).
 
 ## Client surfaces
 

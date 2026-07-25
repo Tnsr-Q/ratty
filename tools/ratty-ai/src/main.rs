@@ -2475,7 +2475,25 @@ fn emit_command(cli: &Cli, action: &str, payload: String) -> Result<(), ExitCode
     match roundtrip(cli, sequence.as_bytes(), &token) {
         Ok(reply) if reply.ok => {
             if cli.json {
-                println!("{}", serde_json::json!({ "ok": true }));
+                let mut out = serde_json::json!({ "ok": true });
+                // Success qualifiers and long-running payloads (#18): a
+                // started/queued ack carries the execution handle, queue
+                // position, and estimated wait in `data=`.
+                if let Some(code) = &reply.code {
+                    out["code"] = serde_json::Value::from(code.as_str());
+                }
+                if !reply.data.is_empty() {
+                    // Terminal-built replies always carry JSON here; fail
+                    // loudly rather than print half an answer.
+                    match serde_json::from_slice::<serde_json::Value>(&reply.data) {
+                        Ok(data) => out["data"] = data,
+                        Err(_) => {
+                            emit_failure(cli.json, "internal", "ack data was not valid JSON");
+                            return Err(exit_codes::reply_error());
+                        }
+                    }
+                }
+                println!("{out}");
             }
             Ok(())
         }

@@ -65,6 +65,14 @@ ESC ] 777 ; ratty:macro.run     ; path=<path>             → always rejected
   a non-positive or non-finite rate rejects `bad-payload`.
 - `tok=` opts into the delivery ack over OSC 778 exactly as the other
   families document. The recorder never captures a `tok=` token.
+- A committed `macro.play` is a **long-running operation** (#18): its one
+  ack is `ok=1;code=started` with a `data=` payload carrying the execution
+  handle (`id`), `position` (always `0` — playback never queues; slot
+  collisions reject `busy`), and the admission-pinned estimate (`eta_ms`
+  for timed playback, `eta_frames` for `mode=instant`). The handle also
+  appears as `id` on the `state.executions` playback item; its absence
+  there is the completion signal. See the long-running-ack section of
+  [query.md](query.md).
 
 ## Command classification
 

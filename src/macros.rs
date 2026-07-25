@@ -217,6 +217,9 @@ struct ActivePlayback {
     /// Whether this playback holds the exclusive scene lock (released when it
     /// finishes or is cancelled).
     scene_locked: bool,
+    /// The session-unique execution handle minted at admission (#18),
+    /// reported in the started ack and in `state.executions`.
+    execution_id: String,
 }
 
 impl ActivePlayback {
@@ -251,11 +254,27 @@ enum SlotState {
     Playing(ActivePlayback),
 }
 
+/// The single started-ack estimate for a committed `macro.play` (#18):
+/// wall milliseconds for timed playback, frames for `mode=instant` —
+/// Bevy's `Time` promises no future frame duration at admission, so
+/// frames are the honest unit there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlaybackEta {
+    /// Timed playback: the last step's offset divided by the clamped rate.
+    Millis(u64),
+    /// Instant playback: `ceil(steps / MAX_PLAYBACK_COMMANDS_PER_FRAME)`.
+    Frames(u64),
+}
+
 /// A read-only projection of an agent's active slot for `state.executions`.
 #[derive(Debug)]
 pub struct ExecutionView {
     /// `"recording"` or `"playback"`.
     pub kind: &'static str,
+    /// Playback only: the execution handle minted at admission (#18). A
+    /// recording carries none — its `macro.record` ack was an immediate
+    /// commit, not a long-running admission.
+    pub id: Option<String>,
     /// The macro name (the target for a playback, the pending name for a
     /// recording).
     pub name: String,
@@ -370,6 +389,7 @@ impl MacroRegistry {
         match self.slots.get(&namespace)? {
             SlotState::Recording(rec) => Some(ExecutionView {
                 kind: "recording",
+                id: None,
                 name: rec.name.clone(),
                 privileged: rec.privileged,
                 commands: rec.steps.len(),
@@ -380,6 +400,7 @@ impl MacroRegistry {
             }),
             SlotState::Playing(pb) => Some(ExecutionView {
                 kind: "playback",
+                id: Some(pb.execution_id.clone()),
                 name: String::new(),
                 privileged: pb.macro_.privileged,
                 commands: pb.macro_.steps.len(),
@@ -548,7 +569,10 @@ impl MacroRegistry {
 
     /// Starts a playback for `source`. Enforces the single slot, validates
     /// the rate, resolves and pins the macro version, and acquires the
-    /// exclusive scene lock for a privileged macro.
+    /// exclusive scene lock for a privileged macro. On success returns the
+    /// started-ack estimate; `execution_id` is the caller-minted handle
+    /// (a mint consumed by a rejected admission is simply discarded —
+    /// handles need uniqueness, not density).
     #[allow(clippy::too_many_arguments)]
     fn start_playback(
         &mut self,
@@ -559,8 +583,9 @@ impl MacroRegistry {
         rate: f32,
         instant: bool,
         scope: Option<MacroScope>,
+        execution_id: String,
         now: Duration,
-    ) -> Result<(), MacroReject> {
+    ) -> Result<PlaybackEta, MacroReject> {
         let namespace = source.namespace();
         if self.slots.contains_key(&namespace) {
             return Err((
@@ -608,6 +633,13 @@ impl MacroRegistry {
         } else {
             false
         };
+        let eta = if instant {
+            let steps = macro_.steps.len();
+            PlaybackEta::Frames(steps.div_ceil(MAX_PLAYBACK_COMMANDS_PER_FRAME) as u64)
+        } else {
+            let last_offset = macro_.steps.last().map_or(0.0, |step| step.offset);
+            PlaybackEta::Millis((f64::from(last_offset / rate) * 1000.0).round() as u64)
+        };
         self.slots.insert(
             namespace,
             SlotState::Playing(ActivePlayback {
@@ -625,9 +657,10 @@ impl MacroRegistry {
                 started: now,
                 next_index: 0,
                 scene_locked,
+                execution_id,
             }),
         );
-        Ok(())
+        Ok(eta)
     }
 
     /// Full session reset: cancel active slots, drop every session macro, and
@@ -715,6 +748,7 @@ pub fn apply_macro_commands(
     time: Res<Time>,
     mut commands: MessageReader<AiCommand>,
     mut registry: ResMut<MacroRegistry>,
+    mut session: ResMut<crate::query_channel::QuerySession>,
     mut acks: MessageWriter<AckOutcome>,
     mut diagnostics: ResMut<AiDiagnostics>,
 ) {
@@ -762,22 +796,45 @@ pub fn apply_macro_commands(
                 rate,
                 instant,
                 scope,
-            } => match registry.start_playback(
-                *source,
-                *origin,
-                name,
-                hash.as_deref(),
-                *rate,
-                *instant,
-                *scope,
-                now,
-            ) {
-                Ok(()) => ack_commit(&mut acks, *source, ack_token),
-                Err((code, message)) => {
-                    warn!("ratty-ai: macro.play rejected: {message}");
-                    reject!("macro.play", code, message);
+            } => {
+                let execution_id = session.mint_execution_id();
+                match registry.start_playback(
+                    *source,
+                    *origin,
+                    name,
+                    hash.as_deref(),
+                    *rate,
+                    *instant,
+                    *scope,
+                    execution_id.clone(),
+                    now,
+                ) {
+                    // macro.play is a long-running operation (#18): its one
+                    // ack is `ok=1;code=started` with the execution handle
+                    // and the admission-pinned estimate. It never queues —
+                    // slot collisions reject `busy` above.
+                    Ok(eta) => {
+                        let mut payload = json!({ "id": execution_id, "position": 0 });
+                        match eta {
+                            PlaybackEta::Millis(ms) => payload["eta_ms"] = json!(ms),
+                            PlaybackEta::Frames(frames) => {
+                                payload["eta_frames"] = json!(frames);
+                            }
+                        }
+                        crate::query_channel::ack_commit_long_running(
+                            &mut acks,
+                            *source,
+                            ack_token,
+                            codes::STARTED,
+                            payload,
+                        );
+                    }
+                    Err((code, message)) => {
+                        warn!("ratty-ai: macro.play rejected: {message}");
+                        reject!("macro.play", code, message);
+                    }
                 }
-            },
+            }
             RattyAiCommand::MacroExport { .. } => {
                 warn!("ratty-ai: macro.export rejected: the wire never writes a filesystem path");
                 reject!(
@@ -916,6 +973,9 @@ pub fn executions_state_value(registry: &MacroRegistry, namespace: u8) -> Value 
                 "commands": view.commands,
                 "scene_locked": view.scene_locked,
             });
+            if let Some(id) = view.id {
+                value["id"] = json!(id);
+            }
             if let Some(played) = view.played {
                 value["played"] = json!(played);
             }
@@ -1024,6 +1084,7 @@ mod tests {
                 1.0,
                 false,
                 None,
+                "exec-test".to_string(),
                 t(0.0),
             )
             .expect_err("play while recording is busy");
@@ -1164,6 +1225,7 @@ mod tests {
                 1.0,
                 false,
                 None,
+                "exec-test".to_string(),
                 t(10.0),
             )
             .expect("registry op ok");
@@ -1199,6 +1261,7 @@ mod tests {
                 1.0,
                 true,
                 None,
+                "exec-test".to_string(),
                 t(0.0),
             )
             .expect("registry op ok");
@@ -1228,6 +1291,7 @@ mod tests {
                     bad,
                     false,
                     None,
+                    "exec-test".to_string(),
                     t(0.0),
                 )
                 .expect_err("bad rate");
@@ -1252,6 +1316,7 @@ mod tests {
                 1.0,
                 false,
                 None,
+                "exec-test".to_string(),
                 t(0.0),
             )
             .expect("registry op ok");
@@ -1293,6 +1358,7 @@ mod tests {
                 1.0,
                 false,
                 None,
+                "exec-test".to_string(),
                 t(0.0),
             )
             .expect_err("privileged play blocked by the held lock");
@@ -1307,6 +1373,7 @@ mod tests {
                 1.0,
                 false,
                 None,
+                "exec-test".to_string(),
                 t(0.0),
             )
             .expect("a non-privileged macro ignores the scene lock");
@@ -1494,6 +1561,7 @@ mod tests {
                 1.0,
                 false,
                 None,
+                "exec-test".to_string(),
                 t(0.0),
             )
             .expect_err("rule-origin play of a non-rule-safe macro rejects");
@@ -1507,6 +1575,7 @@ mod tests {
                 1.0,
                 false,
                 None,
+                "exec-test".to_string(),
                 t(0.0),
             )
             .expect("registry op ok");
@@ -1551,6 +1620,7 @@ mod tests {
         let mut app = App::new();
         app.init_resource::<MacroRegistry>();
         app.init_resource::<AiDiagnostics>();
+        app.init_resource::<crate::query_channel::QuerySession>();
         app.init_resource::<Time>();
         app.add_message::<AiCommand>();
         app.add_message::<AckOutcome>();
@@ -1575,6 +1645,88 @@ mod tests {
             .resource_mut::<Messages<AckOutcome>>()
             .drain()
             .collect()
+    }
+
+    #[test]
+    fn macro_play_acks_started_with_execution_handle_and_eta() {
+        // #18 retrofit: macro.play is a long-running operation whose one
+        // ack is ok=1;code=started with the handle and admission estimate.
+        let mut app = app_test();
+        send(&mut app, None, RattyAiCommand::MacroRecord { name: "x".to_string(), replace: false });
+        send(&mut app, None, mode("3d"));
+        send(&mut app, None, RattyAiCommand::MacroStop);
+        drain_acks(&mut app);
+
+        let nonce = app
+            .world()
+            .resource::<crate::query_channel::QuerySession>()
+            .nonce_hex();
+        send(
+            &mut app,
+            Some("p1"),
+            RattyAiCommand::MacroPlay {
+                name: "x".to_string(),
+                hash: None,
+                rate: 1.0,
+                instant: false,
+                scope: None,
+            },
+        );
+        let acks = drain_acks(&mut app);
+        let ack = acks.first().expect("play acks");
+        assert!(ack.ok, "play commits");
+        assert_eq!(ack.code, Some(codes::STARTED));
+        let payload = ack.payload.as_ref().expect("started ack carries data");
+        let id = payload["id"].as_str().expect("handle is a string");
+        assert!(
+            id.starts_with(&format!("{nonce}-")),
+            "handle {id} is session-scoped"
+        );
+        assert_eq!(payload["position"], json!(0));
+        assert!(payload["eta_ms"].is_u64(), "timed playback estimates in ms");
+
+        // The zero-offset playback finished during the same update; the
+        // freed slot admits an instant playback, whose honest estimate is
+        // frames — Time promises no future frame duration at admission.
+        send(
+            &mut app,
+            Some("p2"),
+            RattyAiCommand::MacroPlay {
+                name: "x".to_string(),
+                hash: None,
+                rate: 1.0,
+                instant: true,
+                scope: None,
+            },
+        );
+        let acks = drain_acks(&mut app);
+        let ack = acks.first().expect("instant play acks");
+        assert_eq!(ack.code, Some(codes::STARTED));
+        let payload = ack.payload.as_ref().expect("data present");
+        assert!(payload["eta_frames"].is_u64());
+        assert!(payload.get("eta_ms").is_none());
+    }
+
+    #[test]
+    fn executions_projection_carries_the_playback_handle() {
+        let mut registry = MacroRegistry::default();
+        registry.test_record(NS0, "seq", &[mode("3d")]);
+        registry
+            .start_playback(
+                NS0,
+                CommandOrigin::Wire,
+                "seq",
+                None,
+                1.0,
+                false,
+                None,
+                "cafe-1".to_string(),
+                t(0.0),
+            )
+            .expect("playback starts");
+        let value = executions_state_value(&registry, 0);
+        assert_eq!(value["items"][0]["id"], json!("cafe-1"));
+        assert_eq!(value["items"][0]["kind"], json!("playback"));
     }
 
     #[test]
