@@ -494,7 +494,8 @@ pub struct ReactiveConfig {
 pub struct TrustedRuleConfig {
     /// Rule name, unique within the trusted tier.
     pub name: String,
-    /// Referenced sensor (`sys.*` or any `agent.<ns>.*`).
+    /// Referenced sensor: `sys.*` or the local session's `agent.0.*`
+    /// (trusted rules run under the local ingress principal).
     pub sensor: String,
     /// Activation threshold: active at or above. Exactly one of
     /// `above`/`below` must be set.

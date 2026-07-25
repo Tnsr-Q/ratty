@@ -70,8 +70,9 @@ ESC ] 777 ; ratty:sensor.remove ; name=<s>[&tok=<t>] BEL
   the caller's `agent.<ns>.` — a caller can never publish into `sys.*` or
   another agent's namespace, by construction. `seq=` (optional) must be
   strictly increasing per sensor or the publish rejects `stale-seq`;
-  omitted sequences auto-increment. `ttl=` is clamped to the advertised
-  bounds; absent uses the default (~10 s).
+  omitted sequences auto-increment, and `u64::MAX` itself is rejected
+  (`bad-payload`) so the sequence always has headroom. `ttl=` is
+  clamped to 0.5–3600 s; absent uses the default (~10 s).
 
 ## Trigger semantics
 
@@ -92,9 +93,11 @@ and fresh**:
   crosses `clear=` on the release side (`clear <= above`, `clear >=
   below`; defaults to the threshold). Deactivation never fires.
 - **Cooldown.** A transition inside `cooldown=` seconds of the last fire
-  (or past the per-frame fire budget) is **latched but suppressed** — the
-  state stays honest, the fire is skipped and counted. The cooldown has a
-  floor (~0.25 s) so a rule can never outrun the action-side rate limits.
+  (or past the per-frame fire budget — which transitions past the budget
+  lose their fire is unspecified) is **latched but suppressed** — the
+  state stays honest, the fire is skipped and counted. Absent, the
+  cooldown defaults to 1 s; it has a floor (~0.25 s) so a rule can never
+  outrun the action-side rate limits.
 - **Registering into a true condition fires.** A rule whose condition
   already holds at registration activates once the debounce matures — its
   own state transitioned. Disabling a rule freezes its transition state
@@ -140,9 +143,9 @@ rows now carry `rule_safe` alongside `privileged`.
   fabricated** — a desktop without a battery simply never publishes
   `sys.battery`, and the first CPU sample is skipped rather than
   published as a meaningless 0 %.
-- **Wire sensors**: typed (finite f32), clamped, rate-limited
-  (token-bucket per namespace), only inside the caller's own
-  `agent.<ns>.*` namespace. Browser-equal by construction.
+- **Wire sensors**: typed (finite f32), rate-limited (token-bucket per
+  namespace), only inside the caller's own `agent.<ns>.*` namespace
+  (canonically spelled). Browser-equal by construction.
 - **Browser/wasm**: no automatic host adapter — `caps` reports it
   honestly (below); wire-published sensors work identically. (On wasm the
   frame clock freezes with hidden tabs, so TTL/debounce inherit
@@ -172,8 +175,9 @@ cooldown = 30.0
 action = "flash;color=%23ff0000&duration=0.4"   # the wire `do=` grammar
 ```
 
-A trusted rule that fails semantic validation (bad action, bad trigger)
-is seeded **disabled and marked invalid** — visible in `state.rules` with
+Duplicate `[[reactive.rules]]` names reject loudly at startup — the
+first entry wins. A trusted rule that fails semantic validation (bad
+action, bad trigger) is seeded **disabled and marked invalid** — visible in `state.rules` with
 the reason, logged loudly at startup, never silently dropped and never a
 startup abort. Wire mutation of a trusted name answers a flat
 `unknown-id`. (A trusted rule with a `macro.play` action can only resolve

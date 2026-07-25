@@ -353,6 +353,12 @@ impl ReactiveRegistry {
             // ref is a `not-owner`.
             let parsed = rest.split_once('.').and_then(|(ns_str, suffix)| {
                 let ns: u8 = ns_str.parse().ok().filter(|ns| *ns <= 0x7F)?;
+                // Canonical spelling only ("agent.7.", never "agent.007."
+                // or "agent.+7.") — sensors are keyed by the canonical
+                // string, so a non-canonical ref could never bind.
+                if ns_str != ns.to_string() {
+                    return None;
+                }
                 valid_sensor_component(suffix).then_some(ns)
             });
             let Some(ns) = parsed else {
@@ -591,6 +597,10 @@ impl ReactiveRegistry {
             .get_mut(&(source.namespace(), name.to_string()))
             .ok_or_else(|| (codes::UNKNOWN_ID, format!("no session rule named '{name}'")))?;
         rule.enabled = enabled;
+        // Disabling freezes the latch exactly as dormancy does — and
+        // dormancy resets the debounce clock: time spent unobserved must
+        // never count as continuous hold time.
+        rule.raw_since = None;
         Ok(())
     }
 
@@ -658,7 +668,18 @@ impl ReactiveRegistry {
         }
         let current_seq = existing.map(|record| record.seq).unwrap_or(0);
         let seq = match seq {
-            None => current_seq + 1,
+            // Saturating: a caller parked just below the ceiling cannot
+            // drive an overflow panic (debug) or a wrap to 0 that would
+            // silently reset the strictly-increasing guarantee (release).
+            None => current_seq.saturating_add(1),
+            // u64::MAX is rejected outright so the sequence always has
+            // headroom for the auto-increment path.
+            Some(u64::MAX) => {
+                return Err((
+                    codes::BAD_PAYLOAD,
+                    "seq= must be below u64::MAX".to_string(),
+                ));
+            }
             Some(seq) if seq > current_seq => seq,
             Some(seq) => {
                 return Err((
@@ -699,7 +720,12 @@ impl ReactiveRegistry {
     /// Publishes a system-adapter sample (trusted internal path — no caps,
     /// no rate limits; the adapter is config-gated and cadence-bounded).
     pub fn publish_system_sensor(&mut self, name: &str, value: f32, ttl: Duration, now: Duration) {
-        let seq = self.sensors.get(name).map(|record| record.seq).unwrap_or(0) + 1;
+        let seq = self
+            .sensors
+            .get(name)
+            .map(|record| record.seq)
+            .unwrap_or(0)
+            .saturating_add(1);
         self.sensors.insert(
             name.to_string(),
             SensorRecord {
@@ -724,6 +750,12 @@ impl ReactiveRegistry {
             return Err((
                 codes::BAD_PAYLOAD,
                 format!("trusted rule names are 1..={MAX_RULE_NAME_BYTES} bytes"),
+            ));
+        }
+        if self.trusted.contains_key(&name) {
+            return Err((
+                codes::ALREADY_EXISTS,
+                format!("a trusted rule named '{name}' is already seeded; the first entry wins"),
             ));
         }
         let spec = RuleSpec {
@@ -1177,11 +1209,7 @@ pub fn sample_system_sensors(
     mut sampler: Local<Option<system_adapter::SystemSampler>>,
 ) {
     let now = time.elapsed();
-    let cadence = config
-        .reactive
-        .system_sample_secs
-        .unwrap_or(DEFAULT_SYSTEM_SAMPLE_SECS)
-        .clamp(MIN_SYSTEM_SAMPLE_SECS, MAX_SYSTEM_SAMPLE_SECS);
+    let cadence = sample_cadence_secs(&config.reactive);
     let sampler = sampler.get_or_insert_with(system_adapter::SystemSampler::new);
     if !sampler.due(now, Duration::from_secs_f32(cadence)) {
         return;
@@ -1193,6 +1221,18 @@ pub fn sample_system_sensors(
     for (name, value) in sampler.sample() {
         registry.publish_system_sensor(name, value, ttl, now);
     }
+}
+
+/// The effective system-sensor sampling cadence: the configured value
+/// clamped to the documented bounds, with a non-finite value (TOML admits
+/// `nan`/`inf`) falling back to the default rather than poisoning the
+/// clamp and panicking `Duration::from_secs_f32`.
+pub fn sample_cadence_secs(config: &crate::config::ReactiveConfig) -> f32 {
+    let configured = config
+        .system_sample_secs
+        .filter(|value| value.is_finite())
+        .unwrap_or(DEFAULT_SYSTEM_SAMPLE_SECS);
+    configured.clamp(MIN_SYSTEM_SAMPLE_SECS, MAX_SYSTEM_SAMPLE_SECS)
 }
 
 /// The sysinfo/starship-battery sampling state behind the native adapter.
@@ -1482,7 +1522,17 @@ mod tests {
         let (code, _) = set_simple(&mut registry, &macros, "r", "agent.5.x", spec_above(1.0))
             .expect_err("foreign");
         assert_eq!(code, codes::NOT_OWNER);
-        for bad_ref in ["cpu", "agent.x", "sys.", "agent.0.", "agent.0.bad name"] {
+        for bad_ref in [
+            "cpu",
+            "agent.x",
+            "sys.",
+            "agent.0.",
+            "agent.0.bad name",
+            // Non-canonical namespace spellings could never bind (sensors
+            // are keyed by the canonical string), so they are malformed.
+            "agent.00.load",
+            "agent.+0.load",
+        ] {
             let (code, _) = set_simple(&mut registry, &macros, "r", bad_ref, spec_above(1.0))
                 .expect_err("malformed");
             assert_eq!(code, codes::BAD_PAYLOAD, "ref '{bad_ref}'");
@@ -2037,6 +2087,120 @@ mod tests {
         assert_eq!(row["dormant"], false);
         assert_eq!(row["action"], "think");
         assert_eq!(row["enabled"], true);
+    }
+
+    #[test]
+    fn sensor_seq_saturates_at_the_ceiling_instead_of_wrapping() {
+        let mut registry = ReactiveRegistry::default();
+        // The sentinel itself is rejected outright.
+        let (code, _) = registry
+            .publish_wire_sensor(NS0, "x", 1.0, None, Some(u64::MAX), t(0.0))
+            .expect_err("u64::MAX seq is rejected");
+        assert_eq!(code, codes::BAD_PAYLOAD);
+        // Parked just below the ceiling, the auto-increment path saturates
+        // instead of panicking (debug) or wrapping to 0 (release).
+        registry
+            .publish_wire_sensor(NS0, "x", 1.0, None, Some(u64::MAX - 1), t(0.1))
+            .expect("registry op ok");
+        registry
+            .publish_wire_sensor(NS0, "x", 2.0, None, None, t(0.2))
+            .expect("registry op ok");
+        registry
+            .publish_wire_sensor(NS0, "x", 3.0, None, None, t(0.3))
+            .expect("registry op ok");
+        assert_eq!(
+            registry.sensors["agent.0.x"].seq,
+            u64::MAX,
+            "the sequence saturates; low sequences stay rejected"
+        );
+        let (code, _) = registry
+            .publish_wire_sensor(NS0, "x", 4.0, None, Some(5), t(0.4))
+            .expect_err("a low explicit seq is still stale");
+        assert_eq!(code, codes::STALE_SEQ);
+    }
+
+    #[test]
+    fn disable_resets_the_debounce_clock_like_dormancy() {
+        let macros = MacroRegistry::default();
+        let mut registry = ReactiveRegistry::default();
+        let spec = RuleSpec {
+            above: Some(80.0),
+            below: None,
+            clear: None,
+            debounce: Some(10.0),
+            cooldown: None,
+        };
+        set_simple(&mut registry, &macros, "r", "agent.0.load", spec).expect("registry op ok");
+        // The raw condition starts holding at t=0…
+        publish(&mut registry, "load", 90.0, t(0.0));
+        assert!(evaluate_at(&mut registry, t(0.0)).is_empty());
+        // …the rule is disabled at t=1 (the hold was only 1s observed)…
+        registry
+            .set_rule_enabled(NS0, "r", false)
+            .expect("registry op ok");
+        // …and re-enabled much later with the condition still high. The
+        // unobserved gap must not count as continuous hold time.
+        registry
+            .set_rule_enabled(NS0, "r", true)
+            .expect("registry op ok");
+        publish(&mut registry, "load", 95.0, t(100.0));
+        assert!(
+            evaluate_at(&mut registry, t(100.0)).is_empty(),
+            "the debounce restarts after an unobserved gap"
+        );
+        assert!(
+            evaluate_at(&mut registry, t(110.0)).len() == 1,
+            "a fresh mature hold fires"
+        );
+    }
+
+    #[test]
+    fn sample_cadence_survives_hostile_config_values() {
+        let mut config = crate::config::ReactiveConfig::default();
+        assert_eq!(sample_cadence_secs(&config), DEFAULT_SYSTEM_SAMPLE_SECS);
+        config.system_sample_secs = Some(f32::NAN);
+        assert_eq!(
+            sample_cadence_secs(&config),
+            DEFAULT_SYSTEM_SAMPLE_SECS,
+            "a NaN cadence falls back instead of poisoning the clamp"
+        );
+        config.system_sample_secs = Some(f32::INFINITY);
+        assert_eq!(sample_cadence_secs(&config), DEFAULT_SYSTEM_SAMPLE_SECS);
+        config.system_sample_secs = Some(0.0);
+        assert_eq!(sample_cadence_secs(&config), MIN_SYSTEM_SAMPLE_SECS);
+        config.system_sample_secs = Some(1e9);
+        assert_eq!(sample_cadence_secs(&config), MAX_SYSTEM_SAMPLE_SECS);
+    }
+
+    #[test]
+    fn duplicate_trusted_rule_names_reject_loudly_first_wins() {
+        let macros = MacroRegistry::default();
+        let mut registry = ReactiveRegistry::default();
+        let first = TrustedRuleConfig {
+            name: "alarm".to_string(),
+            sensor: "sys.cpu".to_string(),
+            above: Some(85.0),
+            below: None,
+            clear: None,
+            debounce: None,
+            cooldown: None,
+            action: "think".to_string(),
+        };
+        let second = TrustedRuleConfig {
+            above: Some(10.0),
+            ..first.clone()
+        };
+        registry
+            .insert_trusted_rule(&first, &macros)
+            .expect("registry op ok");
+        let (code, _) = registry
+            .insert_trusted_rule(&second, &macros)
+            .expect_err("duplicate names reject");
+        assert_eq!(code, codes::ALREADY_EXISTS);
+        assert_eq!(
+            registry.trusted["alarm"].threshold, 85.0,
+            "the first entry wins"
+        );
     }
 
     /// Exercises the real platform handles: the first CPU sample is
