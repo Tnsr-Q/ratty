@@ -364,7 +364,10 @@ impl SpeechQueue {
             ));
         }
         let seq = utterance.seq;
-        self.queues.entry(namespace).or_default().push_back(utterance);
+        self.queues
+            .entry(namespace)
+            .or_default()
+            .push_back(utterance);
         self.pending_total += 1;
         let (position, eta) = self
             .forecast(namespace, seq, now)
@@ -695,7 +698,9 @@ fn pin_duration(text: &str, requested: Option<f32>) -> Result<Duration, AvatarRe
             (f64::from(secs) * 1000.0).round() as u64
         }
     };
-    Ok(Duration::from_millis(ms.clamp(MIN_UTTERANCE_MS, MAX_UTTERANCE_MS)))
+    Ok(Duration::from_millis(
+        ms.clamp(MIN_UTTERANCE_MS, MAX_UTTERANCE_MS),
+    ))
 }
 
 // ── Systems ──
@@ -1046,7 +1051,10 @@ mod tests {
                 spec.file
             );
             assert!(spec.file.ends_with(".glb"));
-            assert_eq!(spec.embedded_url, format!("embedded://objects/{}", spec.file));
+            assert_eq!(
+                spec.embedded_url,
+                format!("embedded://objects/{}", spec.file)
+            );
         }
     }
 
@@ -1078,7 +1086,10 @@ mod tests {
         assert_eq!(pin_duration("hi", Some(0.1)).expect("pins"), t(0.75));
         assert_eq!(pin_duration("hi", Some(60.0)).expect("pins"), t(15.0));
         assert_eq!(pin_duration("hi", Some(4.0)).expect("pins"), t(4.0));
-        assert_eq!(pin_duration("hi", Some(0.0)).expect_err("rejects").0, codes::BAD_PAYLOAD);
+        assert_eq!(
+            pin_duration("hi", Some(0.0)).expect_err("rejects").0,
+            codes::BAD_PAYLOAD
+        );
         assert_eq!(
             pin_duration("hi", Some(f32::NAN)).expect_err("rejects").0,
             codes::BAD_PAYLOAD
@@ -1122,10 +1133,13 @@ mod tests {
     #[test]
     fn rotation_is_seniority_snapshot_not_namespace_number() {
         let mut q = SpeechQueue::default();
-        q.admit(utterance(5, "active", 1.0), t(0.0)).expect("starts");
+        q.admit(utterance(5, "active", 1.0), t(0.0))
+            .expect("starts");
         // ns 7 queues first, then ns 1 — a lower namespace number.
-        q.admit(utterance(7, "senior", 1.0), t(0.1)).expect("queues");
-        q.admit(utterance(1, "junior", 1.0), t(0.2)).expect("queues");
+        q.admit(utterance(7, "senior", 1.0), t(0.1))
+            .expect("queues");
+        q.admit(utterance(1, "junior", 1.0), t(0.2))
+            .expect("queues");
         // Seniority wins: ns 7 speaks before ns 1.
         q.tick(t(1.5));
         assert_eq!(q.active().expect("promoted").utterance.id, "senior");
@@ -1139,12 +1153,15 @@ mod tests {
         // at admission time are ever served before you. An agent admitted
         // later — even with a smaller namespace number — lands behind.
         let mut q = SpeechQueue::default();
-        q.admit(utterance(9, "active", 1.0), t(0.0)).expect("starts");
+        q.admit(utterance(9, "active", 1.0), t(0.0))
+            .expect("starts");
         q.admit(utterance(8, "mine", 1.0), t(0.1)).expect("queues");
         // Adversary: after my admission, a stream of new agents with
         // smaller namespace numbers keeps arriving.
-        q.admit(utterance(0, "later-a", 15.0), t(0.2)).expect("queues");
-        q.admit(utterance(1, "later-b", 15.0), t(0.3)).expect("queues");
+        q.admit(utterance(0, "later-a", 15.0), t(0.2))
+            .expect("queues");
+        q.admit(utterance(1, "later-b", 15.0), t(0.3))
+            .expect("queues");
         // First promotion after the active expires must be mine — nothing
         // pending at my admission time remains.
         q.tick(t(1.5));
@@ -1162,7 +1179,10 @@ mod tests {
         q.admit(utterance(1, "b", 5.0), t(0.1)).expect("queues");
         // Another agent cannot cancel my utterance by handle.
         assert_eq!(q.cancel(1, "a").expect_err("owned").0, codes::NOT_OWNER);
-        assert_eq!(q.cancel(0, "zzz").expect_err("unknown").0, codes::UNKNOWN_ID);
+        assert_eq!(
+            q.cancel(0, "zzz").expect_err("unknown").0,
+            codes::UNKNOWN_ID
+        );
         // The owner cancels its queued utterance.
         q.cancel(1, "b").expect("own queued cancels");
         assert_eq!(q.queue_depth(), 0);
@@ -1210,10 +1230,7 @@ mod tests {
         app.init_resource::<Time>();
         app.add_message::<AiCommand>();
         app.add_message::<AckOutcome>();
-        app.add_systems(
-            Update,
-            (drive_avatar_speech, apply_avatar_commands).chain(),
-        );
+        app.add_systems(Update, (drive_avatar_speech, apply_avatar_commands).chain());
         app
     }
 
@@ -1428,7 +1445,10 @@ mod tests {
             let state = app.world().resource::<AvatarState>();
             assert!(state.shown);
             assert_eq!(state.anchor, AvatarAnchor::TopLeft);
-            assert_eq!(state.offset, Vec2::new(AVATAR_OFFSET_MAX_PX, -AVATAR_OFFSET_MAX_PX));
+            assert_eq!(
+                state.offset,
+                Vec2::new(AVATAR_OFFSET_MAX_PX, -AVATAR_OFFSET_MAX_PX)
+            );
             assert_eq!(state.scale, AVATAR_SCALE_MAX);
         }
         // The from= label is decoration; attribution authority is the

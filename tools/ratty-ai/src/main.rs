@@ -1064,9 +1064,7 @@ fn command_to_osc(command: &Commands) -> (String, String) {
                     .build(),
             ),
             AvatarAction::Stop => ("avatar.stop".into(), String::new()),
-            AvatarAction::Cancel { id } => {
-                ("avatar.cancel".into(), p().field("id", id).build())
-            }
+            AvatarAction::Cancel { id } => ("avatar.cancel".into(), p().field("id", id).build()),
             AvatarAction::SpeechClear { ns, all } => (
                 "avatar.speech.clear".into(),
                 if *all {

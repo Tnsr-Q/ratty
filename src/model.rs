@@ -38,9 +38,7 @@ pub fn seed_embedded_scene_assets(world: &mut World) {
         let is_scene = Path::new(name.as_ref())
             .extension()
             .and_then(|ext| ext.to_str())
-            .is_some_and(|ext| {
-                ext.eq_ignore_ascii_case("glb") || ext.eq_ignore_ascii_case("gltf")
-            });
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("glb") || ext.eq_ignore_ascii_case("gltf"));
         if !is_scene {
             continue;
         }

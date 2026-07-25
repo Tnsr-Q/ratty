@@ -519,8 +519,7 @@ fn answer(
         // avatar utterances (own active and own queued). Private
         // per-agent; absence of a handle is the completion signal (#18).
         "state.executions" => {
-            let mut value =
-                crate::macros::executions_state_value(ctx.macros, source.namespace());
+            let mut value = crate::macros::executions_state_value(ctx.macros, source.namespace());
             if let Some(items) = value["items"].as_array_mut() {
                 items.extend(
                     ctx.avatar

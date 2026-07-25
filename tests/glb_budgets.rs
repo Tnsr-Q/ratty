@@ -63,7 +63,10 @@ fn shipped_glbs_pass_with_measured_numbers() {
     assert_eq!(audit.triangles, 818);
     assert_eq!(audit.materials, 1);
     assert_eq!(audit.images, vec![(2048, 2048)]);
-    assert_eq!(audit.decoded_estimate_bytes, audit.bin_bytes + 2048 * 2048 * 4);
+    assert_eq!(
+        audit.decoded_estimate_bytes,
+        audit.bin_bytes + 2048 * 2048 * 4
+    );
     enforce_glb_caps(&audit).expect("mascot fits every cap");
 
     let audit = audit_glb(&read_asset("Ferris.glb")).expect("Ferris audits");
@@ -84,7 +87,11 @@ fn container_framing_failures_are_named() {
 
     let mut glb = synthetic_glb("{}", None);
     glb[4..8].copy_from_slice(&1u32.to_le_bytes());
-    assert!(audit_glb(&glb).expect_err("version 1").contains("version is 1"));
+    assert!(
+        audit_glb(&glb)
+            .expect_err("version 1")
+            .contains("version is 1")
+    );
 
     let mut glb = synthetic_glb("{}", None);
     glb[8..12].copy_from_slice(&9999u32.to_le_bytes());

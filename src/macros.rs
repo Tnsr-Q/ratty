@@ -1710,7 +1710,14 @@ mod tests {
         // #18 retrofit: macro.play is a long-running operation whose one
         // ack is ok=1;code=started with the handle and admission estimate.
         let mut app = app_test();
-        send(&mut app, None, RattyAiCommand::MacroRecord { name: "x".to_string(), replace: false });
+        send(
+            &mut app,
+            None,
+            RattyAiCommand::MacroRecord {
+                name: "x".to_string(),
+                replace: false,
+            },
+        );
         send(&mut app, None, mode("3d"));
         send(&mut app, None, RattyAiCommand::MacroStop);
         drain_acks(&mut app);

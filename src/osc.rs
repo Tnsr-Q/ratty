@@ -1789,7 +1789,9 @@ mod tests {
             })
         );
         assert_eq!(
-            parse_command("ratty:avatar.set;model=mascot&position=bottom-right&dx=12&dy=-4&scale=2"),
+            parse_command(
+                "ratty:avatar.set;model=mascot&position=bottom-right&dx=12&dy=-4&scale=2"
+            ),
             Some(RattyAiCommand::AvatarSet {
                 model: Some("mascot".to_string()),
                 position: Some("bottom-right".to_string()),
@@ -1800,7 +1802,10 @@ mod tests {
         );
         // A typo'd numeric field is a bad command, never silently absent.
         assert_eq!(parse_command("ratty:avatar.set;dx=abc"), None);
-        assert_eq!(parse_command("ratty:avatar.speak;text=hi&duration=zzz"), None);
+        assert_eq!(
+            parse_command("ratty:avatar.speak;text=hi&duration=zzz"),
+            None
+        );
         // speak requires text; cancel requires id; gesture requires gesture.
         assert_eq!(parse_command("ratty:avatar.speak"), None);
         assert_eq!(parse_command("ratty:avatar.cancel"), None);
@@ -1813,7 +1818,10 @@ mod tests {
                 scope: SpeechClearScope::Namespace(3),
             })
         );
-        assert_eq!(parse_command("ratty:avatar.speech.clear;ns=3&scope=all"), None);
+        assert_eq!(
+            parse_command("ratty:avatar.speech.clear;ns=3&scope=all"),
+            None
+        );
         assert_eq!(parse_command("ratty:avatar.speech.clear;scope=some"), None);
         assert_eq!(parse_command("ratty:avatar.speech.clear;ns=999"), None);
     }

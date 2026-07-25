@@ -173,8 +173,7 @@ pub(super) fn sync_avatar_mascot(
             Visibility::Visible,
             RenderLayers::layer(AVATAR_MASCOT_LAYER),
             WorldAssetRoot(
-                asset_server
-                    .load(GltfAssetLabel::Scene(0).from_asset(state.model.embedded_url)),
+                asset_server.load(GltfAssetLabel::Scene(0).from_asset(state.model.embedded_url)),
             ),
         ));
         state.needs_respawn = false;
@@ -207,10 +206,9 @@ pub(super) fn propagate_avatar_layer(
         let mut current = child_of.parent();
         loop {
             if roots.contains(&current) {
-                commands.entity(entity).insert((
-                    RenderLayers::layer(AVATAR_MASCOT_LAYER),
-                    AvatarLayerTagged,
-                ));
+                commands
+                    .entity(entity)
+                    .insert((RenderLayers::layer(AVATAR_MASCOT_LAYER), AvatarLayerTagged));
                 break;
             }
             let Ok(next) = parents.get(current) else {
@@ -490,10 +488,7 @@ pub(super) fn sync_avatar_overlay(
         f64::from(tail_base_x),
         f64::from(tail_base_y - 6.0 * render_scale),
     ));
-    tail.line_to(Point::new(
-        f64::from(mascot_px.x),
-        f64::from(mascot_px.y),
-    ));
+    tail.line_to(Point::new(f64::from(mascot_px.x), f64::from(mascot_px.y)));
     tail.line_to(Point::new(
         f64::from(tail_base_x),
         f64::from(tail_base_y + 6.0 * render_scale),
@@ -537,7 +532,13 @@ pub(super) fn sync_avatar_overlay(
             ),
         );
     }
-    paint_layout_revealed(&mut scene, &bubble.body, body_origin, BUBBLE_TEXT, revealed_bytes);
+    paint_layout_revealed(
+        &mut scene,
+        &bubble.body,
+        body_origin,
+        BUBBLE_TEXT,
+        revealed_bytes,
+    );
     if clipped {
         scene.pop_layer();
         scene.fill(

@@ -149,7 +149,12 @@ impl AvatarTextSystem {
 
 /// Paints a whole layout (the attribution line, the overflow marker) —
 /// the canonical parley→vello conversion.
-pub(crate) fn paint_layout(scene: &mut Scene, layout: &Layout<()>, origin: Vec2, color: PenikoColor) {
+pub(crate) fn paint_layout(
+    scene: &mut Scene,
+    layout: &Layout<()>,
+    origin: Vec2,
+    color: PenikoColor,
+) {
     paint_layout_revealed(scene, layout, origin, color, usize::MAX);
 }
 
