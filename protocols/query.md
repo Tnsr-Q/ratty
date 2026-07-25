@@ -124,14 +124,25 @@ The 778 analog of the RGP support reply; keys are append-only.
               "viz_items": 256, "sound_voices": 16,
               "sound_plays_per_sec": 4, "viz_series": 8,
               "viz_points_per_series": 256, "viz_points": 1024,
-              "bookmarks_per_namespace": 16, "bookmark_name_bytes": 64 },
+              "bookmarks_per_namespace": 16, "bookmark_name_bytes": 64,
+              "rules_per_namespace": 32, "rule_name_bytes": 64,
+              "rule_fires_per_frame": 16, "sensors_per_namespace": 16,
+              "sensor_name_bytes": 48, "sensor_publishes_per_sec": 16,
+              "sensor_default_ttl_secs": 10.0 },
   "viz_kinds": ["ps.v1", "fs.v1", "git.v1", "net.v1", "chart.bar.v1",
-                "chart.line.v1", "chart.gauge.v1", "timeline.v1"] }
+                "chart.line.v1", "chart.gauge.v1", "timeline.v1"],
+  "sensors": { "system_adapter": false, "system": [] } }
 ```
 
 `viz_kinds` (M3.6, append-only like every key) advertises the registered
 visualization payload kinds, so an emitter can feature-detect a kind
 before publishing instead of learning from a `bad-kind` reject.
+
+`sensors` (M3.8) is the [reactive organ](reactive.md)'s honesty roster:
+`system_adapter` reports whether the config-gated native sensor adapter
+is compiled in **and** granted (always `false` on wasm), and `system`
+lists the sensors it is currently supplying — live truth, never a
+promise.
 
 ### 2. `state.scene` — scene-global public state
 
@@ -235,6 +246,19 @@ normal command lowering** — the handler relowers the equivalent
 never restore objects, macros, or private scene state. `reset` clears
 every bookmark silently.
 
+### 11. `state.rules` / `state.sensors` — the reactive organ *(paginated)*
+
+The read side of the [Ratty Reactive Protocol](reactive.md) (OSC 777
+`rule.*`/`sensor.*`). `state.rules` lists the caller's wire rules plus
+the trusted config rules — each tagged `scope`, with the full trigger
+(`sensor`, `cmp`, `threshold`, `clear`, `debounce_secs`,
+`cooldown_secs`), the canonical `action` name, and the live state
+(`enabled`, `bound`, `dormant`, `active`, `fires`, `suppressed`, and
+`invalid` with the reason for a rejected trusted rule). `state.sensors`
+lists the system sensors plus the caller's **own** wire sensors — never
+another agent's — with `value`, `seq`, `age_secs`, `ttl_secs`, `fresh`,
+`source`, and the count of caller-visible `rules` bound to each.
+
 ## Error codes
 
 Append-only, kebab-case, carried in `code=`: `bad-envelope`,
@@ -243,7 +267,7 @@ Append-only, kebab-case, carried in `code=`: `bad-envelope`,
 `no-anchor`, `already-exists`, `id-reused`, `session-budget`,
 `namespace-cap`, `bad-asset`, `bad-mode`, `bad-kind`, `kind-mismatch`,
 `audio-locked`, `deferred`, `rate-limited`, `voice-cap`, `not-permitted`,
-`internal` — plus the client-side `timeout` and `disposed`. `deferred` is
+`stale-seq`, `internal` — plus the client-side `timeout` and `disposed`. `deferred` is
 the one code that qualifies an `ok=1` ack rather than naming a rejection
 (see Command acks above and [sound.md](sound.md)).
 
