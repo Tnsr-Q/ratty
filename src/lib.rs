@@ -8,6 +8,7 @@
 
 pub mod ai;
 pub mod bookmarks;
+pub mod capability;
 pub mod cli;
 pub mod config;
 mod direct_render;

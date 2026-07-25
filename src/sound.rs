@@ -590,8 +590,10 @@ pub fn apply_sound_commands(
                     continue;
                 }
                 // The scene-ambient capability comes from trusted config
-                // only; the wire can never grant it to itself.
-                if !app_config.audio.allow_scene_ambient {
+                // only; the wire can never grant it to itself (#23 spine).
+                if !crate::capability::SceneCapability::SceneAmbient
+                    .granted_to(*source, &app_config)
+                {
                     reject!(
                         "sound.ambient.set",
                         codes::NOT_PERMITTED,
