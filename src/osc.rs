@@ -124,6 +124,19 @@ pub fn sound_kind_class(kind: &str) -> Option<SoundKindClass> {
         .map(|(_, class)| *class)
 }
 
+/// Which macro registry a `macro.play` resolves against (#16 decision 4).
+///
+/// A bare `macro.play` (no `scope`) resolves the caller's session registry
+/// first, then the trusted promoted registry; an explicit scope pins the
+/// lookup to one tier, defeating shadowing ambiguity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MacroScope {
+    /// The caller's per-agent, session-lifetime registry.
+    Session,
+    /// The trusted, wire-immutable promoted registry.
+    Trusted,
+}
+
 /// A command parsed from an OSC 777 control sequence.
 ///
 /// Variants are grouped by subsystem. The first block is reachable today
@@ -432,17 +445,35 @@ pub enum RattyAiCommand {
     AvatarHide,
 
     // ── Macros ──
-    /// Begin recording a macro.
+    /// Begin recording a macro. An existing name rejects `already-exists`
+    /// unless `mode=replace` (#16's collision rule); replacement is
+    /// transactional — the prior macro survives until `macro.stop` finalizes.
     MacroRecord {
         /// Macro name.
         name: String,
+        /// Whether `mode=replace` was supplied.
+        replace: bool,
     },
-    /// Stop recording.
+    /// Stop recording (finalize) or cancel an active playback.
     MacroStop,
     /// Replay a recorded macro.
     MacroPlay {
-        /// Macro name.
+        /// Macro name. Empty when `hash` addresses the macro directly.
         name: String,
+        /// Immutable content-hash reference (hex). When present it resolves
+        /// the macro directly across both registries, defeating shadowing
+        /// ambiguity regardless of `scope`.
+        hash: Option<String>,
+        /// Playback rate multiplier (`2.0` = double speed, `0.5` = half).
+        /// `1.0` is the recorded tempo. Validated at apply time.
+        rate: f32,
+        /// Instant playback: drop the recorded inter-command delays,
+        /// preserving command order and the per-frame execution budget.
+        instant: bool,
+        /// Resolution scope. `None` resolves the caller's session registry
+        /// first, then the trusted registry; an explicit scope defeats
+        /// shadowing ambiguity.
+        scope: Option<MacroScope>,
     },
     /// Export a macro to a file.
     MacroExport {
@@ -469,6 +500,44 @@ pub enum RattyAiCommand {
         /// Battery% threshold.
         battery_low: Option<f32>,
     },
+}
+
+impl RattyAiCommand {
+    /// Whether this is a macro-control command (`macro.*`). These are never
+    /// captured into a recording, and one encountered mid-playback is
+    /// rejected: a macro can neither record nor play macros (#16 no
+    /// recursion).
+    pub fn is_macro_control(&self) -> bool {
+        matches!(
+            self,
+            Self::MacroRecord { .. }
+                | Self::MacroStop
+                | Self::MacroPlay { .. }
+                | Self::MacroExport { .. }
+                | Self::MacroRun { .. }
+        )
+    }
+
+    /// Whether this command belongs to the control-plane class excluded from
+    /// macro recording (#16 plus the #21 amendment): macro-control commands
+    /// and rule/reactive registration (`react`). Query and transport
+    /// envelopes are OSC 778, never `RattyAiCommand`s, so they are excluded
+    /// by construction, and `tok=` correlation tokens are transport metadata
+    /// stripped before capture. Everything else is recordable choreography.
+    pub fn is_control_plane(&self) -> bool {
+        self.is_macro_control() || matches!(self, Self::React { .. })
+    }
+
+    /// Whether this command mutates scene-global presentation state (mode,
+    /// warp, reset) rather than staying inside the caller's own object
+    /// namespace. A recording that contains one is classified *privileged*
+    /// and needs the exclusive scene lock to play (#16 privileged macros).
+    pub fn is_scene_global(&self) -> bool {
+        matches!(
+            self,
+            Self::SetMode { .. } | Self::SetWarp { .. } | Self::Reset
+        )
+    }
 }
 
 /// A `ratty:`-namespaced OSC 777 sequence parsed at terminal ingress.
@@ -717,13 +786,48 @@ fn parse_action(action: &str, p: &Payload) -> Option<RattyAiCommand> {
         "avatar.hide" => RattyAiCommand::AvatarHide,
 
         // Macros
-        "macro.record" => RattyAiCommand::MacroRecord {
-            name: p.string("name")?,
-        },
+        "macro.record" => {
+            // `mode` is the same closed vocabulary as `bookmark`: absent
+            // records fresh, `replace` overwrites transactionally.
+            let replace = match p.string("mode").as_deref() {
+                None => false,
+                Some("replace") => true,
+                Some(_) => return None,
+            };
+            RattyAiCommand::MacroRecord {
+                name: p.string("name")?,
+                replace,
+            }
+        }
         "macro.stop" => RattyAiCommand::MacroStop,
-        "macro.play" => RattyAiCommand::MacroPlay {
-            name: p.string("name")?,
-        },
+        "macro.play" => {
+            // Address by `name` or by immutable `hash`; at least one is
+            // required. `mode` and `scope` are closed vocabularies — an
+            // unknown value is a bad command, not a silently-ignored tag.
+            let name = p.string_or("name", "");
+            let hash = p.string("hash");
+            if name.is_empty() && hash.is_none() {
+                return None;
+            }
+            let instant = match p.string("mode").as_deref() {
+                None => false,
+                Some("instant") => true,
+                Some(_) => return None,
+            };
+            let scope = match p.string("scope").as_deref() {
+                None => None,
+                Some("session") => Some(MacroScope::Session),
+                Some("trusted") => Some(MacroScope::Trusted),
+                Some(_) => return None,
+            };
+            RattyAiCommand::MacroPlay {
+                name,
+                hash,
+                rate: p.f32("rate", 1.0),
+                instant,
+                scope,
+            }
+        }
         "macro.export" => RattyAiCommand::MacroExport {
             name: p.string("name")?,
             to: p.string_or("to", "macro.ratty"),
@@ -1210,8 +1314,12 @@ mod tests {
             "ratty:avatar.speak;text=hi",
             "ratty:avatar.hide",
             "ratty:macro.record;name=deploy",
+            "ratty:macro.record;name=deploy&mode=replace",
             "ratty:macro.stop",
             "ratty:macro.play;name=deploy",
+            "ratty:macro.play;name=deploy&rate=2.0&mode=instant&scope=session",
+            "ratty:macro.play;name=deploy&scope=trusted",
+            "ratty:macro.play;hash=deadbeef",
             "ratty:macro.export;name=deploy&to=d.ratty",
             "ratty:macro.run;path=d.ratty",
             "ratty:react;effect=warp-intense&cpu_high=90",
@@ -1233,6 +1341,13 @@ mod tests {
             "ratty:history;last=50",
             "ratty:jump;name=x",
             "ratty:bookmark;name=x&mode=append",
+            // macro.play `mode`/`scope` are closed vocabularies, and one of
+            // name= or hash= is required.
+            "ratty:macro.play",
+            "ratty:macro.play;name=x&mode=fast",
+            "ratty:macro.play;name=x&scope=global",
+            // macro.record `mode` is the same closed vocabulary as bookmark.
+            "ratty:macro.record;name=x&mode=append",
         ] {
             assert!(parse_command(case).is_none(), "`{case}` must not parse");
         }
@@ -1251,5 +1366,74 @@ mod tests {
                 name: "dock".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn macro_play_parses_rate_mode_scope_and_hash() {
+        let full =
+            parse_command("ratty:macro.play;name=deploy&rate=0.5&mode=instant&scope=trusted")
+                .expect("parses");
+        assert_eq!(
+            full,
+            RattyAiCommand::MacroPlay {
+                name: "deploy".to_string(),
+                hash: None,
+                rate: 0.5,
+                instant: true,
+                scope: Some(MacroScope::Trusted),
+            }
+        );
+        // Bare name: recorded tempo, no scope, one full run.
+        let bare = parse_command("ratty:macro.play;name=deploy").expect("parses");
+        assert_eq!(
+            bare,
+            RattyAiCommand::MacroPlay {
+                name: "deploy".to_string(),
+                hash: None,
+                rate: 1.0,
+                instant: false,
+                scope: None,
+            }
+        );
+        // Hash addresses the macro directly; name is empty.
+        let by_hash = parse_command("ratty:macro.play;hash=deadbeef").expect("parses");
+        assert_eq!(
+            by_hash,
+            RattyAiCommand::MacroPlay {
+                name: String::new(),
+                hash: Some("deadbeef".to_string()),
+                rate: 1.0,
+                instant: false,
+                scope: None,
+            }
+        );
+    }
+
+    #[test]
+    fn command_classes_gate_recording_and_privilege() {
+        // Macro-control and reactive registration are control-plane: never
+        // captured into a recording.
+        for control in [
+            parse_command("ratty:macro.record;name=x").expect("parses"),
+            parse_command("ratty:macro.stop").expect("parses"),
+            parse_command("ratty:macro.play;name=x").expect("parses"),
+            parse_command("ratty:macro.export;name=x&to=x").expect("parses"),
+            parse_command("ratty:macro.run;path=x").expect("parses"),
+            parse_command("ratty:react;effect=warp&cpu_high=90").expect("parses"),
+        ] {
+            assert!(control.is_control_plane(), "{control:?} is control-plane");
+        }
+        // Ordinary choreography records.
+        let spawn = parse_command("ratty:object.add;id=2147483648&path=rat.obj").expect("parses");
+        assert!(!spawn.is_control_plane(), "object.add records");
+        assert!(!spawn.is_scene_global(), "object.add stays namespaced");
+        // Scene-global commands mark a recording privileged.
+        for global in [
+            parse_command("ratty:mode;3d").expect("parses"),
+            parse_command("ratty:warp;intensity=0.5").expect("parses"),
+            parse_command("ratty:reset").expect("parses"),
+        ] {
+            assert!(global.is_scene_global(), "{global:?} is scene-global");
+        }
     }
 }

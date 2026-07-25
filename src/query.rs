@@ -117,6 +117,18 @@ pub mod codes {
     pub const DISPOSED: &str = "disposed";
     /// An internal invariant failed while answering.
     pub const INTERNAL: &str = "internal";
+    /// The caller's macro slot is occupied: an agent may have at most one
+    /// active recording *or* playback at a time (#16 per-agent single slot).
+    pub const BUSY: &str = "busy";
+    /// A macro-control command asked the terminal to read or write a native
+    /// filesystem path (`macro.export;to=`, `macro.run;path=`). The wire
+    /// never touches the filesystem (#12); promotion is a trusted-tier act.
+    pub const WIRE_FILESYSTEM: &str = "wire-filesystem-access";
+    /// A privileged macro (one containing scene-global commands) could not
+    /// play because the exclusive scene lock is held (#16 privileged macros).
+    pub const SCENE_LOCKED: &str = "scene-locked";
+    /// `macro.stop` arrived with no active recording or playback to finalize.
+    pub const NOTHING_ACTIVE: &str = "nothing-active";
 }
 
 /// Returns whether `token` is a valid correlation token: 1 to

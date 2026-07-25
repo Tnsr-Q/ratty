@@ -130,7 +130,8 @@ impl Plugin for RattyAiPlugin {
                     .after(crate::effects::apply_ai_effect_commands)
                     .after(crate::viz::apply_viz_commands)
                     .after(crate::sound::apply_sound_commands)
-                    .after(crate::bookmarks::apply_bookmark_commands),
+                    .after(crate::bookmarks::apply_bookmark_commands)
+                    .after(crate::macros::apply_macro_commands),
             );
     }
 }
@@ -236,6 +237,14 @@ pub fn apply_ai_commands(
             // the same AiCommand messages independently and owns their
             // acks.
             RattyAiCommand::Bookmark { .. } | RattyAiCommand::BookmarkJump { .. } => {}
+            // The macros organ (crate::macros::apply_macro_commands) reads
+            // the same AiCommand messages independently: it owns the
+            // macro.* acks and taps recordable commands off this stream.
+            RattyAiCommand::MacroRecord { .. }
+            | RattyAiCommand::MacroStop
+            | RattyAiCommand::MacroPlay { .. }
+            | RattyAiCommand::MacroExport { .. }
+            | RattyAiCommand::MacroRun { .. } => {}
             other => {
                 debug!("ratty-ai: command received, handler not yet built: {other:?}");
                 reject(

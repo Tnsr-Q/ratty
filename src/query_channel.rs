@@ -272,6 +272,7 @@ pub fn answer_queries(
     viz: Res<crate::viz::VizRegistry>,
     sound: Res<SoundState>,
     bookmarks: Res<crate::bookmarks::BookmarkRegistry>,
+    macros: Res<crate::macros::MacroRegistry>,
 ) {
     // Acks first: a same-chunk "command with tok= then query" reads its
     // ack before the query reply, in mutation order.
@@ -312,6 +313,7 @@ pub fn answer_queries(
                     viz: &viz,
                     sound: &sound,
                     bookmarks: &bookmarks,
+                    macros: &macros,
                     grid: runtime.parser.screen().size(),
                 };
                 match answer(envelope, *source, &ctx) {
@@ -396,6 +398,7 @@ struct QueryCtx<'a> {
     viz: &'a crate::viz::VizRegistry,
     sound: &'a SoundState,
     bookmarks: &'a crate::bookmarks::BookmarkRegistry,
+    macros: &'a crate::macros::MacroRegistry,
     /// Live grid size as `(rows, cols)`, from the parser screen.
     grid: (u16, u16),
 }
@@ -419,9 +422,17 @@ fn answer(
         "state.visible_objects" => visible_objects(ctx, &data),
         "state.neighbors" => neighbors(ctx, source, &data),
         "state.namespaces" => Ok(namespaces(ctx)),
-        // The macro subsystem is M3.7; until it lands there are honestly
-        // no macros and no executions. Never fabricate.
-        "state.macros" | "state.executions" => Ok(json!({ "items": [] })),
+        // The caller's session macros plus the trusted macros (paginated);
+        // and the caller's own active recording/playback.
+        "state.macros" => paginate(
+            ctx,
+            crate::macros::macros_state_items(ctx.macros, source.namespace()),
+            &data,
+        ),
+        "state.executions" => Ok(crate::macros::executions_state_value(
+            ctx.macros,
+            source.namespace(),
+        )),
         "state.errors" => errors(ctx, source, &data),
         "state.viz" => viz_state(ctx, source, &data),
         "state.bookmarks" => Ok(bookmarks_state(ctx, source)),
@@ -454,6 +465,11 @@ fn caps(ctx: &QueryCtx<'_>) -> Value {
             "viz_points": crate::viz::MAX_VIZ_POINTS_PER_SNAPSHOT,
             "bookmarks_per_namespace": crate::bookmarks::MAX_BOOKMARKS_PER_NAMESPACE,
             "bookmark_name_bytes": crate::bookmarks::MAX_BOOKMARK_NAME_BYTES,
+            "macros_per_namespace": crate::macros::MAX_MACROS_PER_NAMESPACE,
+            "macro_name_bytes": crate::macros::MAX_MACRO_NAME_BYTES,
+            "commands_per_macro": crate::macros::MAX_COMMANDS_PER_MACRO,
+            "macro_recording_secs": crate::macros::MAX_RECORDING_SECS,
+            "macro_playback_per_frame": crate::macros::MAX_PLAYBACK_COMMANDS_PER_FRAME,
         },
         "viz_kinds": crate::viz::REGISTERED_VIZ_KINDS,
     })
@@ -938,6 +954,7 @@ mod tests {
         app.init_resource::<crate::viz::VizRegistry>();
         app.init_resource::<SoundState>();
         app.init_resource::<crate::bookmarks::BookmarkRegistry>();
+        app.init_resource::<crate::macros::MacroRegistry>();
         app.init_resource::<Time>();
         app.insert_resource(TerminalPresentation {
             mode: TerminalPresentationMode::Flat2d,
@@ -955,6 +972,8 @@ mod tests {
             Update,
             (
                 pump_pty_output,
+                crate::macros::apply_macro_commands,
+                crate::macros::drive_macro_playback,
                 apply_ai_object_commands,
                 crate::viz::apply_viz_commands,
                 apply_sound_commands,
@@ -1364,13 +1383,41 @@ mod tests {
     }
 
     #[test]
-    fn macros_and_executions_are_honestly_empty() {
+    fn macros_and_executions_start_empty() {
         let (mut app, host) = test_app();
         for (token, op) in [("q1", "state.macros"), ("q2", "state.executions")] {
             let reply = run_query(&mut app, &host, token, op, None);
             assert!(reply.ok);
             assert_eq!(payload(&reply)["items"], json!([]));
         }
+    }
+
+    #[test]
+    fn state_macros_lists_a_macro_recorded_over_the_wire() {
+        let (mut app, host) = test_app();
+        // Record a one-command macro over OSC 777: the bracket plus one
+        // scene-global command tapped off the stream between them.
+        let chunk = "\x1b]777;ratty:macro.record;name=deploy\x07\
+             \x1b]777;ratty:mode;3d\x07\
+             \x1b]777;ratty:macro.stop\x07";
+        host.feed_tx
+            .send(chunk.as_bytes().to_vec())
+            .expect("virtual feed accepts bytes");
+        app.update();
+
+        let reply = run_query(&mut app, &host, "q1", "state.macros", None);
+        assert!(reply.ok);
+        let page = payload(&reply);
+        let items = page["items"].as_array().expect("items array");
+        assert_eq!(items.len(), 1, "the recorded macro is listed");
+        assert_eq!(items[0]["name"], json!("deploy"));
+        assert_eq!(items[0]["scope"], json!("session"));
+        assert_eq!(items[0]["commands"], json!(1));
+        assert_eq!(
+            items[0]["privileged"],
+            json!(true),
+            "a captured scene-global command marks the macro privileged"
+        );
     }
 
     /// A synthetic `ps.v1` snapshot as its wire `data=` value.

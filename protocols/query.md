@@ -26,8 +26,9 @@ implementations cannot drift.
 - **Bounded everything.** Query size, decoded payload size, reply size,
   and diagnostics retention are all capped; large collections paginate
   with opaque cursors.
-- **Honest answers only.** Ops whose subsystem does not exist yet
-  (macros, executions) answer empty or `unsupported` — never fabricated.
+- **Honest answers only.** Ops whose subsystem does not exist yet answer
+  empty or `unsupported` — never fabricated. (`state.macros` /
+  `state.executions` now project the [macros organ](macros.md).)
 
 ## Transport
 
@@ -79,8 +80,8 @@ is `deferred` (a pre-unlock `sound.ambient.set` committed as retained
 state — see the [Ratty Sound Protocol](sound.md)); clients must ignore
 unknown codes on successful acks.
 
-Correlation tokens are transport metadata: the future macro recorder
-(M3.7) records canonical commands and must never capture them.
+Correlation tokens are transport metadata: the [macros organ](macros.md)
+records canonical commands and never captures them.
 
 ## Read scope
 
@@ -183,10 +184,13 @@ readable), while the caller's own scrolled-away object answers
 
 Live object counts per agent namespace plus the transmission partition.
 
-### 7. `state.macros` / `state.executions` — honestly empty
+### 7. `state.macros` / `state.executions` — the macros organ
 
-`{"items": []}` until the macro subsystem (M3.7) lands. Acked `macro.*`
-commands reply `ok=0; code=unsupported` today.
+`state.macros` lists the caller's session macros plus the trusted macros
+(each tagged `scope`, with `name`, `v`, `commands`, `privileged`, `hash`),
+paginated. `state.executions` projects the caller's own active recording or
+playback. Both are the read side of the [Ratty Macros
+Protocol](macros.md) (OSC 777 `macro.*`).
 
 ### 8. `state.errors` — the caller's rejection ring *(paginated)*
 
