@@ -4,16 +4,18 @@ Issues live in **GitHub Issues on `Tnsr-Q/ratty`**. Agents use the `gh` CLI
 where available, otherwise the GitHub MCP tools / REST API. Issues were
 enabled 2026-07-11.
 
-Work lands only via branch `claude/tender-thompson-gcq3c4` → PR into `main`
-(see the repo's standing constraints); issue operations themselves need no
-branch.
+Work lands only via a fresh `claude/<slug>` branch → PR into `main` (one
+branch per PR); issue operations themselves need no branch.
 
 ## Wayfinding operations
 
 How this repo expresses the /wayfinder skill's concepts:
 
-- **The map** is a single issue labelled `wayfinder:map` — currently
-  [#10, "Wayfinder map — M3 organs design-locked"](https://github.com/Tnsr-Q/ratty/issues/10).
+- **The map** is a single issue labelled `wayfinder:map`; the open one is the
+  current map — currently
+  [#42, "Wayfinder map: terminals-in-space"](https://github.com/Tnsr-Q/ratty/issues/42).
+  [#10 (M3)](https://github.com/Tnsr-Q/ratty/issues/10) is closed —
+  Destination reached.
 - **Tickets** are native **sub-issues** of the map. Add one with
   `POST /repos/Tnsr-Q/ratty/issues/{map}/sub_issues` (field `sub_issue_id` =
   the child issue's database id, not its number).
