@@ -80,9 +80,10 @@ Every parsed control command falls into exactly one recording class:
 
 | Class | Members | Recorded? | Privilege |
 | --- | --- | --- | --- |
-| **Control-plane** | `macro.*`, the reactive `rule.*`/`sensor.*` families | never | — |
-| **Scene-global** | `mode`, `warp`, `reset` | yes | marks the macro **privileged** |
-| **Choreography** | everything else (objects, cursor, viz, sound, effects, bookmarks, presence…) | yes | stays inside the caller's namespace |
+| **Control-plane** | `macro.*`, the reactive `rule.*`/`sensor.*` families, the collaboration presence `user.*`/`note`/`note.remove` family (#25 — a replayed join would forge liveness; see [presence.md](presence.md)) | never | — |
+| **Execution-control** | `avatar.stop`, `avatar.cancel` (#18 — session-scoped handles are transport-epoch metadata, meaningless in a recording; the trusted-macro loader refuses them too; see [avatar.md](avatar.md)) | never | — |
+| **Scene-global** | `mode`, `warp`, `reset`, `avatar.set`/`avatar.show`/`avatar.hide`, wide-scope `avatar.speech.clear` (#23) | yes | marks the macro **privileged** |
+| **Choreography** | everything else (objects, cursor, viz, sound, effects, bookmarks, avatar speech and gestures…) | yes | stays inside the caller's namespace |
 
 A second classification, **rule-safe** (#21, computed at finalize beside
 *privileged*), marks a macro whose every step is in the reactive organ's

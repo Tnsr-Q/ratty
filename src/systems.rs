@@ -398,6 +398,7 @@ pub(crate) struct RenderWidgetParams<'w, 's> {
     model_load_state: Res<'w, ModelLoadState>,
     frame_dirty: ResMut<'w, TerminalFrameDirty>,
     viz_registry: Res<'w, VizRegistry>,
+    presence: Res<'w, crate::presence::PresenceRegistry>,
     blink_phase: Local<'s, u64>,
 }
 
@@ -420,6 +421,7 @@ pub(crate) fn render_terminal_widget(mut params: RenderWidgetParams) {
         model_load_state,
         frame_dirty,
         viz_registry,
+        presence,
         blink_phase,
     } = &mut params;
     let needs_redraw = redraw.take();
@@ -455,7 +457,14 @@ pub(crate) fn render_terminal_widget(mut params: RenderWidgetParams) {
         }
     });
 
-    let _ = terminal.sync_image(images, direct_render, time.elapsed_secs(), viz_registry);
+    let _ = terminal.sync_image(
+        images,
+        direct_render,
+        time.elapsed_secs(),
+        viz_registry,
+        presence,
+        time.elapsed(),
+    );
 }
 
 #[derive(SystemParam)]
@@ -2626,7 +2635,10 @@ pub fn animate_stage_tween(
     }
 }
 
-fn active_mobius_progress(
+/// Progress of the Möbius morph for the active mode (`0` outside the
+/// Möbius view). `pub(crate)` because the presence cursor markers (#25)
+/// project through the same surface math as RGP objects.
+pub(crate) fn active_mobius_progress(
     mode: TerminalPresentationMode,
     mobius_transition: &MobiusTransition,
 ) -> f32 {
@@ -2818,7 +2830,11 @@ fn plane_surface_z(local_x: f32, local_y: f32, warp_amount: f32, elapsed_secs: f
     -(core * 360.0 + ring * 72.0) * pulse
 }
 
-fn plane_surface_point(
+/// Maps a plane-local `[-0.5, 0.5]` point onto the active terminal
+/// surface (flat, warped, or Möbius) at `depth_offset` above it.
+/// `pub(crate)` because the presence cursor markers (#25) pin to the
+/// same surface as RGP objects and the cursor model.
+pub(crate) fn plane_surface_point(
     mode: TerminalPresentationMode,
     local_x: f32,
     local_y: f32,

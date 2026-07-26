@@ -174,6 +174,7 @@ impl Plugin for TerminalPlugin {
             .add_systems(Last, shutdown_terminal_runtime_on_exit)
             .add_plugins(crate::ai::RattyAiPlugin)
             .add_plugins(crate::avatar::AvatarPlugin)
+            .add_plugins(crate::presence::PresencePlugin)
             .add_plugins(crate::bookmarks::BookmarksPlugin)
             .add_plugins(crate::macros::MacrosPlugin)
             .add_plugins(crate::reactive::ReactivePlugin)

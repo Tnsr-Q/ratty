@@ -151,7 +151,11 @@ scene ambient bed — documented in the [Ratty Sound Protocol](protocols/sound.m
 Agents can also record and replay their own choreography as named macros —
 the [Ratty Macros Protocol](protocols/macros.md) (the OSC 777 `macro.*`
 family), which taps the control channel and replays it through the same
-validation path.
+validation path. Other collaborators — remote humans or agent swarms —
+appear on the scene as cursors, names, and floating notes through the
+[Ratty Collaboration Presence Protocol](protocols/presence.md) (the OSC
+777 `user.*`/`note` family): source-agnostic presence rendering with
+leases and per-stream ownership, no networking in the terminal itself.
 
 RGP supports:
 

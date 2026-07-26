@@ -66,6 +66,7 @@ pub const SUPPORTED_OPS: &[&str] = &[
     "state.bookmarks",
     "state.rules",
     "state.sensors",
+    "state.presence",
 ];
 
 /// One OSC 778 item drained from the parser, delivered to the Bevy world.
@@ -313,6 +314,7 @@ pub struct OrganRegistries<'w> {
     macros: Res<'w, crate::macros::MacroRegistry>,
     reactive: Res<'w, crate::reactive::ReactiveRegistry>,
     avatar: Res<'w, crate::avatar::AvatarState>,
+    presence: Res<'w, crate::presence::PresenceRegistry>,
     config: Res<'w, crate::config::AppConfig>,
     time: Res<'w, Time>,
 }
@@ -392,6 +394,7 @@ pub fn answer_queries(
                     macros: &organs.macros,
                     reactive: &organs.reactive,
                     avatar: &organs.avatar,
+                    presence: &organs.presence,
                     config: &organs.config,
                     now: organs.time.elapsed(),
                     grid: runtime.parser.screen().size(),
@@ -481,6 +484,7 @@ struct QueryCtx<'a> {
     macros: &'a crate::macros::MacroRegistry,
     reactive: &'a crate::reactive::ReactiveRegistry,
     avatar: &'a crate::avatar::AvatarState,
+    presence: &'a crate::presence::PresenceRegistry,
     /// Trusted config, for the `caps` capability-grant projection.
     config: &'a crate::config::AppConfig,
     /// `Time::elapsed` at answer time, for sensor freshness projections.
@@ -544,6 +548,16 @@ fn answer(
             crate::reactive::sensors_state_items(ctx.reactive, source.namespace(), ctx.now),
             &data,
         ),
+        // The collaboration-presence rosters (#25), paginated: rosters
+        // cannot ride state.namespaces — one maxed namespace row would
+        // blow the page budget, and that op is unpaginated. Three-tier
+        // scoped: the caller's own namespace in full including expired
+        // rows; foreign namespaces fresh-only.
+        "state.presence" => paginate(
+            ctx,
+            crate::presence::presence_state_items(ctx.presence, source.namespace(), ctx.now),
+            &data,
+        ),
         _ => Err(codes::UNSUPPORTED_OP),
     }
 }
@@ -592,6 +606,16 @@ fn caps(ctx: &QueryCtx<'_>, source: IngressSource) -> Value {
             "avatar_queue_global": crate::avatar::MAX_PENDING_UTTERANCES_GLOBAL,
             "avatar_queue_per_agent": crate::avatar::MAX_PENDING_UTTERANCES_PER_AGENT,
             "avatar_offset_max_px": crate::avatar::AVATAR_OFFSET_MAX_PX,
+            "presence_participants_per_namespace":
+                crate::presence::MAX_PRESENCE_PARTICIPANTS_PER_NAMESPACE,
+            "presence_notes_per_namespace": crate::presence::MAX_PRESENCE_NOTES_PER_NAMESPACE,
+            "presence_id_bytes": crate::presence::MAX_PRESENCE_ID_BYTES,
+            "presence_name_bytes": crate::presence::MAX_PRESENCE_NAME_BYTES,
+            "presence_note_text_bytes": crate::presence::MAX_PRESENCE_NOTE_TEXT_BYTES,
+            "presence_default_ttl_secs": crate::presence::DEFAULT_PRESENCE_TTL_SECS,
+            "presence_note_default_ttl_secs": crate::presence::DEFAULT_PRESENCE_NOTE_TTL_SECS,
+            "presence_min_ttl_secs": crate::presence::MIN_PRESENCE_TTL_SECS,
+            "presence_max_ttl_secs": crate::presence::MAX_PRESENCE_TTL_SECS,
         },
         "viz_kinds": crate::viz::REGISTERED_VIZ_KINDS,
         "avatar_models": crate::osc::AVATAR_MODELS,
@@ -872,15 +896,26 @@ fn neighbors(
 }
 
 /// `state.namespaces`: aggregate public presence — live object counts per
-/// agent namespace plus the transmission/system partition.
+/// agent namespace plus the transmission/system partition, and (#25,
+/// append-only) fresh collaboration participant/note counts. Presence
+/// counts are fresh rows only — public = rendered, so an expired row is
+/// not publicly visible here — and a namespace appears only when it has
+/// something public (objects or fresh presence): expired-only foreign
+/// namespaces never leak through the aggregate. Rosters ride the
+/// paginated `state.presence`, never this unpaginated op.
 fn namespaces(ctx: &QueryCtx<'_>) -> Value {
-    let mut per_namespace: HashMap<u8, usize> = HashMap::new();
+    let mut per_namespace: HashMap<u8, (usize, usize, usize)> = HashMap::new();
     let mut transmission = 0_usize;
     for id in ctx.inline_objects.objects.keys() {
         match ai_object_namespace(*id) {
-            Some(namespace) => *per_namespace.entry(namespace).or_default() += 1,
+            Some(namespace) => per_namespace.entry(namespace).or_default().0 += 1,
             None => transmission += 1,
         }
+    }
+    for (namespace, (participants, notes)) in ctx.presence.fresh_counts(ctx.now) {
+        let entry = per_namespace.entry(namespace).or_default();
+        entry.1 = participants;
+        entry.2 = notes;
     }
     let mut namespaces: Vec<_> = per_namespace.into_iter().collect();
     namespaces.sort_by_key(|(namespace, _)| *namespace);
@@ -888,7 +923,12 @@ fn namespaces(ctx: &QueryCtx<'_>) -> Value {
         "transmission": transmission,
         "namespaces": namespaces
             .into_iter()
-            .map(|(namespace, objects)| json!({ "ns": namespace, "objects": objects }))
+            .map(|(namespace, (objects, participants, notes))| json!({
+                "ns": namespace,
+                "objects": objects,
+                "participants": participants,
+                "notes": notes,
+            }))
             .collect::<Vec<_>>(),
     })
 }
@@ -1114,6 +1154,7 @@ mod tests {
         app.add_message::<AckOutcome>();
         app.init_resource::<crate::bookmarks::PendingBookmarkJumps>();
         app.init_resource::<crate::reactive::ReactiveRegistry>();
+        app.init_resource::<crate::presence::PresenceRegistry>();
         app.add_systems(
             Update,
             (
@@ -1130,6 +1171,7 @@ mod tests {
                 crate::bookmarks::drain_bookmark_jumps,
                 crate::avatar::drive_avatar_speech,
                 crate::avatar::apply_avatar_commands,
+                crate::presence::apply_presence_commands,
                 answer_queries,
             )
                 .chain(),
@@ -1291,6 +1333,18 @@ mod tests {
         assert_eq!(
             caps["limits"]["sensor_publishes_per_sec"],
             json!(crate::reactive::SENSOR_PUBLISHES_PER_SEC)
+        );
+        assert_eq!(
+            caps["limits"]["presence_participants_per_namespace"],
+            json!(crate::presence::MAX_PRESENCE_PARTICIPANTS_PER_NAMESPACE)
+        );
+        assert_eq!(
+            caps["limits"]["presence_notes_per_namespace"],
+            json!(crate::presence::MAX_PRESENCE_NOTES_PER_NAMESPACE)
+        );
+        assert_eq!(
+            caps["limits"]["presence_default_ttl_secs"],
+            json!(crate::presence::DEFAULT_PRESENCE_TTL_SECS)
         );
         // #18 honesty: no config grant in the default test app, so the
         // native adapter reports absent and supplies nothing.
@@ -1485,7 +1539,10 @@ mod tests {
         let reply = run_query(&mut app, &host, "q2", "state.namespaces", None);
         let aggregate = payload(&reply);
         assert_eq!(aggregate["transmission"], json!(1));
-        assert_eq!(aggregate["namespaces"], json!([{ "ns": 0, "objects": 2 }]));
+        assert_eq!(
+            aggregate["namespaces"],
+            json!([{ "ns": 0, "objects": 2, "participants": 0, "notes": 0 }])
+        );
     }
 
     #[test]
@@ -2093,5 +2150,141 @@ mod tests {
         assert!(!session.owns_execution_id(&foreign));
         // A bare nonce with no counter suffix is not a handle.
         assert!(!session.owns_execution_id(&session.nonce_hex()));
+    }
+
+    /// The M3.11 closed loop: join + cursor + note over OSC 777 with
+    /// `tok=` acks, the aggregate and the roster read back over 778, the
+    /// lease expiring visibly (`fresh: false`, counts drop) rather than
+    /// vanishing, and `user.leave`/`note.remove` actually removing rows.
+    #[test]
+    fn closed_loop_presence_over_777_and_778() {
+        let (mut app, host) = test_app();
+        let chunk = "\x1b]777;ratty:user.join;id=alice&color=%2300ffcc&ttl=2&tok=j1\x07\
+             \x1b]777;ratty:user.cursor;id=alice&x=3&y=4&tok=c1\x07\
+             \x1b]777;ratty:note;id=n1&text=review%20this&x=5&y=6&ttl=2&tok=n1\x07";
+        host.feed_tx
+            .send(chunk.as_bytes().to_vec())
+            .expect("virtual feed accepts bytes");
+        app.update();
+        let replies = drain_replies(&host);
+        assert_eq!(replies.len(), 3, "one ack per tok= command");
+        for (index, token) in ["j1", "c1", "n1"].iter().enumerate() {
+            assert_eq!(replies[index].token, *token);
+            assert!(replies[index].ack && replies[index].ok, "{token} commits");
+        }
+
+        // The aggregate: one namespace row with fresh counts (#25).
+        let reply = run_query(&mut app, &host, "q1", "state.namespaces", None);
+        assert_eq!(
+            payload(&reply)["namespaces"],
+            json!([{ "ns": 0, "objects": 0, "participants": 1, "notes": 1 }])
+        );
+
+        // The roster: participant rows precede note rows.
+        let reply = run_query(&mut app, &host, "q2", "state.presence", None);
+        let page = payload(&reply);
+        let items = page["items"].as_array().expect("items array");
+        assert_eq!(items.len(), 2);
+        let participant = &items[0];
+        assert_eq!(participant["kind"], json!("participant"));
+        assert_eq!(participant["ns"], json!(0));
+        assert_eq!(participant["id"], json!("alice"));
+        assert_eq!(
+            participant["name"],
+            json!("alice"),
+            "name defaulted to the id"
+        );
+        assert_eq!(participant["color"], json!("#00ffcc"));
+        assert_eq!(participant["cursor"], json!({ "x": 3, "y": 4 }));
+        assert_eq!(participant["fresh"], json!(true));
+        assert_eq!(participant["revision"], json!(2), "join then cursor");
+        assert_eq!(participant["ttl_secs"], json!(2.0));
+        let note = &items[1];
+        assert_eq!(note["kind"], json!("note"));
+        assert_eq!(note["id"], json!("n1"));
+        assert_eq!(note["text"], json!("review this"));
+        assert_eq!(note["x"], json!(5));
+        assert_eq!(note["y"], json!(6));
+        assert_eq!(note["revision"], json!(1));
+
+        // Past the TTL: expiry is visible in the caller's own roster —
+        // fresh: false, never a silent vanish — while the public
+        // aggregate drops the namespace (nothing rendered = nothing
+        // public).
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(std::time::Duration::from_secs(3));
+        let reply = run_query(&mut app, &host, "q3", "state.presence", None);
+        let page = payload(&reply);
+        let items = page["items"].as_array().expect("items array");
+        assert_eq!(items.len(), 2, "expired rows stay queryable");
+        assert_eq!(items[0]["fresh"], json!(false));
+        assert_eq!(items[1]["fresh"], json!(false));
+        let reply = run_query(&mut app, &host, "q4", "state.namespaces", None);
+        assert_eq!(payload(&reply)["namespaces"], json!([]));
+
+        // Removal is explicit: leave/note.remove work on expired rows
+        // and only then do the rows leave the registry.
+        let chunk = "\x1b]777;ratty:user.leave;id=alice&tok=l1\x07\
+             \x1b]777;ratty:note.remove;id=n1&tok=r1\x07";
+        host.feed_tx
+            .send(chunk.as_bytes().to_vec())
+            .expect("virtual feed accepts bytes");
+        app.update();
+        let replies = drain_replies(&host);
+        assert_eq!(replies.len(), 2);
+        assert!(
+            replies[0].ok && replies[1].ok,
+            "removal of expired rows commits"
+        );
+        let reply = run_query(&mut app, &host, "q5", "state.presence", None);
+        assert_eq!(payload(&reply)["items"], json!([]));
+    }
+
+    /// A maxed namespace roster exceeds one reply page — the reason
+    /// `state.presence` paginates instead of riding `state.namespaces`.
+    #[test]
+    fn presence_rosters_paginate_within_the_page_budget() {
+        let (mut app, host) = test_app();
+        let mut chunk = String::new();
+        for index in 0..16 {
+            chunk.push_str(&format!(
+                "\x1b]777;ratty:user.join;id=participant-{index:02}\x07"
+            ));
+            chunk.push_str(&format!(
+                "\x1b]777;ratty:note;id=note-{index:02}&text=annotation%20{index:02}&x=1&y=2\x07"
+            ));
+        }
+        host.feed_tx
+            .send(chunk.into_bytes())
+            .expect("virtual feed accepts bytes");
+        app.update();
+        drain_replies(&host);
+
+        let mut collected = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut pages = 0;
+        loop {
+            let data = cursor.as_ref().map(|c| json!({ "cursor": c }));
+            let token = format!("q{pages}");
+            let reply = run_query(&mut app, &host, &token, "state.presence", data);
+            assert!(reply.ok);
+            let page = payload(&reply);
+            for item in page["items"].as_array().expect("items") {
+                collected.push(item["id"].as_str().expect("id").to_string());
+            }
+            pages += 1;
+            assert!(pages < 32, "pagination must terminate");
+            match page["cursor"].as_str() {
+                Some(next) => cursor = Some(next.to_string()),
+                None => break,
+            }
+        }
+        assert!(pages > 1, "a maxed roster exceeds one size-bounded page");
+        let expected: Vec<String> = (0..16)
+            .map(|index| format!("participant-{index:02}"))
+            .chain((0..16).map(|index| format!("note-{index:02}")))
+            .collect();
+        assert_eq!(collected, expected, "every row exactly once, in order");
     }
 }

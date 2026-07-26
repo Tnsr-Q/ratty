@@ -392,38 +392,81 @@ pub enum RattyAiCommand {
         name: String,
     },
 
-    // ── Collaboration ──
-    /// A remote user joined.
+    // ── Collaboration (#25) ──
+    /// Create a collaboration participant (`user.join`). Identity is the
+    /// pair (ingress source namespace, caller-local `id=`): the namespace
+    /// comes from the transport at apply time, never from the wire, so a
+    /// stream can only ever populate its own roster — nothing in-band is
+    /// trusted about identity. An existing id — fresh *or* expired —
+    /// rejects `already-exists` unless `replace=true` (#16's collision
+    /// rule); leases follow the sensor TTL model (#21).
     UserJoin {
-        /// User name.
+        /// Caller-local participant id, the identity key within the
+        /// caller's namespace. Charset/length validate at apply.
+        id: String,
+        /// Display name (defaults to the id). Rendering metadata only,
+        /// never authentication.
         name: String,
-        /// Cursor color.
+        /// Cursor color; strict `#rrggbb` validates at apply (colors are
+        /// identity-adjacent, so no lenient effects-style coercion).
         color: String,
+        /// Lease TTL in f32 seconds (like `sensor.publish`); absent picks
+        /// the participant default, and the terminal clamps the range.
+        ttl: Option<f32>,
+        /// Whether `replace=true` was supplied (overwrite an existing id).
+        replace: bool,
     },
-    /// A remote user left.
-    UserLeave {
-        /// User name.
-        name: String,
+    /// Renew a participant's lease (`user.renew`), optionally re-pinning
+    /// its TTL. Renewing an expired participant revives it — expiry is
+    /// computed lazily and stays visible (#21), never deletes, so the row
+    /// is still there to revive. Unknown ids reject `unknown-id`.
+    UserRenew {
+        /// Caller-local participant id.
+        id: String,
+        /// New lease TTL in f32 seconds; absent keeps the stored TTL.
+        ttl: Option<f32>,
     },
-    /// Update a remote user's cursor.
+    /// Update a participant's cursor cell (`user.cursor`). Any successful
+    /// mutation of one's own participant also refreshes its lease.
     UserCursor {
-        /// User name.
-        name: String,
-        /// Cursor column.
+        /// Caller-local participant id.
+        id: String,
+        /// Cursor column (cell). Required and strictly numeric: a typo'd
+        /// coordinate is a bad command, never a silent `(0, 0)`.
         x: u16,
-        /// Cursor row.
+        /// Cursor row (cell); strict like `x`.
         y: u16,
     },
-    /// Place a floating annotation.
+    /// Remove a participant (`user.leave`) — with `note.remove` and
+    /// `reset`, the only ways a row actually leaves the registry (lease
+    /// expiry alone never deletes). Unknown ids reject `unknown-id`.
+    UserLeave {
+        /// Caller-local participant id.
+        id: String,
+    },
+    /// Place a floating annotation pinned to a grid cell (`note`). Keyed
+    /// (namespace, `id=`) with the same collision and lease semantics as
+    /// `user.join`. The M3 `expires=` free-string key is retired: strict
+    /// `ttl=` seconds replaces it.
     Note {
-        /// Note text.
+        /// Caller-local note id.
+        id: String,
+        /// Note text (byte-capped at apply).
         text: String,
-        /// Anchor column.
+        /// Anchor column (cell); required and strictly numeric like
+        /// `user.cursor`.
         x: u16,
-        /// Anchor row.
+        /// Anchor row (cell); strict like `x`.
         y: u16,
-        /// Expiry (e.g. `1h`).
-        expires: String,
+        /// Lease TTL in f32 seconds; absent picks the note default.
+        ttl: Option<f32>,
+        /// Whether `replace=true` was supplied (overwrite an existing id).
+        replace: bool,
+    },
+    /// Remove a note (`note.remove`). Unknown ids reject `unknown-id`.
+    NoteRemove {
+        /// Caller-local note id.
+        id: String,
     },
 
     // ── Sound ──
@@ -660,14 +703,36 @@ impl RattyAiCommand {
         )
     }
 
+    /// Whether this is a collaboration-presence command (`user.*` and
+    /// `note`/`note.remove`, #25). Presence identity is ingress truth — a
+    /// participant exists because a live stream said so *now* — so a
+    /// macro-replayed `user.join` would forge liveness and a replayed
+    /// `user.leave` would evict a real participant. The whole family is
+    /// control-plane, excluded from macro recording, and the applier
+    /// additionally rejects any non-wire origin. (Distinct from the
+    /// effects Think/Confidence/Mood family that older docs call "AI
+    /// presence": that one is recordable choreography.)
+    pub fn is_presence_control(&self) -> bool {
+        matches!(
+            self,
+            Self::UserJoin { .. }
+                | Self::UserRenew { .. }
+                | Self::UserCursor { .. }
+                | Self::UserLeave { .. }
+                | Self::Note { .. }
+                | Self::NoteRemove { .. }
+        )
+    }
+
     /// Whether this command belongs to the control-plane class excluded from
-    /// macro recording (#16 plus the #21 amendment): macro-control commands
-    /// and reactive control (`rule.*` / `sensor.*`). Query and transport
-    /// envelopes are OSC 778, never `RattyAiCommand`s, so they are excluded
-    /// by construction, and `tok=` correlation tokens are transport metadata
-    /// stripped before capture. Everything else is recordable choreography.
+    /// macro recording (#16 plus the #21 and #25 amendments): macro-control
+    /// commands, reactive control (`rule.*` / `sensor.*`), and collaboration
+    /// presence (`user.*` / `note*`). Query and transport envelopes are OSC
+    /// 778, never `RattyAiCommand`s, so they are excluded by construction,
+    /// and `tok=` correlation tokens are transport metadata stripped before
+    /// capture. Everything else is recordable choreography.
     pub fn is_control_plane(&self) -> bool {
-        self.is_macro_control() || self.is_reactive_control()
+        self.is_macro_control() || self.is_reactive_control() || self.is_presence_control()
     }
 
     /// Whether this command belongs to the rule-action allowlist's directly
@@ -923,24 +988,47 @@ fn parse_action(action: &str, p: &Payload) -> Option<RattyAiCommand> {
             name: p.string("name")?,
         },
 
-        // Collaboration
-        "user.join" => RattyAiCommand::UserJoin {
-            name: p.string("name")?,
-            color: p.string_or("color", "#00ff00"),
-        },
-        "user.leave" => RattyAiCommand::UserLeave {
-            name: p.string("name")?,
+        // Collaboration presence (#25). Identity keys (`id=`) ride as
+        // strings; charset/length/color/ttl-range checks stay at apply
+        // time for their explicit ack codes — but every numeric parses
+        // strictly (a typo'd coordinate or ttl is a bad command, never a
+        // silently different one), retiring the lenient default-0 path
+        // these commands carried through M3.
+        "user.join" => {
+            // The display name defaults to the id at parse so both wire
+            // ends agree without a second defaulting site at apply.
+            let id = p.string("id")?;
+            let name = p.string_or("name", &id);
+            RattyAiCommand::UserJoin {
+                id,
+                name,
+                color: p.string_or("color", "#00ff00"),
+                ttl: p.opt_strict("ttl").ok()?,
+                replace: p.flag("replace"),
+            }
+        }
+        "user.renew" => RattyAiCommand::UserRenew {
+            id: p.string("id")?,
+            ttl: p.opt_strict("ttl").ok()?,
         },
         "user.cursor" => RattyAiCommand::UserCursor {
-            name: p.string("name")?,
-            x: p.u16("x", 0),
-            y: p.u16("y", 0),
+            id: p.string("id")?,
+            x: p.parse_req("x")?,
+            y: p.parse_req("y")?,
+        },
+        "user.leave" => RattyAiCommand::UserLeave {
+            id: p.string("id")?,
         },
         "note" => RattyAiCommand::Note {
+            id: p.string("id")?,
             text: p.string("text")?,
-            x: p.u16("x", 0),
-            y: p.u16("y", 0),
-            expires: p.string_or("expires", "1h"),
+            x: p.parse_req("x")?,
+            y: p.parse_req("y")?,
+            ttl: p.opt_strict("ttl").ok()?,
+            replace: p.flag("replace"),
+        },
+        "note.remove" => RattyAiCommand::NoteRemove {
+            id: p.string("id")?,
         },
 
         // Sound. (The bare `sound` stub action is retired: nothing ever
@@ -1425,15 +1513,17 @@ mod tests {
     fn percent_encoded_values_round_trip_through_special_chars() {
         // A note whose text contains the grammar's own delimiters.
         let text = "a=b & c; done";
-        let payload = format!("text={}&x=15&y=10&expires=1h", percent_encode(text));
+        let payload = format!("id=n1&text={}&x=15&y=10&ttl=600", percent_encode(text));
         let command = parse_command(&format!("ratty:note;{payload}")).expect("note parses");
         assert_eq!(
             command,
             RattyAiCommand::Note {
+                id: "n1".to_string(),
                 text: text.to_string(),
                 x: 15,
                 y: 10,
-                expires: "1h".to_string(),
+                ttl: Some(600.0),
+                replace: false,
             }
         );
     }
@@ -1582,10 +1672,15 @@ mod tests {
             "ratty:bookmark;name=x",
             "ratty:bookmark;name=x&mode=replace",
             "ratty:bookmark.jump;name=x",
-            "ratty:user.join;name=alice&color=%2300ff00",
-            "ratty:user.leave;name=alice",
-            "ratty:user.cursor;name=alice&x=1&y=2",
-            "ratty:note;text=hi&x=1&y=2",
+            "ratty:user.join;id=alice",
+            "ratty:user.join;id=alice&name=Alice%20W&color=%2300ffcc&ttl=120&replace=true",
+            "ratty:user.renew;id=alice",
+            "ratty:user.renew;id=alice&ttl=30",
+            "ratty:user.cursor;id=alice&x=1&y=2",
+            "ratty:user.leave;id=alice",
+            "ratty:note;id=n1&text=hi&x=1&y=2",
+            "ratty:note;id=n1&text=hi&x=1&y=2&ttl=600&replace=true",
+            "ratty:note.remove;id=n1",
             "ratty:sound.play;kind=chime",
             "ratty:sound.play;kind=click&gain=0.4",
             "ratty:sound.ambient.set;kind=ambient.hum&xfade=800",
@@ -1703,8 +1798,9 @@ mod tests {
 
     #[test]
     fn command_classes_gate_recording_and_privilege() {
-        // Macro-control and reactive control (rule.*/sensor.*) are
-        // control-plane: never captured into a recording (#16, #21).
+        // Macro-control, reactive control (rule.*/sensor.*), and
+        // collaboration presence (user.*/note*) are control-plane: never
+        // captured into a recording (#16, #21, #25).
         for control in [
             parse_command("ratty:macro.record;name=x").expect("parses"),
             parse_command("ratty:macro.stop").expect("parses"),
@@ -1718,6 +1814,12 @@ mod tests {
             parse_command("ratty:rule.disable;name=x").expect("parses"),
             parse_command("ratty:sensor.publish;name=x&value=1").expect("parses"),
             parse_command("ratty:sensor.remove;name=x").expect("parses"),
+            parse_command("ratty:user.join;id=alice").expect("parses"),
+            parse_command("ratty:user.renew;id=alice").expect("parses"),
+            parse_command("ratty:user.cursor;id=alice&x=1&y=2").expect("parses"),
+            parse_command("ratty:user.leave;id=alice").expect("parses"),
+            parse_command("ratty:note;id=n1&text=hi&x=1&y=2").expect("parses"),
+            parse_command("ratty:note.remove;id=n1").expect("parses"),
         ] {
             assert!(control.is_control_plane(), "{control:?} is control-plane");
         }
@@ -1922,6 +2024,158 @@ mod tests {
             assert!(
                 !command.is_rule_safe_action(),
                 "{command:?} is not directly rule-safe"
+            );
+        }
+    }
+
+    #[test]
+    fn presence_wire_grammar_parses_and_rejects_strictly() {
+        // Bare join: the display name defaults to the id, the color to
+        // green, and the lease TTL to the terminal-side default.
+        assert_eq!(
+            parse_command("ratty:user.join;id=alice"),
+            Some(RattyAiCommand::UserJoin {
+                id: "alice".to_string(),
+                name: "alice".to_string(),
+                color: "#00ff00".to_string(),
+                ttl: None,
+                replace: false,
+            })
+        );
+        // Full join: every optional pinned.
+        assert_eq!(
+            parse_command(
+                "ratty:user.join;id=alice&name=Alice%20W&color=%23ff8800&ttl=120&replace=true"
+            ),
+            Some(RattyAiCommand::UserJoin {
+                id: "alice".to_string(),
+                name: "Alice W".to_string(),
+                color: "#ff8800".to_string(),
+                ttl: Some(120.0),
+                replace: true,
+            })
+        );
+        assert_eq!(
+            parse_command("ratty:user.renew;id=alice&ttl=30"),
+            Some(RattyAiCommand::UserRenew {
+                id: "alice".to_string(),
+                ttl: Some(30.0),
+            })
+        );
+        assert_eq!(
+            parse_command("ratty:user.cursor;id=alice&x=4&y=7"),
+            Some(RattyAiCommand::UserCursor {
+                id: "alice".to_string(),
+                x: 4,
+                y: 7,
+            })
+        );
+        assert_eq!(
+            parse_command("ratty:user.leave;id=alice"),
+            Some(RattyAiCommand::UserLeave {
+                id: "alice".to_string(),
+            })
+        );
+        assert_eq!(
+            parse_command("ratty:note.remove;id=n1"),
+            Some(RattyAiCommand::NoteRemove {
+                id: "n1".to_string(),
+            })
+        );
+        for bad in [
+            // `id=` is the identity key on every presence command.
+            "ratty:user.join",
+            "ratty:user.renew",
+            "ratty:user.cursor;x=1&y=2",
+            "ratty:user.leave",
+            "ratty:note;text=hi&x=1&y=2",
+            "ratty:note.remove",
+            // Numerics parse strictly: a typo'd ttl or coordinate is a
+            // bad command, never a silently different one.
+            "ratty:user.join;id=alice&ttl=fast",
+            "ratty:user.renew;id=alice&ttl=3O",
+            "ratty:user.cursor;id=alice&x=abc&y=2",
+            "ratty:user.cursor;id=alice&x=1&y=70000",
+            "ratty:note;id=n1&text=hi&x=1&y=2&ttl=1h",
+            // Cursor cells and note anchors are required, not default-0.
+            "ratty:user.cursor;id=alice&y=2",
+            "ratty:user.cursor;id=alice&x=1",
+            "ratty:note;id=n1&text=hi&y=2",
+            "ratty:note;id=n1&text=hi&x=1",
+            "ratty:note;id=n1&x=1&y=2",
+        ] {
+            assert!(parse_command(bad).is_none(), "`{bad}` must not parse");
+        }
+    }
+
+    /// The M3 `expires=` free-string key is retired: the payload parser
+    /// ignores unknown keys, so a stale caller still parses — but only
+    /// strict `ttl=` seconds governs the lease.
+    #[test]
+    fn retired_note_expires_key_is_ignored_and_ttl_governs() {
+        assert_eq!(
+            parse_command("ratty:note;id=n1&text=hi&x=1&y=2&expires=1h"),
+            Some(RattyAiCommand::Note {
+                id: "n1".to_string(),
+                text: "hi".to_string(),
+                x: 1,
+                y: 2,
+                ttl: None,
+                replace: false,
+            })
+        );
+        assert_eq!(
+            parse_command("ratty:note;id=n1&text=hi&x=1&y=2&expires=1h&ttl=600"),
+            Some(RattyAiCommand::Note {
+                id: "n1".to_string(),
+                text: "hi".to_string(),
+                x: 1,
+                y: 2,
+                ttl: Some(600.0),
+                replace: false,
+            })
+        );
+    }
+
+    /// Pins the collaboration-presence class (#25): control-plane (a
+    /// replayed join would forge liveness), and nothing else — not
+    /// rule-safe, not scene-global, not execution control.
+    #[test]
+    fn collaboration_presence_class_is_pinned() {
+        for spec in [
+            "ratty:user.join;id=alice",
+            "ratty:user.renew;id=alice",
+            "ratty:user.cursor;id=alice&x=1&y=2",
+            "ratty:user.leave;id=alice",
+            "ratty:note;id=n1&text=hi&x=1&y=2",
+            "ratty:note.remove;id=n1",
+        ] {
+            let command = parse_command(spec).expect("parses");
+            assert!(
+                command.is_presence_control(),
+                "{command:?} is presence control"
+            );
+            assert!(command.is_control_plane(), "{command:?} is control-plane");
+            assert!(
+                !command.is_rule_safe_action(),
+                "{command:?} must not be rule-safe"
+            );
+            assert!(
+                !command.is_scene_global(),
+                "{command:?} stays namespace-scoped"
+            );
+            assert!(
+                !command.is_execution_control(),
+                "{command:?} is not execution control"
+            );
+        }
+        // The effects family older docs call "AI presence" is a different
+        // organ: recordable choreography, not presence control.
+        for spec in ["ratty:think;state=start", "ratty:mood;mood=excited"] {
+            let command = parse_command(spec).expect("parses");
+            assert!(
+                !command.is_presence_control(),
+                "{command:?} is effects choreography, not presence control"
             );
         }
     }

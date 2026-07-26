@@ -242,6 +242,11 @@ impl TerminalSurface {
     /// cell metrics live. Ids are drawn in ascending order so overlapping
     /// charts stack deterministically.
     ///
+    /// The presence organ (#25) appends its own underlays after the viz
+    /// ones: note panels and participant name labels for fresh rows at
+    /// `now`, pinned to (clamped) grid cells. In-texture, so they warp
+    /// with the plane exactly like chart underlays.
+    ///
     /// # Errors
     ///
     /// Returns an error if the offscreen renderer cannot be initialized or rendered.
@@ -251,6 +256,8 @@ impl TerminalSurface {
         exchange: &DirectTerminalSceneExchange,
         elapsed_secs: f32,
         viz: &crate::viz::VizRegistry,
+        presence: &crate::presence::PresenceRegistry,
+        now: std::time::Duration,
     ) -> anyhow::Result<()> {
         let (Some(render_handle), Some(present_handle)) =
             (self.render_image_handle.clone(), self.image_handle.clone())
@@ -307,6 +314,14 @@ impl TerminalSurface {
                 ops,
             ));
         }
+        underlays.extend(crate::presence::presence_underlays(
+            presence,
+            now,
+            self.cols,
+            self.rows,
+            metrics.cell_width,
+            metrics.cell_height,
+        ));
 
         let buffer = self.tui.backend().buffer();
         let cursor = Some(self.tui.backend().cursor_position());

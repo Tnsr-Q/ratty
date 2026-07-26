@@ -1882,4 +1882,55 @@ mod tests {
             "a finished playback clears the slot"
         );
     }
+
+    /// Collaboration presence (#25) is control-plane like rule.*/sensor.*
+    /// (see `command_classes_gate_recording_and_privilege` in osc.rs):
+    /// presence identity is ingress truth, so a macro-replayed
+    /// `user.join` would forge liveness and a replayed `user.leave`
+    /// would evict a real participant. The tap must skip the family.
+    #[test]
+    fn presence_commands_classify_and_filter_like_their_classes() {
+        let mut app = app_test();
+        send(
+            &mut app,
+            None,
+            RattyAiCommand::MacroRecord {
+                name: "m".to_string(),
+                replace: false,
+            },
+        );
+        // Presence control in the recorded stream: never captured.
+        send(
+            &mut app,
+            None,
+            RattyAiCommand::UserJoin {
+                id: "alice".to_string(),
+                name: "alice".to_string(),
+                color: "#00ff00".to_string(),
+                ttl: None,
+                replace: false,
+            },
+        );
+        send(
+            &mut app,
+            None,
+            RattyAiCommand::NoteRemove {
+                id: "n1".to_string(),
+            },
+        );
+        // An ordinary recordable command between them still captures.
+        send(&mut app, None, spawn(0x8000_0001));
+        send(&mut app, None, RattyAiCommand::MacroStop);
+        let macro_ = app
+            .world()
+            .resource::<MacroRegistry>()
+            .resolve(0, "m", None)
+            .expect("stored");
+        assert_eq!(
+            macro_.step_count(),
+            1,
+            "only the ordinary spawn was captured; the presence family is \
+             control-plane and never enters a recording"
+        );
+    }
 }

@@ -424,23 +424,12 @@ enum Commands {
         /// Bookmark name.
         name: String,
     },
-    /// Remote-user presence.
+    /// Collaboration participants (join, renew, cursor, leave).
     #[command(subcommand)]
     User(UserAction),
-    /// Place a floating annotation.
-    Note {
-        /// Note text.
-        text: String,
-        /// Anchor column.
-        #[arg(short, long, default_value = "0")]
-        x: u16,
-        /// Anchor row.
-        #[arg(short, long, default_value = "0")]
-        y: u16,
-        /// Expiry (e.g. `1h`).
-        #[arg(short, long, default_value = "1h")]
-        expires: String,
-    },
+    /// Floating annotations pinned to grid cells.
+    #[command(subcommand)]
+    Note(NoteAction),
     /// The sound organ: one-shot and ambient playback.
     #[command(subcommand)]
     Sound(SoundAction),
@@ -653,32 +642,76 @@ enum AmbientAction {
 
 #[derive(Subcommand)]
 enum UserAction {
-    /// A user joins.
+    /// Create a participant keyed by id in your ingress namespace.
     Join {
-        /// User name.
+        /// Caller-local participant id — the identity key (ASCII
+        /// alphanumerics plus `_-.`, ≤ 48 bytes).
+        id: String,
+        /// Display name (rendering metadata only; defaults to the id).
         #[arg(short, long)]
-        name: String,
-        /// Cursor color.
+        name: Option<String>,
+        /// Cursor color, strict `#rrggbb`.
         #[arg(short, long, default_value = "#00ff00")]
         color: String,
-    },
-    /// A user leaves.
-    Leave {
-        /// User name.
+        /// Lease TTL in seconds (clamped terminal-side).
         #[arg(short, long)]
-        name: String,
+        ttl: Option<f32>,
+        /// Overwrite an existing participant of the same id.
+        #[arg(long)]
+        replace: bool,
     },
-    /// Move a user's cursor.
+    /// Renew a participant's lease (revives an expired one).
+    Renew {
+        /// Caller-local participant id.
+        id: String,
+        /// New lease TTL in seconds; absent keeps the stored TTL.
+        #[arg(short, long)]
+        ttl: Option<f32>,
+    },
+    /// Move a participant's cursor cell (also refreshes the lease).
     Cursor {
-        /// User name.
-        #[arg(short, long)]
-        name: String,
+        /// Caller-local participant id.
+        id: String,
         /// Cursor column.
         #[arg(short, long)]
         x: u16,
         /// Cursor row.
         #[arg(short, long)]
         y: u16,
+    },
+    /// Remove a participant.
+    Leave {
+        /// Caller-local participant id.
+        id: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum NoteAction {
+    /// Place a note keyed by id in your ingress namespace.
+    Add {
+        /// Caller-local note id — the identity key (ASCII alphanumerics
+        /// plus `_-.`, ≤ 48 bytes).
+        id: String,
+        /// Note text.
+        text: String,
+        /// Anchor column.
+        #[arg(short, long)]
+        x: u16,
+        /// Anchor row.
+        #[arg(short, long)]
+        y: u16,
+        /// Lease TTL in seconds (clamped terminal-side).
+        #[arg(short, long)]
+        ttl: Option<f32>,
+        /// Overwrite an existing note of the same id.
+        #[arg(long)]
+        replace: bool,
+    },
+    /// Remove a note.
+    Remove {
+        /// Caller-local note id.
+        id: String,
     },
 }
 
@@ -992,29 +1025,53 @@ fn command_to_osc(command: &Commands) -> (String, String) {
         }
         Commands::Jump { name } => ("bookmark.jump".into(), p().field("name", name).build()),
         Commands::User(action) => match action {
-            UserAction::Join { name, color } => (
+            UserAction::Join {
+                id,
+                name,
+                color,
+                ttl,
+                replace,
+            } => (
                 "user.join".into(),
-                p().field("name", name).field("color", color).build(),
+                // An omitted --name stays off the wire so the terminal's
+                // own name-defaults-to-id rule is the single authority.
+                p().field("id", id)
+                    .opt("name", name.as_deref())
+                    .field("color", color)
+                    .opt("ttl", *ttl)
+                    .opt("replace", replace.then_some("true"))
+                    .build(),
             ),
-            UserAction::Leave { name } => ("user.leave".into(), p().field("name", name).build()),
-            UserAction::Cursor { name, x, y } => (
+            UserAction::Renew { id, ttl } => (
+                "user.renew".into(),
+                p().field("id", id).opt("ttl", *ttl).build(),
+            ),
+            UserAction::Cursor { id, x, y } => (
                 "user.cursor".into(),
-                p().field("name", name).field("x", x).field("y", y).build(),
+                p().field("id", id).field("x", x).field("y", y).build(),
             ),
+            UserAction::Leave { id } => ("user.leave".into(), p().field("id", id).build()),
         },
-        Commands::Note {
-            text,
-            x,
-            y,
-            expires,
-        } => (
-            "note".into(),
-            p().field("text", text)
-                .field("x", x)
-                .field("y", y)
-                .field("expires", expires)
-                .build(),
-        ),
+        Commands::Note(action) => match action {
+            NoteAction::Add {
+                id,
+                text,
+                x,
+                y,
+                ttl,
+                replace,
+            } => (
+                "note".into(),
+                p().field("id", id)
+                    .field("text", text)
+                    .field("x", x)
+                    .field("y", y)
+                    .opt("ttl", *ttl)
+                    .opt("replace", replace.then_some("true"))
+                    .build(),
+            ),
+            NoteAction::Remove { id } => ("note.remove".into(), p().field("id", id).build()),
+        },
         Commands::Sound(action) => match action {
             SoundAction::Play { kind, gain } => (
                 "sound.play".into(),
@@ -2974,20 +3031,97 @@ mod tests {
     #[test]
     fn note_with_delimiters_survives_encoding() {
         // The payload's own grammar chars inside a value must round-trip.
-        let command = Commands::Note {
+        let command = Commands::Note(NoteAction::Add {
+            id: "n1".into(),
             text: "check x=1 & y=2; done".into(),
             x: 15,
             y: 10,
-            expires: "1h".into(),
-        };
+            ttl: Some(600.0),
+            replace: false,
+        });
         assert_eq!(
             round_trip(&command),
             RattyAiCommand::Note {
+                id: "n1".into(),
                 text: "check x=1 & y=2; done".into(),
                 x: 15,
                 y: 10,
-                expires: "1h".into(),
+                ttl: Some(600.0),
+                replace: false,
             }
+        );
+    }
+
+    #[test]
+    fn user_join_round_trips_and_the_terminal_defaults_the_name() {
+        // Bare join: --name stays off the wire, so the terminal's
+        // name-defaults-to-id rule fills it in.
+        assert_eq!(
+            round_trip(&Commands::User(UserAction::Join {
+                id: "alice".into(),
+                name: None,
+                color: "#00ff00".into(),
+                ttl: None,
+                replace: false,
+            })),
+            RattyAiCommand::UserJoin {
+                id: "alice".into(),
+                name: "alice".into(),
+                color: "#00ff00".into(),
+                ttl: None,
+                replace: false,
+            }
+        );
+        // Full join: display name, color, ttl, and the replace flag.
+        assert_eq!(
+            round_trip(&Commands::User(UserAction::Join {
+                id: "alice".into(),
+                name: Some("Alice W".into()),
+                color: "#ff8800".into(),
+                ttl: Some(120.0),
+                replace: true,
+            })),
+            RattyAiCommand::UserJoin {
+                id: "alice".into(),
+                name: "Alice W".into(),
+                color: "#ff8800".into(),
+                ttl: Some(120.0),
+                replace: true,
+            }
+        );
+    }
+
+    #[test]
+    fn presence_lifecycle_subcommands_round_trip() {
+        assert_eq!(
+            round_trip(&Commands::User(UserAction::Renew {
+                id: "alice".into(),
+                ttl: Some(30.0),
+            })),
+            RattyAiCommand::UserRenew {
+                id: "alice".into(),
+                ttl: Some(30.0),
+            }
+        );
+        assert_eq!(
+            round_trip(&Commands::User(UserAction::Cursor {
+                id: "alice".into(),
+                x: 4,
+                y: 7,
+            })),
+            RattyAiCommand::UserCursor {
+                id: "alice".into(),
+                x: 4,
+                y: 7,
+            }
+        );
+        assert_eq!(
+            round_trip(&Commands::User(UserAction::Leave { id: "alice".into() })),
+            RattyAiCommand::UserLeave { id: "alice".into() }
+        );
+        assert_eq!(
+            round_trip(&Commands::Note(NoteAction::Remove { id: "n1".into() })),
+            RattyAiCommand::NoteRemove { id: "n1".into() }
         );
     }
 

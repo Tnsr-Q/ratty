@@ -215,11 +215,29 @@ a hidden foreign id answers a flat `unknown-id` (its existence is not
 readable), while the caller's own scrolled-away object answers
 `no-anchor`.
 
-### 6. `state.namespaces` — aggregate presence
+### 6. `state.namespaces` — aggregate public presence
 
 Live object counts per agent namespace plus the transmission partition.
+Since M3.11 (#25) each namespace row also carries `participants` and
+`notes` — **fresh** collaboration-presence counts (appended keys, shape
+otherwise unchanged). A namespace appears only while it has something
+public: live objects or at least one fresh presence row. Full rosters
+ride the paginated `state.presence` op, never this unpaginated
+aggregate.
 
-### 7. `state.macros` / `state.executions` — the macros organ
+### 7. `state.presence` — collaboration rosters *(paginated)*
+
+Participant and note rows from the collaboration presence organ
+([presence.md](presence.md)): participant rows before note rows,
+(namespace, id)-ordered within each kind. Participant rows carry `kind`,
+`ns`, `id`, `name`, `color`, `cursor` (`{x, y}` or `null`), `fresh`,
+`age_secs`, `ttl_secs`, `revision`; note rows carry `kind`, `ns`, `id`,
+`text`, `x`, `y` and the same lease fields. Read scope follows the
+three tiers: the caller's own namespace in full **including expired
+rows** (`fresh: false` stays visible, #21), foreign namespaces as fresh
+rows only — an expired foreign row's existence never leaks.
+
+### 8. `state.macros` / `state.executions` — the macros organ
 
 `state.macros` lists the caller's session macros plus the trusted macros
 (each tagged `scope`, with `name`, `v`, `commands`, `privileged`, `hash`),
@@ -230,13 +248,13 @@ caller's own avatar utterances (active and queued, with their handles;
 see the [Ratty Avatar Protocol](avatar.md)). Executions are private
 per-agent; absence of a handle means finished or cancelled.
 
-### 8. `state.errors` — the caller's rejection ring *(paginated)*
+### 9. `state.errors` — the caller's rejection ring *(paginated)*
 
 The last 32 rejections in the caller's namespace: `seq`, `action`,
 `code`, `message` — the query-channel return path for every failure that
 used to be only a terminal-side `warn!`.
 
-### 9. `state.viz` — visualization records *(paginated)*
+### 10. `state.viz` — visualization records *(paginated)*
 
 
 The read side of the `viz.*` family (see the
@@ -250,7 +268,7 @@ existence is not readable. Payload read-back is deliberately
 summary-level in v1: `item_count`, never item dumps or raw payloads.
 Sorted by id.
 
-### 10. `state.bookmarks` — the caller's view bookmarks
+### 11. `state.bookmarks` — the caller's view bookmarks
 
 The read side of the view-bookmark commands (M3.6). Bookmarks store only
 versioned public view state — the presentation mode and plane warp, the
@@ -273,7 +291,7 @@ normal command lowering** — the handler relowers the equivalent
 never restore objects, macros, or private scene state. `reset` clears
 every bookmark silently.
 
-### 11. `state.rules` / `state.sensors` — the reactive organ *(paginated)*
+### 12. `state.rules` / `state.sensors` — the reactive organ *(paginated)*
 
 The read side of the [Ratty Reactive Protocol](reactive.md) (OSC 777
 `rule.*`/`sensor.*`). `state.rules` lists the caller's wire rules plus
