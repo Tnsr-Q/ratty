@@ -108,7 +108,9 @@ const SPAN_HEIGHT_FRACTION: f32 = 0.55;
 const GAUGE_CENTER_Y: f32 = 0.62;
 
 /// Width-per-height of one stroke-font glyph cell, advance included.
-const GLYPH_ASPECT: f32 = 0.72;
+/// `pub(crate)` because the presence underlays (#25) size their note
+/// panels and name labels from the same advance.
+pub(crate) const GLYPH_ASPECT: f32 = 0.72;
 
 // ── Draw ops ──
 

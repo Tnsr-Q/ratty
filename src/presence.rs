@@ -59,6 +59,18 @@
 //! Everything rendered (name, color, cursor, note text) is public by
 //! definition — presence is the embodiment substrate.
 //!
+//! ## Rendering (the embodiment substrate)
+//!
+//! Fresh rows render, expired rows render nothing — that is the visible
+//! expiry on the scene. Cursor markers are small unlit caret meshes in
+//! the main scene (screen-space in the flat view; pinned to the warped
+//! surface through the RGP projection in the 3D modes). Name labels and
+//! note panels are vello stroke-font underlays drawn into the terminal
+//! texture beside the viz underlays, so they warp with the plane. Every
+//! registry mutation *and* every fresh→expired flip requests a terminal
+//! redraw — an expired note disappears even on an otherwise idle
+//! terminal.
+//!
 //! ## Honest limitations
 //!
 //! - Leases advance on `Res<Time>`, so on a hidden wasm tab expiry
@@ -66,9 +78,18 @@
 //!   stretch in wall time, nothing ever fires while unobserved.
 //! - Cursors and notes pin to **live grid cells** (the viewport): they
 //!   do **not** scroll with the text they were placed beside.
+//!   Out-of-grid cells clamp to the nearest edge cell at render; the
+//!   stored wire value is untouched.
 //! - Name labels and note text render through the vello stroke font:
 //!   uppercase letters, digits, and limited punctuation; other glyphs
 //!   render as hollow boxes. The full text stays queryable either way.
+//! - Notes render one line anchored at their cell, truncated at the
+//!   grid's right edge; labels cap at 16 glyphs. The full text and name
+//!   stay queryable via `state.presence`.
+//! - A participant without a reported cursor renders nothing — marker
+//!   and label both hang off the cursor cell — and the wire carries no
+//!   color on `note`, so note borders are the fixed presence accent,
+//!   not per-participant.
 //! - A plain PTY is one effective principal: every local writer shares
 //!   namespace 0. Distinct participants under one namespace are distinct
 //!   *ids*, honestly labeled, not authenticated identities.
@@ -77,14 +98,22 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use bevy::ecs::message::{MessageReader, MessageWriter};
+use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 use serde_json::{Value, json};
 
 use crate::ai::{AiCommand, CommandOrigin};
+use crate::config::CURSOR_DEPTH;
 use crate::osc::RattyAiCommand;
 use crate::query::codes;
 use crate::query_channel::{AckOutcome, AiDiagnostics, ack_commit, reject};
-use crate::terminal::TerminalRedrawState;
+use crate::scene::{
+    MobiusTransition, TerminalPlane, TerminalPlaneWarp, TerminalPresentation,
+    TerminalPresentationMode, TerminalViewport,
+};
+use crate::systems::{active_mobius_progress, plane_surface_point};
+use crate::terminal::{TerminalRedrawState, TerminalSurface};
+use crate::viz_draw::{GLYPH_ASPECT, TextAlign, UnderlayRect, VizDrawOp};
 
 /// Upper bound on participants per agent namespace: an honest failure
 /// instead of an unbounded roster driven by untrusted output. Expired
@@ -575,21 +604,541 @@ pub fn presence_state_items(
         .collect()
 }
 
-/// Registers the presence registry and its applier.
+// ── Rendering: markers on the scene, notes and labels in the texture ──
+
+/// Caret width and thickness as fractions of the cell width.
+const MARKER_WIDTH_FRACTION: f32 = 0.28;
+
+/// Caret height as a fraction of the cell height.
+const MARKER_HEIGHT_FRACTION: f32 = 0.85;
+
+/// Plane-local depth offset for markers in the 3D modes: above the
+/// warped surface, below the RGP object baseline of 8.
+const MARKER_PLANE_OFFSET: f32 = 6.0;
+
+/// Note text glyph height as a fraction of the cell height.
+const NOTE_GLYPH_HEIGHT_FRACTION: f32 = 0.62;
+
+/// Note panel padding as a fraction of the note glyph height.
+const NOTE_PAD_FRACTION: f32 = 0.40;
+
+/// Note border stroke width as a fraction of the panel height.
+const NOTE_BORDER_STROKE: f32 = 0.06;
+
+/// Label glyph height as a fraction of the cell height.
+const LABEL_GLYPH_HEIGHT_FRACTION: f32 = 0.55;
+
+/// Gap between the cursor cell and its name label, in cell widths.
+const LABEL_GAP_FRACTION: f32 = 0.35;
+
+/// Displayed name-label glyph cap; the full name stays queryable.
+const LABEL_MAX_GLYPHS: usize = 16;
+
+/// Note panel fill: a subtle scrim so the text under it stays hinted.
+const NOTE_FILL: [f32; 4] = [0.05, 0.05, 0.08, 0.82];
+
+/// Note panel border: the fixed presence accent (the avatar-bubble hue).
+/// The wire carries no color on `note`, so this cannot be
+/// per-participant — an honest limitation, not a default.
+const NOTE_BORDER: [f32; 4] = [0.35, 0.76, 1.0, 0.9];
+
+/// Note text color.
+const NOTE_TEXT: [f32; 4] = [0.91, 0.93, 0.96, 1.0];
+
+/// One fresh, cursor-bearing participant queued for rendering: the
+/// (namespace, id) key, the record, and its reported cursor cell.
+type LabeledParticipant<'a> = ((u8, &'a str), &'a ParticipantRecord, (u16, u16));
+
+/// One participant's cursor caret in the main scene — presence's own
+/// marker component, deliberately not [`crate::inline::TerminalRgpObject`]:
+/// `sync_inline_objects` full-syncs by despawning every RGP entity, and
+/// a Kitty upload would silently evict every cursor if markers shared
+/// the component.
+#[derive(Component)]
+pub(crate) struct PresenceCursorMarker {
+    /// Owner namespace of the participant this caret embodies.
+    namespace: u8,
+    /// Caller-local participant id.
+    id: String,
+    /// Last-applied color channels, for material change detection.
+    color: [u8; 3],
+}
+
+/// Clamps a wire cursor/note cell into the live grid (clamp-to-edge;
+/// the stored wire value is untouched).
+fn clamped_cell(x: u16, y: u16, cols: u16, rows: u16) -> (u16, u16) {
+    (x.min(cols.saturating_sub(1)), y.min(rows.saturating_sub(1)))
+}
+
+/// Parses a strict `#rrggbb` into its channels. Stored colors are
+/// validated at apply time ([`validate_color`]), so `None` is
+/// unreachable for registry records — the render side stays a total
+/// function instead of panicking on a broken invariant.
+fn hex_rgb(color: &str) -> Option<[u8; 3]> {
+    let bytes = color.as_bytes();
+    if bytes.len() != 7 || bytes[0] != b'#' {
+        return None;
+    }
+    let channel = |index: usize| -> Option<u8> {
+        let high = char::from(bytes[index]).to_digit(16)?;
+        let low = char::from(bytes[index + 1]).to_digit(16)?;
+        Some((high * 16 + low) as u8)
+    };
+    Some([channel(1)?, channel(3)?, channel(5)?])
+}
+
+/// The presence underlays for one frame: fresh note panels first, then
+/// fresh participants' name labels, each batch (namespace, id)-sorted so
+/// overlaps stack deterministically (the viz ascending-id posture).
+/// Rendered = public, so every namespace draws. Coordinates are physical
+/// texture pixels, computed where the cell metrics live
+/// ([`crate::terminal::TerminalSurface::sync_image`]).
+pub(crate) fn presence_underlays(
+    registry: &PresenceRegistry,
+    now: Duration,
+    cols: u16,
+    rows: u16,
+    cell_width: f32,
+    cell_height: f32,
+) -> Vec<(UnderlayRect, Vec<VizDrawOp>)> {
+    let mut underlays = Vec::new();
+    if cell_width <= 0.0 || cell_height <= 0.0 {
+        return underlays;
+    }
+    let mut notes: Vec<(&(u8, String), &NoteRecord)> = registry
+        .notes
+        .iter()
+        .filter(|(_, record)| record.fresh(now))
+        .collect();
+    notes.sort_by(|a, b| a.0.cmp(b.0));
+    for (_, record) in notes {
+        underlays.push(note_underlay(record, cols, rows, cell_width, cell_height));
+    }
+    let mut labeled: Vec<LabeledParticipant<'_>> = registry
+        .participants
+        .iter()
+        .filter_map(|((namespace, id), record)| {
+            let cursor = record.cursor?;
+            record
+                .fresh(now)
+                .then_some(((*namespace, id.as_str()), record, cursor))
+        })
+        .collect();
+    labeled.sort_by(|a, b| a.0.cmp(&b.0));
+    for (_, record, cursor) in labeled {
+        underlays.extend(label_underlay(
+            record,
+            cursor,
+            cols,
+            rows,
+            cell_width,
+            cell_height,
+        ));
+    }
+    underlays
+}
+
+/// One note panel: a subtle filled rect, the accent border, and the text
+/// on a single line — anchored at the (clamped) cell, one cell tall,
+/// truncated at the grid's right edge.
+fn note_underlay(
+    record: &NoteRecord,
+    cols: u16,
+    rows: u16,
+    cell_width: f32,
+    cell_height: f32,
+) -> (UnderlayRect, Vec<VizDrawOp>) {
+    let (col, row) = clamped_cell(record.x, record.y, cols, rows);
+    let glyph_height = cell_height * NOTE_GLYPH_HEIGHT_FRACTION;
+    let advance = glyph_height * GLYPH_ASPECT;
+    let pad = glyph_height * NOTE_PAD_FRACTION;
+    let x = f32::from(col) * cell_width;
+    let glyphs = record.text.chars().count() as f32;
+    let width = (pad * 2.0 + advance * glyphs).min(f32::from(cols) * cell_width - x);
+    let rect = UnderlayRect {
+        x,
+        y: f32::from(row) * cell_height,
+        width,
+        height: cell_height,
+    };
+    let pad_fraction = pad / width;
+    let ops = vec![
+        VizDrawOp::Fill {
+            min: (0.0, 0.0),
+            max: (1.0, 1.0),
+            color: NOTE_FILL,
+        },
+        VizDrawOp::Polyline {
+            points: vec![(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0), (0.0, 0.0)],
+            width: NOTE_BORDER_STROKE,
+            color: NOTE_BORDER,
+        },
+        VizDrawOp::Text {
+            pos: (pad_fraction, (1.0 - NOTE_GLYPH_HEIGHT_FRACTION) * 0.5),
+            height: NOTE_GLYPH_HEIGHT_FRACTION,
+            text: record.text.clone(),
+            color: NOTE_TEXT,
+            align: TextAlign::Left,
+            max_width: Some((1.0 - pad_fraction * 2.0).max(0.0)),
+        },
+    ];
+    (rect, ops)
+}
+
+/// One participant name label: participant-colored stroke text beside
+/// the (clamped) cursor cell, shifted left at the grid's right edge so
+/// it stays on the texture. `None` only for an unparseable stored color,
+/// which apply-time validation makes unreachable.
+fn label_underlay(
+    record: &ParticipantRecord,
+    cursor: (u16, u16),
+    cols: u16,
+    rows: u16,
+    cell_width: f32,
+    cell_height: f32,
+) -> Option<(UnderlayRect, Vec<VizDrawOp>)> {
+    let rgb = hex_rgb(&record.color)?;
+    let (col, row) = clamped_cell(cursor.0, cursor.1, cols, rows);
+    let glyph_height = cell_height * LABEL_GLYPH_HEIGHT_FRACTION;
+    let text: String = record.name.chars().take(LABEL_MAX_GLYPHS).collect();
+    let width = glyph_height * GLYPH_ASPECT * text.chars().count() as f32;
+    let x = ((f32::from(col) + 1.0) * cell_width + cell_width * LABEL_GAP_FRACTION)
+        .min((f32::from(cols) * cell_width - width).max(0.0));
+    let ops = vec![VizDrawOp::Text {
+        pos: (0.0, (1.0 - LABEL_GLYPH_HEIGHT_FRACTION) * 0.5),
+        height: LABEL_GLYPH_HEIGHT_FRACTION,
+        text,
+        color: [
+            f32::from(rgb[0]) / 255.0,
+            f32::from(rgb[1]) / 255.0,
+            f32::from(rgb[2]) / 255.0,
+            1.0,
+        ],
+        align: TextAlign::Left,
+        max_width: None,
+    }];
+    Some((
+        UnderlayRect {
+            x,
+            y: f32::from(row) * cell_height,
+            width,
+            height: cell_height,
+        },
+        ops,
+    ))
+}
+
+/// The world pose (translation, rotation) for a marker at `cursor`:
+/// screen-space above the terminal in the flat view (the RGP depth
+/// neighborhood), pinned to the warped surface through
+/// [`plane_surface_point`] in the 3D modes. `None` when the 3D plane is
+/// missing (the sync hides the marker, the RGP posture).
+#[allow(clippy::too_many_arguments)]
+fn marker_pose(
+    cursor: (u16, u16),
+    cols: u16,
+    rows: u16,
+    viewport: &TerminalViewport,
+    mode: TerminalPresentationMode,
+    plane_transform: Option<&Transform>,
+    warp_amount: f32,
+    elapsed_secs: f32,
+    mobius_progress: f32,
+) -> Option<(Vec3, Quat)> {
+    let (col, row) = clamped_cell(cursor.0, cursor.1, cols, rows);
+    let cols_f = f32::from(cols.max(1));
+    let rows_f = f32::from(rows.max(1));
+    let center_col = f32::from(col) + 0.5;
+    let center_row = f32::from(row) + 0.5;
+    match mode {
+        TerminalPresentationMode::Flat2d => Some((
+            Vec3::new(
+                viewport.center.x - viewport.size.x * 0.5 + center_col * (viewport.size.x / cols_f),
+                viewport.center.y + viewport.size.y * 0.5 - center_row * (viewport.size.y / rows_f),
+                CURSOR_DEPTH,
+            ),
+            Quat::IDENTITY,
+        )),
+        TerminalPresentationMode::Plane3d | TerminalPresentationMode::Mobius3d => {
+            let plane_transform = plane_transform?;
+            let local = plane_surface_point(
+                mode,
+                center_col / cols_f - 0.5,
+                0.5 - center_row / rows_f,
+                warp_amount,
+                elapsed_secs,
+                MARKER_PLANE_OFFSET,
+                mobius_progress,
+            );
+            Some((
+                plane_transform.transform_point(local),
+                plane_transform.rotation,
+            ))
+        }
+    }
+}
+
+/// The material a caret marker renders with: unlit, so the participant
+/// color reads exactly as sent regardless of scene lighting.
+fn marker_material(rgb: [u8; 3]) -> StandardMaterial {
+    StandardMaterial {
+        base_color: Color::srgb_u8(rgb[0], rgb[1], rgb[2]),
+        unlit: true,
+        cull_mode: None,
+        ..default()
+    }
+}
+
+/// Query type for the live markers (`Without<TerminalPlane>` keeps the
+/// mutable `Transform` access provably disjoint from the plane read).
+type PresenceMarkerQuery<'w, 's> = Query<
+    'w,
+    's,
+    (
+        Entity,
+        &'static mut PresenceCursorMarker,
+        &'static mut Transform,
+        &'static mut Visibility,
+        &'static MeshMaterial3d<StandardMaterial>,
+    ),
+    Without<TerminalPlane>,
+>;
+
+/// Parameters for [`sync_presence_cursor_markers`].
+#[derive(SystemParam)]
+pub(crate) struct PresenceMarkerParams<'w, 's> {
+    commands: Commands<'w, 's>,
+    time: Res<'w, Time>,
+    registry: Res<'w, PresenceRegistry>,
+    terminal: Res<'w, TerminalSurface>,
+    viewport: Res<'w, TerminalViewport>,
+    presentation: Res<'w, TerminalPresentation>,
+    mobius_transition: Res<'w, MobiusTransition>,
+    plane_warp: Res<'w, TerminalPlaneWarp>,
+    plane_query: Query<'w, 's, &'static Transform, With<TerminalPlane>>,
+    markers: PresenceMarkerQuery<'w, 's>,
+    meshes: ResMut<'w, Assets<Mesh>>,
+    materials: ResMut<'w, Assets<StandardMaterial>>,
+    /// The unit-cube mesh every caret shares, created on first need.
+    marker_mesh: Local<'s, Option<Handle<Mesh>>>,
+}
+
+/// Synchronizes the cursor caret markers with the participant roster:
+/// spawn on first sight, despawn on expiry / leave / cursor loss (a
+/// join-replace clears the cursor), and pose every survivor at its
+/// clamped cell through the active presentation projection each frame
+/// (the warped surface animates, so poses are per-frame like RGP; the
+/// writes go through `set_if_neq` so change detection only fires on
+/// actual movement). Materials are only touched when the participant's
+/// color actually changed.
+pub(crate) fn sync_presence_cursor_markers(mut params: PresenceMarkerParams) {
+    let PresenceMarkerParams {
+        commands,
+        time,
+        registry,
+        terminal,
+        viewport,
+        presentation,
+        mobius_transition,
+        plane_warp,
+        plane_query,
+        markers,
+        meshes,
+        materials,
+        marker_mesh,
+    } = &mut params;
+    let now = time.elapsed();
+    let elapsed_secs = time.elapsed_secs();
+    let cols = terminal.cols;
+    let rows = terminal.rows;
+    let cell_width = viewport.size.x / f32::from(cols.max(1));
+    let cell_height = viewport.size.y / f32::from(rows.max(1));
+    let scale = Vec3::new(
+        cell_width * MARKER_WIDTH_FRACTION,
+        cell_height * MARKER_HEIGHT_FRACTION,
+        cell_width * MARKER_WIDTH_FRACTION,
+    );
+    let mobius_progress = active_mobius_progress(presentation.mode, mobius_transition);
+    let plane_transform = plane_query.single().ok();
+
+    // The desired marker set: fresh participants with a reported cursor.
+    // A Vec + linear claim keeps this allocation-light — the roster is
+    // 16-capped per namespace and this runs every presence-active frame.
+    let mut desired: Vec<LabeledParticipant<'_>> = registry
+        .participants
+        .iter()
+        .filter_map(|((namespace, id), record)| {
+            let cursor = record.cursor?;
+            record
+                .fresh(now)
+                .then_some(((*namespace, id.as_str()), record, cursor))
+        })
+        .collect();
+
+    for (entity, mut marker, mut transform, mut visibility, material_handle) in markers.iter_mut() {
+        let claimed = desired
+            .iter()
+            .position(|((namespace, id), _, _)| *namespace == marker.namespace && *id == marker.id)
+            .map(|index| desired.swap_remove(index));
+        let Some((_, record, cursor)) = claimed else {
+            commands.entity(entity).despawn();
+            continue;
+        };
+        match marker_pose(
+            cursor,
+            cols,
+            rows,
+            viewport,
+            presentation.mode,
+            plane_transform,
+            plane_warp.amount,
+            elapsed_secs,
+            mobius_progress,
+        ) {
+            Some((translation, rotation)) => {
+                transform.set_if_neq(Transform {
+                    translation,
+                    rotation,
+                    scale,
+                });
+                visibility.set_if_neq(Visibility::Visible);
+            }
+            None => {
+                visibility.set_if_neq(Visibility::Hidden);
+            }
+        }
+        if let Some(rgb) = hex_rgb(&record.color)
+            && marker.color != rgb
+        {
+            if let Some(mut material) = materials.get_mut(&material_handle.0) {
+                material.base_color = Color::srgb_u8(rgb[0], rgb[1], rgb[2]);
+            }
+            marker.color = rgb;
+        }
+    }
+
+    // Spawn the newcomers, key-sorted so entity order is deterministic
+    // (the claim pass swap-removes, which shuffles the survivors).
+    desired.sort_by(|a, b| a.0.cmp(&b.0));
+    for ((namespace, id), record, cursor) in desired {
+        let Some(rgb) = hex_rgb(&record.color) else {
+            continue; // Unreachable: colors are validated at apply.
+        };
+        let mesh = marker_mesh
+            .get_or_insert_with(|| meshes.add(Cuboid::new(1.0, 1.0, 1.0)))
+            .clone();
+        let (transform, visibility) = match marker_pose(
+            cursor,
+            cols,
+            rows,
+            viewport,
+            presentation.mode,
+            plane_transform,
+            plane_warp.amount,
+            elapsed_secs,
+            mobius_progress,
+        ) {
+            Some((translation, rotation)) => (
+                Transform {
+                    translation,
+                    rotation,
+                    scale,
+                },
+                Visibility::Visible,
+            ),
+            None => (Transform::default(), Visibility::Hidden),
+        };
+        commands.spawn((
+            PresenceCursorMarker {
+                namespace,
+                id: id.to_string(),
+                color: rgb,
+            },
+            Mesh3d(mesh),
+            MeshMaterial3d(materials.add(marker_material(rgb))),
+            transform,
+            visibility,
+        ));
+    }
+}
+
+/// The texture-facing state stamp: the mutation sequence plus the count
+/// of fresh in-texture rows (note panels and labeled cursors). Between
+/// two equal sequences freshness can only decay, so an equal stamp
+/// proves the drawn texture is still exact — no per-row set tracking
+/// needed.
+fn presence_texture_stamp(registry: &PresenceRegistry, now: Duration) -> (u64, usize) {
+    let fresh_notes = registry
+        .notes
+        .values()
+        .filter(|record| record.fresh(now))
+        .count();
+    let fresh_labels = registry
+        .participants
+        .values()
+        .filter(|record| record.cursor.is_some() && record.fresh(now))
+        .count();
+    (registry.mutation_seq, fresh_notes + fresh_labels)
+}
+
+/// Requests a terminal redraw whenever the presence underlays would
+/// change: on every registry mutation and — crucially — on every
+/// fresh→expired flip, so an expired note or label disappears from an
+/// otherwise idle terminal (#21's visible expiry, applied to pixels).
+pub(crate) fn request_presence_expiry_redraw(
+    time: Res<Time>,
+    registry: Res<PresenceRegistry>,
+    mut redraw: ResMut<TerminalRedrawState>,
+    mut drawn_stamp: Local<Option<(u64, usize)>>,
+) {
+    let stamp = presence_texture_stamp(&registry, time.elapsed());
+    if *drawn_stamp == Some(stamp) {
+        return;
+    }
+    *drawn_stamp = Some(stamp);
+    redraw.request();
+}
+
+/// Registers the presence registry, its applier, and the render side.
 ///
 /// Ordering: `apply_presence_commands` runs after `pump_pty_output` (it
-/// owns the `user.*`/`note` acks); the render systems land in the next
-/// slice ordered after the applier. `answer_queries` is ordered after
-/// the applier in [`crate::ai::RattyAiPlugin`] so a same-chunk "join
-/// then read" observes the join.
+/// owns the `user.*`/`note` acks). The marker sync runs after the
+/// applier and after `handle_window_resize` (it positions against the
+/// live viewport), gated on there being anything to sync or clean up.
+/// The expiry-redraw coupling runs between the applier and the redraw
+/// pipeline so a request lands in the same frame's texture pass, gated
+/// on a non-empty registry (an emptying `user.leave`/`reset` already
+/// requests its redraw on the mutation path). `answer_queries` is
+/// ordered after the applier in [`crate::ai::RattyAiPlugin`] so a
+/// same-chunk "join then read" observes the join.
 pub struct PresencePlugin;
 
 impl Plugin for PresencePlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<PresenceRegistry>().add_systems(
-            Update,
-            apply_presence_commands.after(crate::systems::pump_pty_output),
-        );
+        app.init_resource::<PresenceRegistry>()
+            .add_systems(
+                Update,
+                apply_presence_commands.after(crate::systems::pump_pty_output),
+            )
+            .add_systems(
+                Update,
+                sync_presence_cursor_markers
+                    .after(apply_presence_commands)
+                    .after(crate::systems::handle_window_resize)
+                    .run_if(
+                        |registry: Res<PresenceRegistry>,
+                         markers: Query<(), With<PresenceCursorMarker>>| {
+                            !registry.is_empty() || !markers.is_empty()
+                        },
+                    ),
+            )
+            .add_systems(
+                Update,
+                request_presence_expiry_redraw
+                    .after(apply_presence_commands)
+                    .before(crate::systems::TerminalRedrawSet)
+                    .run_if(|registry: Res<PresenceRegistry>| !registry.is_empty()),
+            );
     }
 }
 
@@ -1128,6 +1677,238 @@ mod tests {
         assert!(counts.is_empty(), "all-expired namespaces vanish");
     }
 
+    // ── Rendering: pure geometry over the registry ──
+
+    #[test]
+    fn note_and_label_underlays_pin_their_pixel_geometry() {
+        let mut registry = PresenceRegistry::default();
+        registry
+            .set_note(0, "n1", "HI", 2, 3, None, false, t(0.0))
+            .expect("registry op ok");
+        registry
+            .join(0, "alice", "AL", "#00ff00", None, false, t(0.0))
+            .expect("registry op ok");
+        registry
+            .set_cursor(0, "alice", 5, 2, t(0.0))
+            .expect("registry op ok");
+        let underlays = presence_underlays(&registry, t(0.0), 80, 24, 10.0, 20.0);
+        assert_eq!(underlays.len(), 2, "one note panel, one name label");
+
+        // The note panel anchors at its cell, one cell tall, sized by
+        // the stroke-font advance: fill, closed border, then the text.
+        let (rect, ops) = &underlays[0];
+        let glyph_height = 20.0 * NOTE_GLYPH_HEIGHT_FRACTION;
+        let expected_width =
+            glyph_height * NOTE_PAD_FRACTION * 2.0 + glyph_height * GLYPH_ASPECT * 2.0;
+        assert!((rect.x - 20.0).abs() < 1e-4);
+        assert!((rect.y - 60.0).abs() < 1e-4);
+        assert!((rect.height - 20.0).abs() < 1e-4);
+        assert!((rect.width - expected_width).abs() < 1e-3);
+        assert_eq!(ops.len(), 3);
+        assert!(matches!(ops[0], VizDrawOp::Fill { .. }));
+        assert!(
+            matches!(&ops[1], VizDrawOp::Polyline { points, .. } if points.first() == points.last()),
+            "the border strokes a closed loop"
+        );
+        assert!(matches!(&ops[2], VizDrawOp::Text { text, .. } if text == "HI"));
+
+        // The label sits one cell right of the cursor cell (plus the
+        // gap), on the cursor row, in the participant's color.
+        let (rect, ops) = &underlays[1];
+        assert!((rect.x - (60.0 + 10.0 * LABEL_GAP_FRACTION)).abs() < 1e-3);
+        assert!((rect.y - 40.0).abs() < 1e-4);
+        match &ops[0] {
+            VizDrawOp::Text { text, color, .. } => {
+                assert_eq!(text, "AL");
+                assert!(color[0].abs() < 1e-6 && (color[1] - 1.0).abs() < 1e-6);
+            }
+            other => panic!("expected a text op, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn out_of_grid_cells_clamp_to_the_edge_at_render() {
+        assert_eq!(clamped_cell(1000, 1000, 80, 24), (79, 23));
+        assert_eq!(clamped_cell(0, 0, 80, 24), (0, 0));
+        // Degenerate grids never underflow.
+        assert_eq!(clamped_cell(5, 5, 0, 0), (0, 0));
+
+        let mut registry = PresenceRegistry::default();
+        registry
+            .set_note(0, "n1", "A-LONG-NOTE-BODY", 1000, 1000, None, false, t(0.0))
+            .expect("registry op ok");
+        registry
+            .join(
+                0,
+                "alice",
+                "SIXTEEN-GLYPH-NAME!",
+                "#00ff00",
+                None,
+                false,
+                t(0.0),
+            )
+            .expect("registry op ok");
+        registry
+            .set_cursor(0, "alice", 79, 0, t(0.0))
+            .expect("registry op ok");
+        let underlays = presence_underlays(&registry, t(0.0), 80, 24, 10.0, 20.0);
+        // The note clamps to the bottom-right cell and its panel
+        // truncates at the grid's right edge instead of overflowing.
+        let (rect, _) = &underlays[0];
+        assert!((rect.x - 790.0).abs() < 1e-3);
+        assert!((rect.y - 460.0).abs() < 1e-3);
+        assert!(
+            (rect.width - 10.0).abs() < 1e-3,
+            "the panel clamps to the remaining grid width"
+        );
+        // The label caps at 16 glyphs and shifts left so it stays on
+        // the texture despite the right-edge cursor.
+        let (rect, ops) = &underlays[1];
+        let glyph_height = 20.0 * LABEL_GLYPH_HEIGHT_FRACTION;
+        let expected_width = glyph_height * GLYPH_ASPECT * 16.0;
+        assert!((rect.width - expected_width).abs() < 1e-3);
+        assert!((rect.x - (800.0 - expected_width)).abs() < 1e-3);
+        match &ops[0] {
+            VizDrawOp::Text { text, .. } => assert_eq!(text, "SIXTEEN-GLYPH-NA"),
+            other => panic!("expected a text op, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn only_fresh_rows_render_and_notes_precede_labels_deterministically() {
+        let mut registry = PresenceRegistry::default();
+        registry
+            .set_note(1, "b", "B", 0, 0, Some(100.0), false, t(0.0))
+            .expect("registry op ok");
+        registry
+            .set_note(0, "z", "Z", 0, 0, Some(100.0), false, t(0.0))
+            .expect("registry op ok");
+        registry
+            .set_note(0, "gone", "GONE", 0, 0, Some(1.0), false, t(0.0))
+            .expect("registry op ok");
+        // Fresh but cursor-less: queryable state, no pixels.
+        registry
+            .join(0, "idle", "IDLE", "#0000ff", Some(100.0), false, t(0.0))
+            .expect("registry op ok");
+        // Expired with a cursor: no pixels either.
+        registry
+            .join(0, "stale", "STALE", "#0000ff", Some(1.0), false, t(0.0))
+            .expect("registry op ok");
+        registry
+            .set_cursor(0, "stale", 1, 1, t(0.0))
+            .expect("registry op ok");
+        registry
+            .join(1, "a", "A", "#ff0000", Some(100.0), false, t(0.0))
+            .expect("registry op ok");
+        registry
+            .set_cursor(1, "a", 2, 2, t(0.0))
+            .expect("registry op ok");
+        registry
+            .join(0, "m", "M", "#00ff00", Some(100.0), false, t(0.0))
+            .expect("registry op ok");
+        registry
+            .set_cursor(0, "m", 3, 3, t(0.0))
+            .expect("registry op ok");
+        let texts: Vec<String> = presence_underlays(&registry, t(50.0), 80, 24, 10.0, 20.0)
+            .iter()
+            .filter_map(|(_, ops)| {
+                ops.iter().find_map(|op| match op {
+                    VizDrawOp::Text { text, .. } => Some(text.clone()),
+                    _ => None,
+                })
+            })
+            .collect();
+        // Note panels first ((ns, id)-sorted), then labels ((ns,
+        // id)-sorted); the expired note, the expired cursor, and the
+        // cursor-less participant render nothing.
+        assert_eq!(texts, vec!["Z", "B", "M", "A"]);
+    }
+
+    #[test]
+    fn strict_hex_colors_parse_to_channels() {
+        assert_eq!(hex_rgb("#00ff00"), Some([0, 255, 0]));
+        assert_eq!(hex_rgb("#AbCdEf"), Some([0xab, 0xcd, 0xef]));
+        assert_eq!(hex_rgb("00ff00"), None);
+        assert_eq!(hex_rgb("#00ff0"), None);
+        assert_eq!(hex_rgb("#00gg00"), None);
+    }
+
+    #[test]
+    fn marker_poses_track_the_cell_center_in_every_projection() {
+        let viewport = TerminalViewport {
+            size: Vec2::new(800.0, 480.0),
+            center: Vec2::ZERO,
+        };
+        // Flat view: cell (0, 0) centers half a cell in from the
+        // top-left corner, at the cursor depth.
+        let (translation, rotation) = marker_pose(
+            (0, 0),
+            80,
+            24,
+            &viewport,
+            TerminalPresentationMode::Flat2d,
+            None,
+            0.0,
+            0.0,
+            0.0,
+        )
+        .expect("flat pose");
+        assert!((translation.x - -395.0).abs() < 1e-3);
+        assert!((translation.y - 230.0).abs() < 1e-3);
+        assert!((translation.z - CURSOR_DEPTH).abs() < 1e-6);
+        assert_eq!(rotation, Quat::IDENTITY);
+        // Out-of-grid cursors clamp to the far edge cell.
+        let (translation, _) = marker_pose(
+            (1000, 1000),
+            80,
+            24,
+            &viewport,
+            TerminalPresentationMode::Flat2d,
+            None,
+            0.0,
+            0.0,
+            0.0,
+        )
+        .expect("flat pose");
+        assert!((translation.x - 395.0).abs() < 1e-3);
+        assert!((translation.y - -230.0).abs() < 1e-3);
+        // The 3D modes need the plane; without one there is no pose
+        // (the sync hides the marker instead).
+        assert!(
+            marker_pose(
+                (0, 0),
+                80,
+                24,
+                &viewport,
+                TerminalPresentationMode::Plane3d,
+                None,
+                0.0,
+                0.0,
+                0.0,
+            )
+            .is_none()
+        );
+        // Through an identity plane at zero warp the marker floats
+        // exactly the plane offset above the surface point.
+        let plane = Transform::IDENTITY;
+        let (translation, rotation) = marker_pose(
+            (0, 0),
+            80,
+            24,
+            &viewport,
+            TerminalPresentationMode::Plane3d,
+            Some(&plane),
+            0.0,
+            0.0,
+            0.0,
+        )
+        .expect("3d pose");
+        assert!((translation.x - -0.49375).abs() < 1e-5);
+        assert!((translation.y - 0.479_166_7).abs() < 1e-4);
+        assert!((translation.z - MARKER_PLANE_OFFSET).abs() < 1e-5);
+        assert_eq!(rotation, Quat::IDENTITY);
+    }
+
     // ── App tier: the applier over the message stream ──
 
     fn app_test() -> App {
@@ -1284,5 +2065,43 @@ mod tests {
             "reset's single ack belongs to apply_ai_commands"
         );
         assert!(app.world().resource::<PresenceRegistry>().is_empty());
+    }
+
+    #[test]
+    fn expiry_flips_redraw_an_otherwise_idle_terminal() {
+        let mut app = App::new();
+        app.init_resource::<PresenceRegistry>();
+        app.init_resource::<TerminalRedrawState>();
+        app.init_resource::<Time>();
+        app.add_systems(Update, request_presence_expiry_redraw);
+        app.world_mut()
+            .resource_mut::<PresenceRegistry>()
+            .set_note(0, "n1", "REVIEW", 2, 3, Some(1.0), false, Duration::ZERO)
+            .expect("registry op ok");
+        // Clear the boot-time pending redraw so requests are observable.
+        let _ = app.world_mut().resource_mut::<TerminalRedrawState>().take();
+        app.update();
+        assert!(
+            app.world_mut().resource_mut::<TerminalRedrawState>().take(),
+            "a fresh note is a texture change"
+        );
+        app.update();
+        assert!(
+            !app.world_mut().resource_mut::<TerminalRedrawState>().take(),
+            "an unchanged fresh roster requests nothing"
+        );
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(Duration::from_secs(2));
+        app.update();
+        assert!(
+            app.world_mut().resource_mut::<TerminalRedrawState>().take(),
+            "the fresh→expired flip redraws the idle terminal"
+        );
+        app.update();
+        assert!(
+            !app.world_mut().resource_mut::<TerminalRedrawState>().take(),
+            "expiry redraws once, not every frame"
+        );
     }
 }

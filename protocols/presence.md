@@ -175,12 +175,17 @@ query subcommands — `state.presence` rides the generic query surface.
 
 Fresh rows render; expired rows do not (that is the visible expiry on
 the scene — the row itself stays queryable). Cursor markers are small
-colored 3D markers in the main scene, live in all three presentation
-modes, with the participant's name label beside the cell in the
-participant's color; notes draw as subtle filled rectangles with a
-participant-colored border and their text, in-texture, warping with the
-plane. Out-of-grid cells clamp to the nearest edge cell at render; the
-stored value is untouched.
+unlit caret meshes in the main scene, live in all three presentation
+modes (screen-space in the flat view, pinned to the warped surface
+through the RGP projection in 3D), with the participant's name label
+beside the cell in the participant's color; notes draw as subtle filled
+rectangles with an accent border and their text, in-texture, warping
+with the plane. The wire carries no color on `note`, so the border is
+the fixed presence accent, never per-participant. Out-of-grid cells
+clamp to the nearest edge cell at render; the stored value is
+untouched. Every roster mutation *and* every fresh→expired flip
+requests a terminal redraw, so an expiring note disappears from an
+otherwise idle terminal.
 
 ## wasm
 
@@ -195,6 +200,9 @@ the read side is the same query channel. Honest limitations:
 - Name labels and note text render through the vello stroke font:
   uppercase letters, digits, and limited punctuation — other glyphs draw
   as hollow boxes. The full text stays queryable regardless.
+- Notes render one line anchored at their cell, truncated at the grid's
+  right edge; labels cap at 16 glyphs. A participant without a reported
+  cursor renders nothing (marker and label hang off the cursor cell).
 - A plain PTY is one effective principal: every local writer shares
   namespace 0. Distinct ids under one namespace are honestly labeled
   distinct *participants*, not authenticated identities — authentication
