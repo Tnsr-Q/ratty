@@ -124,6 +124,14 @@ additionally get their error ack.
     cursor:{x,y}|null, fresh, age_secs, ttl_secs, revision}`
   - note: `{kind:"note", ns, id, text, x, y, fresh, age_secs, ttl_secs,
     revision}`
+
+  Resumed cursors are monotone-by-key, not snapshot-stable (the
+  [query protocol](query.md) contract): a roster that mutates between
+  page fetches — including a foreign row expiring, which removes it
+  from the visible set — can shift later rows across the cursor
+  boundary and omit them from the walk. Rosters small enough for one
+  page (the common case) are unaffected; re-query from the start for a
+  consistent snapshot.
 - **`state.namespaces`** (append-only extension): each namespace row
   gains `participants` and `notes` — **fresh counts only**, and a
   namespace with nothing public (no objects, nothing fresh) is absent

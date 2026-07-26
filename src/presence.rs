@@ -1727,6 +1727,47 @@ mod tests {
     }
 
     #[test]
+    fn unclamped_note_panels_never_truncate_their_text() {
+        // Regression for the f32 floor boundary: the panel is sized as
+        // pad*2 + advance*N, and recovering N from the max_width
+        // fraction lands a rounding hair below N at ~14% of realistic
+        // cell metrics (a one-glyph note rendered an empty panel at
+        // cell heights 14-40px). Sweep heights and glyph counts and
+        // assert the recovered count survives the round-trip whenever
+        // the grid does not clamp the panel.
+        let cols: u16 = 2000;
+        let cell_width = 10.0;
+        for half_px in 12..=128u16 {
+            let cell_height = f32::from(half_px) * 0.5;
+            let glyph_height = cell_height * NOTE_GLYPH_HEIGHT_FRACTION;
+            let advance = glyph_height * crate::viz_draw::GLYPH_ASPECT;
+            for glyphs in 1..=256usize {
+                let record = NoteRecord {
+                    text: "X".repeat(glyphs),
+                    x: 0,
+                    y: 0,
+                    updated: t(0.0),
+                    ttl: t(60.0),
+                    revision: 1,
+                };
+                let (rect, ops) = note_underlay(&record, cols, 24, cell_width, cell_height);
+                if rect.width >= f32::from(cols) * cell_width - 1e-3 {
+                    continue; // grid-edge clamp: truncation is the contract
+                }
+                let VizDrawOp::Text { max_width, .. } = &ops[2] else {
+                    panic!("expected the text op third");
+                };
+                let budget = max_width.expect("note text always carries a budget") * rect.width;
+                assert_eq!(
+                    crate::viz_draw::glyphs_that_fit(budget, advance),
+                    glyphs,
+                    "cell_height {cell_height} glyphs {glyphs}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn out_of_grid_cells_clamp_to_the_edge_at_render() {
         assert_eq!(clamped_cell(1000, 1000, 80, 24), (79, 23));
         assert_eq!(clamped_cell(0, 0, 80, 24), (0, 0));

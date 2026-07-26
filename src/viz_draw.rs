@@ -112,6 +112,13 @@ const GAUGE_CENTER_Y: f32 = 0.62;
 /// panels and name labels from the same advance.
 pub(crate) const GLYPH_ASPECT: f32 = 0.72;
 
+/// Slack added before flooring a width budget into a glyph count.
+/// Budgets that encode an exact glyph count survive the fraction
+/// round-trip through `UnderlayRect` with an f32 error a few orders of
+/// magnitude below this; one glyph is 1.0 in these units, so the slack
+/// can never admit a visibly overflowing glyph.
+const GLYPH_FIT_EPSILON: f32 = 1e-3;
+
 // ── Draw ops ──
 
 /// Horizontal anchoring for an underlay text op.
@@ -960,6 +967,15 @@ pub(crate) fn append_viz_underlay(scene: &mut Scene, rect: UnderlayRect, ops: &[
     }
 }
 
+/// How many stroke glyphs a pixel budget holds at the given advance.
+/// A caller whose budget encodes an exact glyph count (the presence
+/// note panel is sized as pad*2 + advance*N, #25) reaches the division
+/// as N minus an f32 rounding hair, and a bare floor would drop the
+/// final glyph; the epsilon absorbs that round-trip error.
+pub(crate) fn glyphs_that_fit(budget_px: f32, advance: f32) -> usize {
+    (budget_px / advance + GLYPH_FIT_EPSILON).floor().max(0.0) as usize
+}
+
 /// Strokes one text run into the scene. The glyph advance is computed in
 /// pixels (where the footprint aspect is known) and the run truncates to
 /// its width budget.
@@ -983,8 +999,7 @@ fn append_text(
     let budget_px = max_width.map(|fraction| fraction * rect.width);
     let mut characters: Vec<char> = text.chars().collect();
     if let Some(budget) = budget_px {
-        let fits = (budget / advance).floor().max(0.0) as usize;
-        characters.truncate(fits);
+        characters.truncate(glyphs_that_fit(budget, advance));
     }
     if characters.is_empty() {
         return;

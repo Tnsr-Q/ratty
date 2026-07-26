@@ -80,9 +80,9 @@ Every parsed control command falls into exactly one recording class:
 
 | Class | Members | Recorded? | Privilege |
 | --- | --- | --- | --- |
-| **Control-plane** | `macro.*`, the reactive `rule.*`/`sensor.*` families | never | — |
+| **Control-plane** | `macro.*`, the reactive `rule.*`/`sensor.*` families, the collaboration presence `user.*`/`note`/`note.remove` family (#25 — a replayed join would forge liveness; see [presence.md](presence.md)) | never | — |
 | **Scene-global** | `mode`, `warp`, `reset` | yes | marks the macro **privileged** |
-| **Choreography** | everything else (objects, cursor, viz, sound, effects, bookmarks, presence…) | yes | stays inside the caller's namespace |
+| **Choreography** | everything else (objects, cursor, viz, sound, effects, bookmarks…) | yes | stays inside the caller's namespace |
 
 A second classification, **rule-safe** (#21, computed at finalize beside
 *privileged*), marks a macro whose every step is in the reactive organ's
