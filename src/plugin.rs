@@ -39,6 +39,9 @@ pub struct TerminalPlugin;
 
 impl Plugin for TerminalPlugin {
     fn build(&self, app: &mut App) {
+        // Embedded glTF scenes ride Bevy's `embedded://` memory source on
+        // both targets; seed it before any Startup system can load one.
+        crate::model::seed_embedded_scene_assets(app.world_mut());
         app.init_resource::<TerminalSelection>()
             .init_resource::<crate::model::CursorSettings>()
             .init_resource::<TerminalInlineObjects>()
@@ -170,6 +173,7 @@ impl Plugin for TerminalPlugin {
             )
             .add_systems(Last, shutdown_terminal_runtime_on_exit)
             .add_plugins(crate::ai::RattyAiPlugin)
+            .add_plugins(crate::avatar::AvatarPlugin)
             .add_plugins(crate::bookmarks::BookmarksPlugin)
             .add_plugins(crate::macros::MacrosPlugin)
             .add_plugins(crate::reactive::ReactivePlugin)

@@ -51,6 +51,8 @@ pub struct AppConfig {
     pub audio: AudioConfig,
     /// Reactive organ settings.
     pub reactive: ReactiveConfig,
+    /// Scene-level capability grants (#23): the trusted tier.
+    pub trust: TrustConfig,
 }
 
 impl AppConfig {
@@ -434,7 +436,8 @@ impl ThemePaletteConfig {
 ///
 /// Master gain and mute are config-only — no wire command can write them;
 /// the wire supplies only registry-clamped per-play gains. The scene-ambient
-/// capability is likewise granted here (trusted config), never in-band.
+/// capability is likewise granted here (trusted config), never in-band; its
+/// canonical read path is [`crate::capability::SceneCapability::SceneAmbient`].
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct AudioConfig {
@@ -516,6 +519,42 @@ pub struct TrustedRuleConfig {
     /// The allowlisted action, in wire grammar (e.g.
     /// `flash;color=%23ff0000&duration=0.4`).
     pub action: String,
+}
+
+/// Scene-level capability grants: the trusted tier of #23.
+///
+/// Everything here is config-only — no wire command can write it, and
+/// there is no hot reload, so grants are fixed for the process lifetime.
+/// Keyed by ingress principal: `[trust.local]` is the only principal that
+/// exists today (see [`crate::runtime::IngressSource`]); authenticated
+/// transports get their own tables when they land, out-of-band. The
+/// canonical read path is [`crate::capability::SceneCapability`].
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct TrustConfig {
+    /// Grants for the local ingress principal: the spawned PTY on native
+    /// builds, the embedding page's virtual channel on wasm.
+    pub local: LocalTrustConfig,
+}
+
+/// Scene-capability grants for [`crate::runtime::IngressSource::Local`].
+///
+/// One PTY is one principal: a grant here reaches every process writing
+/// the terminal — ratty cannot split it finer, and does not pretend to.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct LocalTrustConfig {
+    /// Grants avatar scene control (`avatar.set`/`show`/`hide`, clearing
+    /// other agents' speech, cancelling the speech queue). Default true:
+    /// a single-tenant session directs its own scene, mirroring
+    /// `[audio] allow_scene_ambient`; multi-writer operators revoke it.
+    pub avatar_scene: bool,
+}
+
+impl Default for LocalTrustConfig {
+    fn default() -> Self {
+        Self { avatar_scene: true }
+    }
 }
 
 /// Cursor configuration.

@@ -162,7 +162,9 @@ impl Plugin for RattyAiPlugin {
                     .after(crate::bookmarks::apply_bookmark_commands)
                     .after(crate::macros::apply_macro_commands)
                     .after(crate::reactive::apply_reactive_commands)
-                    .after(crate::reactive::evaluate_rules),
+                    .after(crate::reactive::evaluate_rules)
+                    .after(crate::avatar::drive_avatar_speech)
+                    .after(crate::avatar::apply_avatar_commands),
             );
     }
 }
@@ -286,6 +288,17 @@ pub fn apply_ai_commands(
             | RattyAiCommand::RuleDisable { .. }
             | RattyAiCommand::SensorPublish { .. }
             | RattyAiCommand::SensorRemove { .. } => {}
+            // The avatar organ (crate::avatar::apply_avatar_commands) reads
+            // the same AiCommand messages independently and owns the
+            // avatar.* acks, so this catch-all must never double-ack them.
+            RattyAiCommand::AvatarSet { .. }
+            | RattyAiCommand::AvatarShow
+            | RattyAiCommand::AvatarGesture { .. }
+            | RattyAiCommand::AvatarSpeak { .. }
+            | RattyAiCommand::AvatarStopSpeaking
+            | RattyAiCommand::AvatarCancel { .. }
+            | RattyAiCommand::AvatarSpeechClear { .. }
+            | RattyAiCommand::AvatarHide => {}
             other => {
                 debug!("ratty-ai: command received, handler not yet built: {other:?}");
                 reject(

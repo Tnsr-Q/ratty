@@ -469,7 +469,15 @@ pub(crate) struct SyncMaterialsParams<'w, 's> {
     plane_back_materials:
         Query<'w, 's, &'static MeshMaterial3d<StandardMaterial>, With<TerminalPlaneBack>>,
     present_materials: ResMut<'w, Assets<TerminalPresentMaterial>>,
-    present_query: Query<'w, 's, &'static MeshMaterial2d<TerminalPresentMaterial>>,
+    // `With<TerminalSprite>`: the avatar overlay quad carries the same
+    // material type but its own texture — rebinding it to the terminal
+    // image here would clobber the bubble.
+    present_query: Query<
+        'w,
+        's,
+        &'static MeshMaterial2d<TerminalPresentMaterial>,
+        With<crate::scene::TerminalSprite>,
+    >,
     frame_dirty: Res<'w, TerminalFrameDirty>,
 }
 

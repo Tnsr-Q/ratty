@@ -74,7 +74,10 @@ pub mod codes {
     pub const BAD_CURSOR: &str = "bad-cursor";
     /// The target id lies outside the caller's namespace.
     pub const NOT_OWNER: &str = "not-owner";
-    /// No live object exists under the target id.
+    /// No live object exists under the target id — including an execution
+    /// handle that names nothing live (finished, cancelled, or minted by a
+    /// previous session; handles are live-state references, never
+    /// tombstoned).
     pub const UNKNOWN_ID: &str = "unknown-id";
     /// The object exists but scrolled away and has no anchor.
     pub const NO_ANCHOR: &str = "no-anchor";
@@ -117,8 +120,10 @@ pub mod codes {
     pub const DISPOSED: &str = "disposed";
     /// An internal invariant failed while answering.
     pub const INTERNAL: &str = "internal";
-    /// The caller's macro slot is occupied: an agent may have at most one
-    /// active recording *or* playback at a time (#16 per-agent single slot).
+    /// A bounded execution resource the caller asked for is occupied: the
+    /// caller's macro slot (an agent may have at most one active recording
+    /// *or* playback at a time, #16 per-agent single slot), or the avatar
+    /// speech queue at its global pending cap (#23 fair queue).
     pub const BUSY: &str = "busy";
     /// A macro-control command asked the terminal to read or write a native
     /// filesystem path (`macro.export;to=`, `macro.run;path=`). The wire
@@ -127,12 +132,35 @@ pub mod codes {
     /// A privileged macro (one containing scene-global commands) could not
     /// play because the exclusive scene lock is held (#16 privileged macros).
     pub const SCENE_LOCKED: &str = "scene-locked";
-    /// `macro.stop` arrived with no active recording or playback to finalize.
+    /// A stop-style command (`macro.stop`, `avatar.stop`) arrived with
+    /// nothing of the caller's live to finalize or cancel — or a command
+    /// that needs a live target arrived with none (`avatar.speak`/
+    /// `avatar.gesture` while the avatar is hidden).
     pub const NOTHING_ACTIVE: &str = "nothing-active";
     /// A `sensor.publish` carried a sequence number at or below the
     /// sensor's current one; out-of-order samples are rejected rather than
     /// silently reordering the sensor's history (#21 sample integrity).
     pub const STALE_SEQ: &str = "stale-seq";
+    /// Qualifier on an `ok=1` ack (#18 long-running): the operation began
+    /// executing immediately; the ack `data=` carries its execution handle.
+    /// There is no later notification — clients poll `state.executions`.
+    pub const STARTED: &str = "started";
+    /// Qualifier on an `ok=1` ack (#18 long-running): the operation was
+    /// admitted to a bounded queue; the ack `data=` carries its execution
+    /// handle, queue position, and estimated wait.
+    pub const QUEUED: &str = "queued";
+    /// The caller already has its maximum pending utterances queued
+    /// (#23 fair queue: at most one pending per agent).
+    pub const AGENT_QUEUE_FULL: &str = "agent-queue-full";
+    /// The utterance text exceeds the avatar text byte cap (#23).
+    pub const TEXT_TOO_LONG: &str = "text-too-long";
+    /// An avatar model id not in the curated registry (#23 §3; wire
+    /// commands reference immutable registry ids only, never paths).
+    pub const UNKNOWN_MODEL: &str = "unknown-model";
+    /// An avatar anchor name not in the nine-anchor vocabulary (#23 §3).
+    pub const UNKNOWN_ANCHOR: &str = "unknown-anchor";
+    /// An avatar gesture name not in the choreography vocabulary (#23 §1).
+    pub const UNKNOWN_GESTURE: &str = "unknown-gesture";
 }
 
 /// Returns whether `token` is a valid correlation token: 1 to
@@ -721,6 +749,22 @@ mod tests {
         assert!(!parsed.ok);
         assert_eq!(parsed.code.as_deref(), Some(codes::ALREADY_EXISTS));
         assert!(parsed.data.is_empty());
+    }
+
+    #[test]
+    fn long_running_ack_payload_round_trips() {
+        // #18: a started/queued ack carries the execution handle, queue
+        // position, and estimated wait in `data=` — the same reply grammar,
+        // exercised end to end at the byte level.
+        let payload = br#"{"eta_ms":9100,"id":"9f3a2c8b41e6d075-4","position":2}"#;
+        let reply = reply_sequence("s2", true, true, Some(codes::QUEUED), Some(payload));
+        let mut scanner = ReplyScanner::default();
+        scanner.push(&reply);
+        let parsed = parse_reply_body(&scanner.next_frame().expect("frame")).expect("parses");
+        assert!(parsed.ack);
+        assert!(parsed.ok);
+        assert_eq!(parsed.code.as_deref(), Some(codes::QUEUED));
+        assert_eq!(parsed.data, payload);
     }
 
     #[test]

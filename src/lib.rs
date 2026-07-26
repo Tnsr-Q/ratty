@@ -7,11 +7,14 @@
 #![warn(clippy::unwrap_used)]
 
 pub mod ai;
+pub mod avatar;
 pub mod bookmarks;
+pub mod capability;
 pub mod cli;
 pub mod config;
 mod direct_render;
 pub mod effects;
+mod fonts;
 pub mod inline;
 pub mod keyboard;
 pub mod kitty;

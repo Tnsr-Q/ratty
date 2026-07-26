@@ -26,22 +26,34 @@ pub(crate) struct DirectTerminalRenderPlugin;
 impl Plugin for DirectTerminalRenderPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<DirectTerminalSceneExchange>();
+        app.init_resource::<AvatarOverlayExchange>();
         let exchange = app
             .world()
             .resource::<DirectTerminalSceneExchange>()
             .clone();
+        let avatar_exchange = app.world().resource::<AvatarOverlayExchange>().clone();
 
         let render_app = app.sub_app_mut(RenderApp);
         render_app.init_resource::<DirectTerminalRenderState>();
         render_app.world_mut().insert_resource(exchange);
+        render_app.world_mut().insert_resource(avatar_exchange);
         render_app.init_resource::<ExtractedDirectTerminalFrame>();
-        render_app.add_systems(ExtractSchedule, extract_terminal_frame);
+        render_app.init_resource::<ExtractedAvatarOverlayFrame>();
+        render_app.add_systems(
+            ExtractSchedule,
+            (extract_terminal_frame, extract_avatar_overlay_frame),
+        );
         // Render inside the render-graph schedule so Vello's submission is
         // ordered with the frame's GPU work: `Begin` runs before the camera
-        // passes that sample the terminal texture.
+        // passes that sample the terminal texture. The avatar overlay
+        // shares the one GpuRenderer; two sequential submissions per frame.
         render_app.add_systems(
             RenderGraph,
-            render_terminal_frame.in_set(RenderGraphSystems::Begin),
+            (
+                render_terminal_frame,
+                render_avatar_overlay_frame.after(render_terminal_frame),
+            )
+                .in_set(RenderGraphSystems::Begin),
         );
     }
 }
@@ -341,6 +353,173 @@ fn render_terminal_frame(
     // textures are `Rgba8Unorm`, so this is a plain same-format texel copy.
     let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor {
         label: Some("terminal present copy"),
+    });
+    encoder.copy_texture_to_texture(
+        render_image.texture.as_image_copy(),
+        present_image.texture.as_image_copy(),
+        Extent3d {
+            width: current.width,
+            height: current.height,
+            depth_or_array_layers: 1,
+        },
+    );
+    render_queue.submit([encoder.finish()]);
+
+    exchange.recycle_scene(current.scene);
+}
+
+// ── Avatar overlay (#23): a second vello scene, screen-space ──
+//
+// The bubble/typewriter overlay renders through the exact terminal
+// pipeline shape — its own render/present texture pair, the same shared
+// GpuRenderer, the same retention-on-mismatch guard — but composites via
+// a screen-space quad on a dedicated overlay camera, so it can never
+// inherit the plane warp. The scene's base color is always TRANSPARENT.
+
+/// One published avatar overlay frame.
+pub(crate) struct AvatarOverlayFrame {
+    /// Plain `Rgba8Unorm` storage texture Vello rasterizes into.
+    pub(crate) render_image: Handle<Image>,
+    /// The present texture the overlay quad samples (sRGB view).
+    pub(crate) present_image: Handle<Image>,
+    /// Frame extent, physical px.
+    pub(crate) width: u32,
+    /// Frame extent, physical px.
+    pub(crate) height: u32,
+    /// The overlay scene (bubble chrome, text, glow).
+    pub(crate) scene: Scene,
+}
+
+/// Shared bounded exchange between the main world and the render world,
+/// the [`DirectTerminalSceneExchange`] shape.
+#[derive(Resource, Clone, Default)]
+pub(crate) struct AvatarOverlayExchange {
+    inner: Arc<AvatarOverlayExchangeInner>,
+}
+
+#[derive(Default)]
+struct AvatarOverlayExchangeInner {
+    pending: Mutex<Option<AvatarOverlayFrame>>,
+    recycled: Mutex<Option<Scene>>,
+}
+
+impl AvatarOverlayExchange {
+    pub(crate) fn take_recycled_scene(&self) -> Scene {
+        self.inner
+            .recycled
+            .lock()
+            .expect("avatar overlay recycled scene lock")
+            .take()
+            .unwrap_or_default()
+    }
+
+    fn recycle_scene(&self, mut scene: Scene) {
+        scene.reset();
+        let mut recycled = self
+            .inner
+            .recycled
+            .lock()
+            .expect("avatar overlay recycled scene lock");
+        if recycled.is_none() {
+            *recycled = Some(scene);
+        }
+    }
+
+    pub(crate) fn publish_frame(&self, frame: AvatarOverlayFrame) {
+        let previous = self
+            .inner
+            .pending
+            .lock()
+            .expect("avatar overlay pending frame lock")
+            .replace(frame);
+        if let Some(previous) = previous {
+            self.recycle_scene(previous.scene);
+        }
+    }
+
+    fn take_pending_frame(&self) -> Option<AvatarOverlayFrame> {
+        self.inner
+            .pending
+            .lock()
+            .expect("avatar overlay pending frame lock")
+            .take()
+    }
+}
+
+#[derive(Resource, Default)]
+struct ExtractedAvatarOverlayFrame(Option<AvatarOverlayFrame>);
+
+fn extract_avatar_overlay_frame(
+    mut frame: ResMut<ExtractedAvatarOverlayFrame>,
+    exchange: Extract<Res<AvatarOverlayExchange>>,
+) {
+    if let Some(next_frame) = exchange.take_pending_frame()
+        && let Some(previous_frame) = frame.0.replace(next_frame)
+    {
+        exchange.recycle_scene(previous_frame.scene);
+    }
+}
+
+fn render_avatar_overlay_frame(
+    mut state: ResMut<DirectTerminalRenderState>,
+    exchange: Res<AvatarOverlayExchange>,
+    mut frame: ResMut<ExtractedAvatarOverlayFrame>,
+    gpu_images: Res<RenderAssets<GpuImage>>,
+    render_device: Res<RenderDevice>,
+    render_queue: Res<RenderQueue>,
+) {
+    let Some(current) = frame.0.take() else {
+        return;
+    };
+    let (Some(render_image), Some(present_image)) = (
+        gpu_images.get(&current.render_image),
+        gpu_images.get(&current.present_image),
+    ) else {
+        debug!("retaining avatar overlay frame: GPU image not yet prepared");
+        frame.0 = Some(current);
+        return;
+    };
+
+    let render_size = render_image.texture_descriptor.size;
+    let present_size = present_image.texture_descriptor.size;
+    if render_size.width != current.width
+        || render_size.height != current.height
+        || present_size.width != current.width
+        || present_size.height != current.height
+    {
+        debug!(
+            "retaining avatar overlay frame: render {}x{}, present {}x{}, frame {}x{}",
+            render_size.width,
+            render_size.height,
+            present_size.width,
+            present_size.height,
+            current.width,
+            current.height
+        );
+        frame.0 = Some(current);
+        return;
+    }
+
+    let device = render_device.wgpu_device();
+    let renderer = state
+        .renderer
+        .get()
+        .get_or_insert_with(|| GpuRenderer::new(device).expect("vello renderer"));
+
+    renderer
+        .render_scene_to_texture_view(
+            device,
+            &render_queue,
+            &render_image.texture_view,
+            current.width,
+            current.height,
+            PenikoColor::TRANSPARENT,
+            &current.scene,
+        )
+        .expect("render avatar overlay scene into Bevy texture");
+
+    let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor {
+        label: Some("avatar overlay present copy"),
     });
     encoder.copy_texture_to_texture(
         render_image.texture.as_image_copy(),
