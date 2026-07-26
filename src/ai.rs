@@ -164,7 +164,8 @@ impl Plugin for RattyAiPlugin {
                     .after(crate::reactive::apply_reactive_commands)
                     .after(crate::reactive::evaluate_rules)
                     .after(crate::avatar::drive_avatar_speech)
-                    .after(crate::avatar::apply_avatar_commands),
+                    .after(crate::avatar::apply_avatar_commands)
+                    .after(crate::presence::apply_presence_commands),
             );
     }
 }
@@ -299,6 +300,16 @@ pub fn apply_ai_commands(
             | RattyAiCommand::AvatarCancel { .. }
             | RattyAiCommand::AvatarSpeechClear { .. }
             | RattyAiCommand::AvatarHide => {}
+            // The collaboration-presence organ
+            // (crate::presence::apply_presence_commands) reads the same
+            // AiCommand messages independently and owns the user.*/note
+            // acks, so this catch-all must never double-ack them.
+            RattyAiCommand::UserJoin { .. }
+            | RattyAiCommand::UserRenew { .. }
+            | RattyAiCommand::UserCursor { .. }
+            | RattyAiCommand::UserLeave { .. }
+            | RattyAiCommand::Note { .. }
+            | RattyAiCommand::NoteRemove { .. } => {}
             other => {
                 debug!("ratty-ai: command received, handler not yet built: {other:?}");
                 reject(
