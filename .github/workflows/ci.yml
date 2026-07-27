@@ -22,6 +22,9 @@ jobs:
         manifest:
           - Cargo.toml
           - widget/Cargo.toml
+          - tools/ratty-ai/Cargo.toml
+          - tools/silk/Cargo.toml
+          - tools/ratty-relay/Cargo.toml
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -32,6 +35,9 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all --manifest-path ${{ matrix.manifest }} -- --check
 
+  # Cross-target coverage stays on the shipped crates. The in-repo tools are
+  # unix-oriented host utilities (ratty-ai's raw-tty transport, ratty-relay's
+  # PTY interposer), so they are gated by fmt/clippy/test on Linux instead.
   check:
     name: Check (${{ matrix.label }}, ${{ matrix.manifest }})
     runs-on: ${{ matrix.os }}
@@ -92,6 +98,9 @@ jobs:
         manifest:
           - Cargo.toml
           - widget/Cargo.toml
+          - tools/ratty-ai/Cargo.toml
+          - tools/silk/Cargo.toml
+          - tools/ratty-relay/Cargo.toml
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -116,3 +125,40 @@ jobs:
         uses: Swatinem/rust-cache@v2
       - name: Run clippy
         run: cargo clippy --all-targets --manifest-path ${{ matrix.manifest }} -- -D warnings
+
+  # The in-repo tools are standalone crates that `#[path]`-include the
+  # terminal's own wire modules, so their suites are where a drift between
+  # tool and terminal shows up first. The root and widget crates are not
+  # here yet — running their suites headlessly is its own question.
+  test:
+    name: Test (${{ matrix.manifest }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        manifest:
+          - tools/ratty-ai/Cargo.toml
+          - tools/silk/Cargo.toml
+          - tools/ratty-relay/Cargo.toml
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config \
+            libasound2-dev \
+            libfontconfig1-dev \
+            libudev-dev \
+            libwayland-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+      - name: Run tests
+        run: cargo test --manifest-path ${{ matrix.manifest }}
