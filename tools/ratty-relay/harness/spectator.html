@@ -1,10 +1,18 @@
 <!doctype html>
 <!--
-  Minimal web-spectator harness for `ratty-relay` (ratty #46, map #42).
+  Minimal web-spectator harness for `ratty-relay` (ratty #46/#62, map #42).
 
   This is the walking skeleton's `ws.onmessage → session.feed()` proof —
   NOT the site widget. Hosting, embedding, reconnect UX, and how N panes
   ever reach the page API belong to the browser-story lane (#53 → #57).
+
+  Stage 2 adds the spectator half of the presence contract: this page tracks
+  the mirrored rows the relay announces in `presence-mirror` control frames
+  and feeds `user.leave` / `note.remove` for each on ANY socket close — clean
+  end, drop, or the relay dying outright. Spectator instances are
+  connection-ephemeral, which is what keeps a mirrored row from outliving the
+  link it arrived on. The ids are tracked out-of-band deliberately: there is
+  no second OSC parser here to drift from the terminal's.
 
   To run: build the widget with wasm-pack (`wasm-pack build widget --target
   web`), serve this file next to the generated `pkg/` directory (any static
@@ -40,6 +48,24 @@
 
       let session = null;
       let ws = null;
+      // Mirrored presence rows this spectator has been told it holds, keyed
+      // "<kind>:<id>". Released on every close path.
+      let mirrored = new Map();
+
+      // Mirrored ids are ASCII [A-Za-z0-9_.-] by the terminal's own id
+      // charset, every byte of which is percent-encoding-unreserved — so the
+      // teardown needs no encoder, and cannot invent one that drifts.
+      function releaseMirrors() {
+        if (!session || mirrored.size === 0) return;
+        let wire = "";
+        for (const { kind, id } of mirrored.values()) {
+          const action = kind === "note" ? "note.remove" : "user.leave";
+          wire += `\x1b]777;ratty:${action};id=${id}\x07`;
+        }
+        mirrored.clear();
+        session.feed(new TextEncoder().encode(wire));
+        session.drain_input();
+      }
 
       async function boot() {
         try {
@@ -62,13 +88,22 @@
         ws = new WebSocket(document.getElementById("url").value);
         ws.binaryType = "arraybuffer";
         ws.onopen = () => status("connected");
-        ws.onclose = () => status("disconnected");
+        // Any close — clean end, drop, or the relay dying — releases the
+        // mirrors. `onclose` fires on every one of those paths.
+        ws.onclose = () => { releaseMirrors(); status("disconnected"); };
+        ws.onerror = () => status("connection error");
         ws.onmessage = (event) => {
           if (typeof event.data === "string") {
             const frame = JSON.parse(event.data);
             if (frame.type === "hello") {
               status(`session '${frame.session}' ${frame.cols}x${frame.rows}` +
                      (frame.degraded ? " (degraded join)" : ""));
+            } else if (frame.type === "presence-mirror") {
+              // The primary reset already cleared this instance's rosters
+              // through the forwarded bytes, so drop the tracked set too.
+              if (frame.clear) mirrored.clear();
+              for (const row of frame.remove ?? []) mirrored.delete(`${row.kind}:${row.id}`);
+              for (const row of frame.add ?? []) mirrored.set(`${row.kind}:${row.id}`, row);
             } else if (frame.type === "end") {
               status(`session ended (${frame.reason})`);
             }
@@ -77,6 +112,10 @@
           session.feed(new Uint8Array(event.data));
         };
       });
+
+      // A tab closed or navigated away is the same event class as a socket
+      // drop: the link is gone, so the mirrors go with it.
+      window.addEventListener("pagehide", releaseMirrors);
 
       boot();
     </script>

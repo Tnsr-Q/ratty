@@ -33,7 +33,7 @@ impl Ring {
     /// Apply one gated segment.
     pub fn push(&mut self, seg: &Seg) {
         match seg {
-            Seg::Anchor { bytes } => {
+            Seg::Anchor { bytes, .. } => {
                 self.buf.clear();
                 self.buf.extend_from_slice(bytes);
                 self.degraded = false;
@@ -94,6 +94,7 @@ mod tests {
         assert!(ring.degraded());
         ring.push(&Seg::Anchor {
             bytes: b"\x1b[2J".to_vec(),
+            roster_reset: false,
         });
         assert!(!ring.degraded());
         ring.push(&Seg::Data(b"ok".to_vec()));
@@ -106,6 +107,7 @@ mod tests {
         ring.push(&Seg::Data(b"old".to_vec()));
         ring.push(&Seg::Anchor {
             bytes: b"\x1bc".to_vec(),
+            roster_reset: false,
         });
         ring.push(&Seg::Data(b"new".to_vec()));
         assert_eq!(ring.snapshot(), b"\x1bcnew".to_vec());

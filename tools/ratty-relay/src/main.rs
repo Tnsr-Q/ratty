@@ -8,11 +8,18 @@
 //! the read-only native spectator. Spectators cannot write: the server
 //! ignores every inbound frame and `watch` sinks stdin.
 //!
+//! Stage 2 adds the presence engine: an OSC 778 poll of the primary's
+//! `state.presence`, injected only at sequence boundaries and with its own
+//! replies excised from the input direction, synthesizing gated presence for
+//! spectators — fresh rows only, ids rewritten `r<ns>.<id>`, every join a
+//! `replace=true`, and fan-out only, so replayed history can never resurrect
+//! a mirrored row. Spectator instances are connection-ephemeral: they tear
+//! their mirrors down on any socket close.
+//!
 //! Design: `docs/research/relay-design.md` (the locked #45 resolution).
-//! Scope: stage 1 — no presence synthesis (that is #62); stage-1 spectators
-//! see no presence at all, lawfully.
 
 use std::process::ExitCode;
+use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 
@@ -20,10 +27,16 @@ use clap::{Parser, Subcommand};
 #[path = "../../../src/osc.rs"]
 mod osc;
 
+#[allow(dead_code)] // Shared wire module; the relay uses the 778 client half.
+#[path = "../../../src/query.rs"]
+mod query;
+
 mod frames;
 mod gate;
 #[cfg(unix)]
 mod host;
+mod poll;
+mod presence;
 mod ring;
 mod server;
 #[cfg(unix)]
@@ -37,6 +50,11 @@ const DEFAULT_LISTEN: &str = "127.0.0.1:7877";
 /// Default replay-ring capacity. A session that scrolls past this without
 /// a full clear degrades late-joins to a blank-anchor live tail.
 const DEFAULT_RING_CAP: usize = 4 * 1024 * 1024;
+
+/// Default `state.presence` poll cadence. The design's figure; it also sets
+/// the sampling floor — a join/leave pair inside one interval is invisible,
+/// and cursor motion decimates to this rate.
+const DEFAULT_POLL_MS: u64 = 250;
 
 #[derive(Parser)]
 #[command(
@@ -63,6 +81,11 @@ enum Mode {
         /// Replay-ring capacity in bytes.
         #[arg(long, default_value_t = DEFAULT_RING_CAP)]
         ring_cap: usize,
+        /// `state.presence` poll interval in milliseconds. `0` disables the
+        /// presence engine entirely — stage-1 behaviour, spectators see no
+        /// presence at all, lawfully.
+        #[arg(long, default_value_t = DEFAULT_POLL_MS)]
+        poll_ms: u64,
         /// Fallback for embeddings that cannot pass trailing args: a command
         /// string split on whitespace (no quoting).
         #[arg(long, conflicts_with = "command")]
@@ -85,9 +108,10 @@ fn main() -> ExitCode {
             listen,
             session,
             ring_cap,
+            poll_ms,
             cmd,
             command,
-        } => run_host(listen, session, ring_cap, cmd, command),
+        } => run_host(listen, session, ring_cap, poll_ms, cmd, command),
         Mode::Watch { url } => watch::run(&url),
     };
     match result {
@@ -104,6 +128,7 @@ fn run_host(
     listen: String,
     session: String,
     ring_cap: usize,
+    poll_ms: u64,
     cmd: Option<String>,
     command: Vec<String>,
 ) -> anyhow::Result<i32> {
@@ -115,6 +140,7 @@ fn run_host(
         listen,
         session,
         ring_cap,
+        poll: (poll_ms > 0).then(|| Duration::from_millis(poll_ms)),
         command: host::resolve_command(command)?,
     })
 }
@@ -124,6 +150,7 @@ fn run_host(
     _listen: String,
     _session: String,
     _ring_cap: usize,
+    _poll_ms: u64,
     _cmd: Option<String>,
     _command: Vec<String>,
 ) -> anyhow::Result<i32> {
