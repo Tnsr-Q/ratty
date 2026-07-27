@@ -84,6 +84,13 @@ fn main() -> anyhow::Result<()> {
                         },
                         transparent: app_config.window.opacity < 1.0,
                         visible: false,
+                        // SPIKE #54 (THROWAWAY) — the default `Fifo` pins every
+                        // frame to the refresh interval, which flattens the
+                        // measurement: N=1 and N=2 would both read 16.7 ms and
+                        // an unchanged number would look like "N seams are
+                        // free". Uncapped so the per-submission cost is
+                        // observable at all.
+                        present_mode: bevy::window::PresentMode::AutoNoVsync,
                         ..default()
                     }),
                     ..default()

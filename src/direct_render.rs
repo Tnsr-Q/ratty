@@ -334,6 +334,15 @@ fn render_terminal_frame(
         .get()
         .get_or_insert_with(|| GpuRenderer::new(device).expect("vello renderer"));
 
+    // SPIKE #54 (THROWAWAY) — the headline unknown is "what do N Vello
+    // submissions per frame cost". Vello offers no batching (each
+    // `render_scene_to_texture_view` submits internally), so N terminals are
+    // N sequential submissions and the per-submission cost is the multiplier.
+    // Timed here rather than via frame time, because native builds pipeline
+    // the render app against the main world — frame time hides this until it
+    // stops hiding it.
+    let spike_vello_start = std::time::Instant::now();
+
     // Vello rasterizes into the plain `Rgba8Unorm` storage texture; its default
     // view is storage-compatible (no sRGB reinterpretation).
     renderer
@@ -347,6 +356,30 @@ fn render_terminal_frame(
             &current.scene,
         )
         .expect("render terminal scene into Bevy texture");
+
+    let spike_vello_ns = spike_vello_start.elapsed().as_nanos() as u64;
+
+    // SPIKE #54 (THROWAWAY) — the control. Wall clock around a single
+    // submission cannot separate marginal cost from queue backpressure and
+    // warm-up. Submitting the *same* scene a second time in the same frame,
+    // through the same renderer, is exactly the shape N terminals would take
+    // — so the delta between the two is the honest answer to "what does one
+    // more terminal's submission cost".
+    let spike_second_start = std::time::Instant::now();
+    renderer
+        .render_scene_to_texture_view(
+            device,
+            &render_queue,
+            &render_image.texture_view,
+            current.width,
+            current.height,
+            current.base_color,
+            &current.scene,
+        )
+        .expect("spike: second submission of the same scene");
+    let spike_second_ns = spike_second_start.elapsed().as_nanos() as u64;
+
+    let spike_copy_start = std::time::Instant::now();
 
     // Copy the rendered, sRGB-encoded bytes into the present texture, which the
     // materials sample through an `Rgba8UnormSrgb` view to decode them. Both
@@ -365,7 +398,41 @@ fn render_terminal_frame(
     );
     render_queue.submit([encoder.finish()]);
 
+    spike_record_submission(
+        spike_vello_ns,
+        spike_second_ns,
+        spike_copy_start.elapsed().as_nanos() as u64,
+    );
+
     exchange.recycle_scene(current.scene);
+}
+
+/// SPIKE #54 (THROWAWAY) — running cost of one terminal's per-frame GPU work,
+/// reported to stderr so a short native run yields a number without a
+/// diagnostics plugin. Reported as a mean over a window rather than per frame:
+/// the first submissions include pipeline/shader warm-up and would dominate.
+fn spike_record_submission(vello_ns: u64, second_ns: u64, copy_ns: u64) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    const WINDOW: u64 = 120;
+    static SUBMITS: AtomicU64 = AtomicU64::new(0);
+    static VELLO_NS: AtomicU64 = AtomicU64::new(0);
+    static SECOND_NS: AtomicU64 = AtomicU64::new(0);
+    static COPY_NS: AtomicU64 = AtomicU64::new(0);
+
+    VELLO_NS.fetch_add(vello_ns, Ordering::Relaxed);
+    SECOND_NS.fetch_add(second_ns, Ordering::Relaxed);
+    COPY_NS.fetch_add(copy_ns, Ordering::Relaxed);
+    let n = SUBMITS.fetch_add(1, Ordering::Relaxed) + 1;
+    if n.is_multiple_of(WINDOW) {
+        let vello = VELLO_NS.swap(0, Ordering::Relaxed) as f64 / WINDOW as f64 / 1000.0;
+        let second = SECOND_NS.swap(0, Ordering::Relaxed) as f64 / WINDOW as f64 / 1000.0;
+        let copy = COPY_NS.swap(0, Ordering::Relaxed) as f64 / WINDOW as f64 / 1000.0;
+        eprintln!(
+            "[spike54] frames={n} first_submit={vello:.0}us second_submit={second:.0}us \
+             copy={copy:.0}us  marginal_ratio={:.2}",
+            if vello > 0.0 { second / vello } else { 0.0 }
+        );
+    }
 }
 
 // ── Avatar overlay (#23): a second vello scene, screen-space ──
