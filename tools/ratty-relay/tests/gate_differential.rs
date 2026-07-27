@@ -6,6 +6,7 @@
 //! identical gated output; classification is additionally checked against
 //! the crate's own `parse_control` on each embedded 777.
 
+#[allow(dead_code)] // The gate's injection-boundary half belongs to the host.
 #[path = "../src/gate.rs"]
 mod gate;
 #[allow(dead_code)]
@@ -123,7 +124,7 @@ fn classification_agrees_with_the_crate_parser() {
     let forwarded: Vec<u8> = segs
         .iter()
         .flat_map(|seg| match seg {
-            Seg::Data(b) | Seg::Anchor { bytes: b } => b.clone(),
+            Seg::Data(b) | Seg::Anchor { bytes: b, .. } => b.clone(),
         })
         .collect();
     let forwarded_text = String::from_utf8_lossy(&forwarded).into_owned();

@@ -36,7 +36,13 @@ pub enum Seg {
     Data(Vec<u8>),
     /// A full-clear anchor (777 `reset`, CSI `2J`, or RIS). `bytes` is the
     /// forwarded sequence itself so the ring can restart exactly at it.
-    Anchor { bytes: Vec<u8> },
+    ///
+    /// `roster_reset` marks the 777 `reset` specifically: it clears every
+    /// presence roster on each spectator instance as the forwarded bytes
+    /// land (`protocols/presence.md:162-164`), so the presence mirror drops
+    /// its model at that point without emitting synthetic leaves. ED2 and
+    /// RIS clear the screen and nothing else.
+    Anchor { bytes: Vec<u8>, roster_reset: bool },
 }
 
 /// Running excision counters, for the host status line and tests.
@@ -52,6 +58,10 @@ enum State {
     Ground,
     /// Saw ESC; deciding what follows.
     Esc,
+    /// Inside a two-or-more-byte `ESC <intermediate…> <final>` (charset
+    /// designation, DECALN). Tracked only so the injection boundary is
+    /// honest — the bytes forward either way.
+    EscIntermediate,
     /// Inside `ESC ]` — payload withheld until the terminator classifies it.
     Osc {
         payload: Vec<u8>,
@@ -76,6 +86,11 @@ pub struct Gate {
     state: State,
     /// The current run of forwarded bytes, flushed into a `Seg::Data`.
     run: Vec<u8>,
+    /// UTF-8 continuation bytes still expected for the codepoint in flight.
+    /// Like `EscIntermediate`, this exists purely so `at_boundary` cannot
+    /// claim a boundary in the middle of something the primary is still
+    /// assembling.
+    continuations: u8,
     out: Vec<Seg>,
     pub stats: GateStats,
 }
@@ -91,6 +106,7 @@ impl Gate {
         Self {
             state: State::Ground,
             run: Vec::new(),
+            continuations: 0,
             out: Vec::new(),
             stats: GateStats::default(),
         }
@@ -106,12 +122,43 @@ impl Gate {
         std::mem::take(&mut self.out)
     }
 
+    /// True when everything pushed so far ends on a boundary the primary's
+    /// own parser is also sitting on — the only place the relay may inject
+    /// its own 778 queries into the stream the primary parses.
+    ///
+    /// "Boundary" is the strict reading: not inside an OSC, CSI, APC/DCS or
+    /// two-byte-escape sequence, and not between a UTF-8 lead byte and its
+    /// continuations. The last two do not affect what spectators receive —
+    /// injected bytes bypass the tee entirely — but an injection there would
+    /// cancel a charset designation or split a codepoint on the *primary's*
+    /// screen, so the guard covers them rather than the comment excusing
+    /// them.
+    pub fn at_boundary(&self) -> bool {
+        matches!(self.state, State::Ground) && self.continuations == 0
+    }
+
     fn step(&mut self, byte: u8) {
         match &mut self.state {
-            State::Ground => match byte {
-                0x1b => self.state = State::Esc,
-                _ => self.run.push(byte),
-            },
+            State::Ground => {
+                if self.continuations > 0 && (0x80..0xc0).contains(&byte) {
+                    self.continuations -= 1;
+                    self.run.push(byte);
+                    return;
+                }
+                // A non-continuation byte ends whatever codepoint was in
+                // flight, so malformed UTF-8 can never leave this stuck.
+                self.continuations = utf8_continuations(byte);
+                match byte {
+                    0x1b => self.state = State::Esc,
+                    _ => self.run.push(byte),
+                }
+            }
+            State::EscIntermediate => {
+                self.run.push(byte);
+                if !(0x20..=0x2f).contains(&byte) {
+                    self.state = State::Ground;
+                }
+            }
             State::Esc => match byte {
                 b']' => {
                     self.state = State::Osc {
@@ -131,9 +178,15 @@ impl Gate {
                     self.state = State::PassSt { esc_pending: false };
                 }
                 b'c' => {
-                    // RIS — hard terminal reset: forward and anchor.
-                    self.emit_anchor(vec![0x1b, b'c']);
+                    // RIS — hard terminal reset: forward and anchor. It
+                    // clears the screen, not the presence rosters.
+                    self.emit_anchor(vec![0x1b, b'c'], false);
                     self.state = State::Ground;
+                }
+                0x20..=0x2f => {
+                    // An intermediate: the final byte is still to come.
+                    self.run.extend_from_slice(&[0x1b, byte]);
+                    self.state = State::EscIntermediate;
                 }
                 _ => {
                     self.run.extend_from_slice(&[0x1b, byte]);
@@ -210,7 +263,7 @@ impl Gate {
                         let seq = std::mem::take(seq);
                         self.state = State::Ground;
                         if is_ed2 {
-                            self.emit_anchor(seq);
+                            self.emit_anchor(seq, false);
                         } else {
                             self.run.extend_from_slice(&seq);
                         }
@@ -251,22 +304,36 @@ impl Gate {
                 let mut bytes = vec![0x1b, b']'];
                 bytes.extend_from_slice(&payload);
                 bytes.extend_from_slice(terminator);
-                self.emit_anchor(bytes);
+                self.emit_anchor(bytes, true);
             }
             Verdict::ExciseControl => self.stats.excised_control += 1,
             Verdict::Excise778 => self.stats.excised_778 += 1,
         }
     }
 
-    fn emit_anchor(&mut self, bytes: Vec<u8>) {
+    fn emit_anchor(&mut self, bytes: Vec<u8>, roster_reset: bool) {
         self.flush_run();
-        self.out.push(Seg::Anchor { bytes });
+        self.out.push(Seg::Anchor {
+            bytes,
+            roster_reset,
+        });
     }
 
     fn flush_run(&mut self) {
         if !self.run.is_empty() {
             self.out.push(Seg::Data(std::mem::take(&mut self.run)));
         }
+    }
+}
+
+/// Continuation bytes a UTF-8 lead byte still expects; `0` for ASCII, for a
+/// stray continuation, and for any byte that cannot start a codepoint.
+fn utf8_continuations(byte: u8) -> u8 {
+    match byte {
+        0xc2..=0xdf => 1,
+        0xe0..=0xef => 2,
+        0xf0..=0xf4 => 3,
+        _ => 0,
     }
 }
 
@@ -371,7 +438,7 @@ mod tests {
         let mut out = Vec::new();
         for seg in segs {
             match seg {
-                Seg::Data(bytes) | Seg::Anchor { bytes } => out.extend_from_slice(bytes),
+                Seg::Data(bytes) | Seg::Anchor { bytes, .. } => out.extend_from_slice(bytes),
             }
         }
         out
@@ -476,7 +543,9 @@ mod tests {
         assert_eq!(
             segs,
             vec![Seg::Anchor {
-                bytes: reset.to_vec()
+                bytes: reset.to_vec(),
+                // `reset` is the only anchor that also clears the rosters.
+                roster_reset: true,
             }]
         );
     }
@@ -522,7 +591,8 @@ mod tests {
             vec![
                 Seg::Data(b"before".to_vec()),
                 Seg::Anchor {
-                    bytes: b"\x1b[2J".to_vec()
+                    bytes: b"\x1b[2J".to_vec(),
+                    roster_reset: false,
                 },
                 Seg::Data(b"after".to_vec()),
             ]
@@ -530,11 +600,13 @@ mod tests {
         // 3J (scrollback clear) is not an anchor.
         let (segs, _) = gate_all(&[b"\x1b[3J"]);
         assert_eq!(segs, vec![Seg::Data(b"\x1b[3J".to_vec())]);
+        // RIS clears the screen; rosters are untouched.
         let (segs, _) = gate_all(&[b"\x1bc"]);
         assert_eq!(
             segs,
             vec![Seg::Anchor {
-                bytes: b"\x1bc".to_vec()
+                bytes: b"\x1bc".to_vec(),
+                roster_reset: false,
             }]
         );
     }
@@ -558,10 +630,59 @@ mod tests {
             vec![
                 Seg::Data(b"\x1b]777;ratty:flash".to_vec()),
                 Seg::Anchor {
-                    bytes: b"\x1b[2J".to_vec()
+                    bytes: b"\x1b[2J".to_vec(),
+                    roster_reset: false,
                 },
             ]
         );
+    }
+
+    #[test]
+    fn the_injection_boundary_covers_everything_the_primary_is_assembling() {
+        // Injection is only safe where the primary's own parser is also
+        // between things. The gate's `Ground` alone is not that: a two-byte
+        // escape awaiting its final byte, and a UTF-8 lead byte awaiting its
+        // continuations, both sit "in Ground" and are both mid-something.
+        let mut gate = Gate::new();
+        assert!(gate.at_boundary(), "a fresh gate is at a boundary");
+
+        // Charset designation `ESC ( B`, split before the final byte.
+        gate.push(b"\x1b(");
+        assert!(!gate.at_boundary(), "mid escape-intermediate");
+        gate.push(b"B");
+        assert!(gate.at_boundary());
+
+        // A three-byte codepoint, one byte at a time.
+        gate.push(&[0xe2]);
+        assert!(!gate.at_boundary(), "mid UTF-8 lead");
+        gate.push(&[0x9c]);
+        assert!(!gate.at_boundary(), "mid UTF-8 continuation");
+        gate.push(&[0x93]);
+        assert!(gate.at_boundary());
+
+        // Malformed UTF-8 cannot wedge the guard: any non-continuation byte
+        // ends the codepoint in flight.
+        gate.push(&[0xf0, b'a']);
+        assert!(gate.at_boundary());
+
+        // And the framing states still count, as before.
+        gate.push(b"\x1b]777;ratty:fla");
+        assert!(!gate.at_boundary(), "mid OSC");
+        gate.push(b"sh\x07");
+        assert!(gate.at_boundary());
+        gate.push(b"\x1b[1;3");
+        assert!(!gate.at_boundary(), "mid CSI");
+        gate.push(b"2m");
+        assert!(gate.at_boundary());
+    }
+
+    #[test]
+    fn escape_intermediates_and_utf8_still_forward_verbatim() {
+        // The boundary tracking must not change a single teed byte.
+        let input = "\x1b(Bcaf\u{e9} \u{2713}\x1b)0tail".as_bytes();
+        let (segs, stats) = gate_all(&[input]);
+        assert_eq!(flat_data(&segs), input.to_vec());
+        assert_eq!(stats, GateStats::default());
     }
 
     #[test]
