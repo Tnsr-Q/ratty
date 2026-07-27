@@ -1,0 +1,84 @@
+<!doctype html>
+<!--
+  Minimal web-spectator harness for `ratty-relay` (ratty #46, map #42).
+
+  This is the walking skeleton's `ws.onmessage → session.feed()` proof —
+  NOT the site widget. Hosting, embedding, reconnect UX, and how N panes
+  ever reach the page API belong to the browser-story lane (#53 → #57).
+
+  To run: build the widget with wasm-pack (`wasm-pack build widget --target
+  web`), serve this file next to the generated `pkg/` directory (any static
+  server; WebGPU requires a secure context or localhost), start a hosted
+  session with `ratty -e ratty-relay host ... zsh` (unquoted argv; the
+  exact separator story is pinned by tests/cli_seam.rs and the design
+  doc), then open this page and connect to ws://127.0.0.1:7877. Adjust
+  WIDGET_MODULE if the wasm-pack output name differs.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>ratty-relay spectator harness</title>
+    <style>
+      body { margin: 0; background: #111; color: #9ae; font: 13px monospace; }
+      #bar { padding: 6px 8px; display: flex; gap: 8px; align-items: center; }
+      #status { color: #7c7; }
+      #ratty-canvas { display: block; width: 100vw; height: calc(100vh - 34px); }
+      input { background: #222; color: #cde; border: 1px solid #345; padding: 3px 6px; width: 22em; }
+      button { background: #234; color: #cde; border: 1px solid #456; padding: 3px 10px; }
+    </style>
+  </head>
+  <body>
+    <div id="bar">
+      <input id="url" value="ws://127.0.0.1:7877" />
+      <button id="connect">connect</button>
+      <span id="status">idle</span>
+    </div>
+    <canvas id="ratty-canvas"></canvas>
+    <script type="module">
+      const WIDGET_MODULE = "./pkg/ratatui_ratty.js";
+      const status = (t) => (document.getElementById("status").textContent = t);
+
+      let session = null;
+      let ws = null;
+
+      async function boot() {
+        try {
+          const widget = await import(WIDGET_MODULE);
+          await widget.default();
+          session = widget.start("#ratty-canvas", "");
+          // The spectator parser's auto-replies (cursor reports, RGP/778
+          // acks) accumulate forever in the unbounded input channel unless
+          // drained; a read-only spectator discards them.
+          setInterval(() => { if (session) session.drain_input(); }, 250);
+          status("widget ready");
+        } catch (err) {
+          status(`widget failed to load: ${err} — check WIDGET_MODULE`);
+        }
+      }
+
+      document.getElementById("connect").addEventListener("click", () => {
+        if (!session) { status("widget not ready"); return; }
+        if (ws) ws.close();
+        ws = new WebSocket(document.getElementById("url").value);
+        ws.binaryType = "arraybuffer";
+        ws.onopen = () => status("connected");
+        ws.onclose = () => status("disconnected");
+        ws.onmessage = (event) => {
+          if (typeof event.data === "string") {
+            const frame = JSON.parse(event.data);
+            if (frame.type === "hello") {
+              status(`session '${frame.session}' ${frame.cols}x${frame.rows}` +
+                     (frame.degraded ? " (degraded join)" : ""));
+            } else if (frame.type === "end") {
+              status(`session ended (${frame.reason})`);
+            }
+            return; // control frames are metadata, never fed to the parser
+          }
+          session.feed(new Uint8Array(event.data));
+        };
+      });
+
+      boot();
+    </script>
+  </body>
+</html>
