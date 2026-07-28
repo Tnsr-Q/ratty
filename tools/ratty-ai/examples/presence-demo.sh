@@ -125,6 +125,46 @@ show() {
 # and the reason the relay's mirror cannot rewrite ids naively.
 SWARM_ID='swarm.agent.0123456789.0123456789.0123456789.abc'
 
+# ── Preflight ────────────────────────────────────────────────────────────
+#
+# Ask the terminal whether it has a presence organ at all before spending
+# seventy seconds pretending it does. A ratty built before 2026-07-26
+# (commit 025954e, which added `src/presence.rs` and the `state.presence`
+# op) answers every `ratty:user.*` write with nothing and draws nothing --
+# an empty plane that looks exactly like a rendering defect and is not one.
+# One live run was lost to a stale binary; that is what this costs one
+# round trip to prevent.
+#
+# A caps read that fails outright is NOT treated as a missing organ -- that
+# is the transport strain, and it must not block the demo.
+preflight() {
+  local caps status
+  caps=$(ratty-ai --timeout "$REPLY_TIMEOUT" query caps 2>/dev/null)
+  status=$?
+  if [ "$status" -ne 0 ]; then
+    echo "    (could not read caps, exit $status — continuing; if the plane"
+    echo "     stays empty, suspect the binary before suspecting the renderer)"
+    return 0
+  fi
+  case "$caps" in
+    *'"state.presence"'*) return 0 ;;
+  esac
+  echo
+  echo "── STOP: this ratty has no presence organ ───────────────────────────"
+  echo
+  echo "  \`caps\` does not advertise state.presence, so every user.* and note"
+  echo "  write below would be ignored and the plane would stay empty. That"
+  echo "  is a stale binary, not a gate failure — nothing here is judgeable."
+  echo
+  echo "  The organ landed 2026-07-26 (025954e). Rebuild and re-run:"
+  echo
+  echo "      cargo build --release"
+  echo "      ./target/release/ratty -e tools/ratty-ai/examples/presence-demo.sh"
+  echo
+  exit 2
+}
+preflight
+
 echo "── presence: the collaboration organ, live ──────────────────────────"
 echo
 echo "watch the plane. nothing on it yet."
