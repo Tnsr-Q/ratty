@@ -2200,9 +2200,9 @@ mod tests {
     //
     // ratty's scanner sits *in front of* vt100, so anywhere the two disagree
     // is behaviour ratty invented for a terminal it is supposed to emulate.
-    // These assert against a bare parser fed the identical bytes, and against
-    // a literal expectation as well, so a change that broke both the same way
-    // still fails.
+    // Each test below names the production mutation it is meant to kill; a
+    // test that kills nothing is ballast, and an earlier draft of this block
+    // shipped four such tests before a mutation sweep caught them.
 
     fn wide_parser() -> vt100::Parser<crate::runtime::TerminalParserCallbacks> {
         vt100::Parser::new_with_callbacks(
@@ -2217,145 +2217,230 @@ mod tests {
         parser.screen().contents().replace('\n', " | ")
     }
 
-    /// Asserts ratty renders `expected`, *and* that a bare vt100 parser fed
-    /// the same bytes renders it too.
-    fn assert_matches_bare_vt100(chunks: &[&[u8]], expected: &str) {
+    fn feed_ratty(
+        chunks: &[&[u8]],
+    ) -> (
+        vt100::Parser<crate::runtime::TerminalParserCallbacks>,
+        TerminalInlineObjects,
+    ) {
         let mut parser = wide_parser();
         let mut inline = TerminalInlineObjects::default();
         for chunk in chunks {
             inline.consume_pty_output(chunk, &mut parser);
         }
-        let ratty = screen_text(&parser);
+        (parser, inline)
+    }
+
+    /// Asserts ratty renders `expected`, and that a bare vt100 parser fed the
+    /// same bytes agrees — on text, on **formatting**, and on the **cursor**.
+    ///
+    /// Plain `contents()` is far too coarse on its own: it drops SGR, drops
+    /// the cursor, and trims trailing blank rows, which between them hid a
+    /// rule wrongly widened to abort on `\n`. The formatted and cursor
+    /// comparisons are what make this differential bite.
+    fn assert_matches_bare_vt100(chunks: &[&[u8]], expected: &str) {
+        let (parser, _) = feed_ratty(chunks);
 
         let mut reference = wide_parser();
         for chunk in chunks {
             reference.process(chunk);
         }
-        let reference = screen_text(&reference);
 
         assert_eq!(
-            reference, expected,
-            "the reference parser's own behaviour moved; re-derive the expectation deliberately"
+            screen_text(&reference),
+            expected,
+            "the reference parser's own behaviour moved; re-derive this deliberately"
         );
-        assert_eq!(ratty, expected, "ratty diverged from the parser it fronts");
+        assert_eq!(
+            screen_text(&parser),
+            expected,
+            "ratty's screen text diverged from the parser it fronts"
+        );
+        assert_eq!(
+            parser.screen().contents_formatted(),
+            reference.screen().contents_formatted(),
+            "ratty's formatting diverged (SGR state) from the parser it fronts"
+        );
+        assert_eq!(
+            parser.screen().cursor_position(),
+            reference.screen().cursor_position(),
+            "ratty's cursor diverged from the parser it fronts"
+        );
     }
 
     /// The headline of #75: Ctrl-C a `timg`/`chafa` render and the shell
-    /// prints an ANSI-coloured prompt. vte leaves its APC string on that
-    /// `ESC`; before the fix `apc_end` recognised only `ESC \` and `0x9c`, so
-    /// every later byte was buffered and the terminal went dark for good.
+    /// prints its prompt. vte leaves its APC string on that `ESC`; `apc_end`
+    /// recognised only `ESC \` and `0x9c`, so every later byte was buffered
+    /// and the terminal went dark for good.
+    ///
+    /// Sweeps several `ESC`-introduced continuations on purpose. Restricting
+    /// the rule to `ESC [` alone passes a single-case version of this test
+    /// while leaving an ordinary `ESC ]` title write buffered forever.
     #[test]
-    fn truncated_apc_recovers_on_the_next_escape_sequence() {
+    fn truncated_apc_recovers_on_any_escape_sequence() {
+        let truncated = b"\x1b_Gf=24,s=1,v=1;AAAA".as_slice();
+        // CSI, an OSC title write, a charset designation, and a bare ESC verb.
         assert_matches_bare_vt100(
-            &[
-                b"A0 before\r\n",
-                b"\x1b_Gf=24,s=1,v=1;AAAA",
-                b"\x1b[31mPROMPT\x1b[0m\r\n",
-                b"C2 later\r\n",
-            ],
-            "A0 before | PROMPT | C2 later",
+            &[b"A0\r\n", truncated, b"\x1b[31mCSI\x1b[0m\r\nT"],
+            "A0 | CSI | T",
+        );
+        assert_matches_bare_vt100(
+            &[b"A0\r\n", truncated, b"\x1b]0;title\x07OSC\r\nT"],
+            "A0 | OSC | T",
+        );
+        assert_matches_bare_vt100(&[b"A0\r\n", truncated, b"\x1b(BCHARSET"], "A0 | CHARSET");
+        // `ESC M` is reverse index: it scrolls, so `A0` leaves the viewport.
+        assert_matches_bare_vt100(&[b"A0\r\n", truncated, b"\x1bMESCVERB"], "ESCVERB");
+    }
+
+    /// Kills: dropping `CAN` from the abort set.
+    #[test]
+    fn truncated_apc_is_abandoned_by_can() {
+        assert_matches_bare_vt100(
+            &[b"A0\r\n", b"\x1b_Gf=24,s=1,v=1;AAAA", b"\x18B1"],
+            "A0 | B1",
         );
     }
 
+    /// Kills: dropping `SUB`. Separate from `CAN` so removing either one
+    /// alone still fails — a single test using only `\x18` corroborates
+    /// nothing about `\x1a`.
     #[test]
-    fn truncated_apc_is_abandoned_by_can_and_sub() {
-        for abort in [b"\x18".as_slice(), b"\x1a".as_slice()] {
-            assert_matches_bare_vt100(
-                &[
-                    b"A0 before\r\n",
-                    b"\x1b_Gf=24,s=1,v=1;AAAA",
-                    abort,
-                    b"B1 after\r\n",
-                ],
-                "A0 before | B1 after",
-            );
-        }
+    fn truncated_apc_is_abandoned_by_sub() {
+        assert_matches_bare_vt100(
+            &[b"A0\r\n", b"\x1b_Gf=24,s=1,v=1;AAAA", b"\x1aB1"],
+            "A0 | B1",
+        );
     }
 
     /// Deliberately NOT "fixed": with no abort byte in sight, swallowing is
-    /// what a terminal does. Locking it keeps a later change from widening
-    /// the recovery rule into a divergence in the other direction.
+    /// what a terminal does.
+    ///
+    /// Kills: widening the abort set to any ordinary byte (`\n` is the
+    /// tempting one). The tail deliberately ends **without** a newline and
+    /// the cursor is compared, because `contents()` trims trailing blank
+    /// rows — which is exactly how an earlier version of this test let a
+    /// wrongly-widened rule through.
     #[test]
     fn truncated_apc_still_swallows_plain_text_like_vt100_does() {
         assert_matches_bare_vt100(
             &[
-                b"A0 before\r\n",
+                b"A0\r\n",
                 b"\x1b_Gf=24,s=1,v=1;AAAA",
-                b"B1 after\r\n",
+                b"B1 after\r\nC2 later",
             ],
-            "A0 before",
+            "A0",
         );
     }
 
     /// Also deliberately not "fixed". An `ESC _` inside an OSC payload really
     /// does close the OSC and open an APC in vte, so teaching the scanner
     /// OSC-awareness would *introduce* a divergence rather than remove one.
+    ///
+    /// Kills: an OSC-aware skip in the scan. The OSC and the `ESC _` must
+    /// arrive in **one chunk** for that to be true — split across chunks the
+    /// prefix is already forwarded and there is no OSC context left to be
+    /// aware of, which made an earlier version of this test a tautology.
     #[test]
     fn esc_underscore_inside_an_osc_payload_matches_vt100() {
-        assert_matches_bare_vt100(
-            &[
-                b"A0 before\r\n",
-                b"\x1b]0;ti",
-                b"\x1b_",
-                b"tle",
-                b"\x07",
-                b"B1 after\r\n",
-            ],
-            "A0 before",
+        assert_matches_bare_vt100(&[b"A0\r\n\x1b]0;ti\x1b_tle\x07B1 after"], "A0");
+    }
+
+    /// Kills: removing the `handle_apc_sequence` dispatch, or an off-by-one
+    /// in `seq_end`. Asserts the transfer was **handled**, not merely that
+    /// the screen looks unchanged — a forward-only scanner leaves identical
+    /// screen text while silently dropping every graphic.
+    #[test]
+    fn a_complete_apc_transfer_is_still_dispatched() {
+        let (_, inline) = feed_ratty(&[b"\x1b_Ga=T,f=24,s=1,v=1;AAAA\x1b\\"]);
+        assert_eq!(
+            inline.objects.len(),
+            1,
+            "a complete Kitty transmit was not dispatched"
         );
     }
 
+    /// The indeterminate case the abort rule must not break: a trailing lone
+    /// `ESC` may still be the first half of `ESC \`, so it has to stay
+    /// buffered rather than count as an abort.
+    ///
+    /// Kills: treating a trailing `ESC` as an abort. Asserts the retained
+    /// buffer directly — on screen text alone the mutation is invisible,
+    /// because the re-retained `ESC` plus the next chunk's `\` reaches vt100
+    /// as an inert bare ST.
     #[test]
-    fn a_complete_apc_transfer_is_untouched() {
-        assert_matches_bare_vt100(
-            &[
-                b"A0 before\r\n",
-                b"\x1b_Gf=24,s=1,v=1;AAAA\x1b\\",
-                b"B1 after\r\n",
-            ],
-            "A0 before | B1 after",
-        );
-    }
-
-    /// The indeterminate case the abandon rule must not break: a trailing lone
-    /// `ESC` may still turn out to be the first half of `ESC \`, so it has to
-    /// stay buffered rather than be treated as an abort.
-    #[test]
-    fn a_terminator_split_across_chunks_still_terminates() {
-        assert_matches_bare_vt100(
-            &[
-                b"A0 before\r\n",
-                b"\x1b_Gf=24,s=1,v=1;AAAA\x1b",
-                b"\\B1 after\r\n",
-            ],
-            "A0 before | B1 after",
-        );
-    }
-
-    /// A truncated sequence is not a command, so it must not reach the
-    /// RGP/Kitty dispatch — and the bytes after the aborting one must still
-    /// reach the screen, which is what proves the scan resumed rather than
-    /// buffering the rest of the stream.
-    #[test]
-    fn an_abandoned_apc_is_dropped_and_the_stream_resumes() {
+    fn a_trailing_esc_stays_buffered_until_the_next_chunk() {
         let mut parser = wide_parser();
         let mut inline = TerminalInlineObjects::default();
-        inline.consume_pty_output(b"\x1b_Ga=T,f=24,s=1,v=1;AAAA\x18AFTER\r\n", &mut parser);
 
-        assert!(
-            inline.objects.is_empty(),
-            "a truncated Kitty transmit was dispatched as a command"
-        );
+        inline.consume_pty_output(b"A0\r\n\x1b_Ga=T,f=24,s=1,v=1;AAAA\x1b", &mut parser);
+        let (buffered, discarding) = inline.apc_buffer_state();
         assert_eq!(
-            screen_text(&parser),
-            "AFTER",
-            "the stream did not resume at the aborting byte"
+            buffered, 25,
+            "the in-progress APC must stay whole, trailing ESC included"
         );
+        assert!(!discarding, "an in-progress APC must not arm the discarder");
+
+        inline.consume_pty_output(b"\\B1", &mut parser);
+        assert_eq!(screen_text(&parser), "A0 | B1");
+        assert_eq!(
+            inline.objects.len(),
+            1,
+            "the split transfer was not handled"
+        );
+    }
+
+    /// An abandoned sequence must not stay buffered, and the stream must
+    /// resume *at* the aborting byte.
+    ///
+    /// Note it is not asserted that the partial sequence goes undispatched:
+    /// `consume_rgp_sequence` (src/rgp.rs:169-175) and the Kitty decoder both
+    /// reject anything not ending in a terminator, and an abandoned slice is
+    /// cut *before* its abort byte, so dispatching one is a no-op regardless.
+    /// Not dispatching is defence in depth, not a falsifiable property.
+    #[test]
+    fn an_abandoned_apc_does_not_stay_buffered() {
+        let (parser, inline) = feed_ratty(&[b"\x1b_Ga=T,f=24,s=1,v=1;AAAA\x18AFTER"]);
+        assert_eq!(screen_text(&parser), "AFTER");
         let (buffered, discarding) = inline.apc_buffer_state();
         assert_eq!(buffered, 0, "the abandoned sequence stayed buffered");
         assert!(
             !discarding,
             "an abandoned sequence must not arm the discarder"
         );
+    }
+
+    /// The over-long discard path has its own copy of the abort rule
+    /// (`resync_after_overlong_apc`), and nothing else in the suite reaches
+    /// it with an aborting byte.
+    ///
+    /// Kills: resuming past the aborting byte in that path, which eats the
+    /// `ESC` and renders the following CSI as literal text — the #75 symptom
+    /// surviving above the 8 MiB cap.
+    #[test]
+    fn an_overlong_apc_aborted_by_an_escape_still_resumes() {
+        let mut parser = wide_parser();
+        let mut inline = TerminalInlineObjects::default();
+
+        let mut opening = b"\x1b_Gf=24,s=1,v=1;".to_vec();
+        opening.resize(64 * 1024, b'A');
+        inline.consume_pty_output(&opening, &mut parser);
+        for _ in 0..160 {
+            inline.consume_pty_output(&vec![b'A'; 64 * 1024], &mut parser);
+        }
+        let (_, discarding) = inline.apc_buffer_state();
+        assert!(
+            discarding,
+            "the cap did not engage; this test proves nothing"
+        );
+
+        inline.consume_pty_output(b"\x1b[31mTAIL", &mut parser);
+        assert_eq!(
+            screen_text(&parser),
+            "TAIL",
+            "the aborting ESC was eaten, so the CSI printed as text"
+        );
+        let (_, discarding) = inline.apc_buffer_state();
+        assert!(!discarding, "the discarder stayed armed after an abort");
     }
 }
