@@ -185,6 +185,17 @@ struct OscGuard {
     /// Payload bytes counted since the current OSC's introducer; frozen at
     /// the cap once the guard begins dropping.
     osc_len: usize,
+    /// Spike #55 byte-level tee (TEST BUILDS ONLY). When `Some`, every byte
+    /// actually handed to `vt100::Parser::process` is appended here, so a
+    /// test can assert the charter's literal standard — "zero bytes may ever
+    /// leak into pane 0" (docs/research/browser-story.md:507) — instead of
+    /// the weaker screen-state standard. The screen oracle cannot see bytes
+    /// that reach vte and are swallowed inside its APC state machine.
+    ///
+    /// `None` by default so the test-mode throughput benchmark measures the
+    /// scanner, not the tee's memcpy.
+    #[cfg(test)]
+    forwarded: Option<Vec<u8>>,
 }
 
 #[derive(Default, PartialEq, Eq, Clone, Copy, Debug)]
@@ -211,7 +222,23 @@ impl OscGuard {
     /// Forwards `bytes` to the parser, eliding the payload of any single
     /// OSC sequence past the cap.
     fn forward<CB: Callbacks>(&mut self, parser: &mut vt100::Parser<CB>, bytes: &[u8]) {
-        self.for_each_run(bytes, |run| parser.process(run));
+        // TEST BUILDS ONLY: mirror the exact runs into the tee. `teed` is a
+        // local because `for_each_run` already borrows `self` mutably; the
+        // whole capture compiles away in non-test builds, leaving the body
+        // byte-for-byte the original `for_each_run(bytes, |run| …)` call.
+        #[cfg(test)]
+        let mut teed: Option<Vec<u8>> = self.forwarded.as_ref().map(|_| Vec::new());
+        self.for_each_run(bytes, |run| {
+            #[cfg(test)]
+            if let Some(teed) = teed.as_mut() {
+                teed.extend_from_slice(run);
+            }
+            parser.process(run);
+        });
+        #[cfg(test)]
+        if let (Some(teed), Some(sink)) = (teed, self.forwarded.as_mut()) {
+            sink.extend_from_slice(&teed);
+        }
     }
 
     /// Walks `bytes`, invoking `emit` on each contiguous run that should
@@ -304,6 +331,24 @@ impl OscGuard {
 }
 
 impl TerminalInlineObjects {
+    /// Spike #55 byte-level tee (TEST BUILDS ONLY): starts capturing every
+    /// byte handed to `vt100::Parser::process`. See [`OscGuard::forwarded`].
+    #[cfg(test)]
+    fn enable_forward_tee(&mut self) {
+        self.osc_guard.forwarded = Some(Vec::new());
+    }
+
+    /// Spike #55 byte-level tee (TEST BUILDS ONLY): drains and returns every
+    /// byte captured since [`Self::enable_forward_tee`].
+    #[cfg(test)]
+    fn take_forwarded_bytes(&mut self) -> Vec<u8> {
+        self.osc_guard
+            .forwarded
+            .as_mut()
+            .map(std::mem::take)
+            .unwrap_or_default()
+    }
+
     /// Consumes PTY output and extracts inline object control sequences.
     pub fn consume_pty_output<CB: Callbacks>(
         &mut self,
@@ -2813,8 +2858,12 @@ mod spike55_pane0_fuzz {
     /// KILL CONDITION 2. A RAW (un-encoded) payload carrying real pane-1
     /// terminal output executes against pane 0. The payload's own `ESC`
     /// pulls vte out of the APC string, so the rest of the frame runs as
-    /// control sequences and prints as text. This is what makes base64
-    /// load-bearing for shape (b).
+    /// control sequences and prints as text.
+    ///
+    /// NOTE ON WORDING: this does NOT make base64 specifically load-bearing.
+    /// The invariant it proves is narrower — the payload alphabet must
+    /// exclude `ESC` (0x1b), `0x9c`, `CAN` (0x18) and `SUB` (0x1a). base64,
+    /// base64url and hex all satisfy it.
     #[test]
     fn spike55_raw_payload_executes_against_pane0() {
         let base = feed(&[&baseline_bytes()[..]]);
@@ -2837,5 +2886,739 @@ mod spike55_pane0_fuzz {
             base.0 != got.0,
             "the baseline must not already look like this",
         );
+    }
+
+    // ==================================================================
+    // SPIKE #55 ITEM 1 — THE BYTE-LEVEL ORACLE
+    //
+    // The charter's literal standard is BYTE-level: "zero bytes may ever
+    // leak into pane 0" (docs/research/browser-story.md:507). Everything
+    // above is a SCREEN-level oracle, which is strictly weaker: it cannot
+    // see bytes that reach vte and are swallowed inside vte's APC state
+    // machine. `OscGuard::forward` (src/inline.rs:224) now carries a
+    // `#[cfg(test)]` tee of the exact bytes handed to
+    // `vt100::Parser::process`, so the two standards can be compared.
+    // ==================================================================
+
+    /// Screen state AND the exact bytes handed to the vt100 parser.
+    fn feed_teed(chunks: &[&[u8]]) -> (String, String, Vec<u8>) {
+        let mut parser = new_parser();
+        let mut inline = TerminalInlineObjects::default();
+        inline.enable_forward_tee();
+        for chunk in chunks {
+            inline.consume_pty_output(chunk, &mut parser);
+        }
+        let forwarded = inline.take_forwarded_bytes();
+        let screen = parser.screen();
+        (
+            screen.contents(),
+            String::from_utf8_lossy(&screen.contents_formatted()).into_owned(),
+            forwarded,
+        )
+    }
+
+    /// Removes every leftmost non-overlapping occurrence of `needle`.
+    fn strip_all(haystack: &[u8], needle: &[u8]) -> Vec<u8> {
+        if needle.is_empty() {
+            return haystack.to_vec();
+        }
+        let mut out = Vec::with_capacity(haystack.len());
+        let mut i = 0;
+        while i < haystack.len() {
+            if haystack[i..].starts_with(needle) {
+                i += needle.len();
+            } else {
+                out.push(haystack[i]);
+                i += 1;
+            }
+        }
+        out
+    }
+
+    #[derive(Default)]
+    struct ByteOutcome {
+        tearings: usize,
+        screen_diverged: usize,
+        strict_diverged: usize,
+        elided_diverged: usize,
+        extra_bytes_max: i64,
+        first_elided_example: Option<String>,
+    }
+
+    fn byte_compare(
+        outcome: &mut ByteOutcome,
+        base_screen: &(String, String),
+        base_forwarded: &[u8],
+        got: &(String, String, Vec<u8>),
+        frame: &[u8],
+        label: &str,
+    ) {
+        outcome.tearings += 1;
+        if base_screen.0 != got.0 || base_screen.1 != got.1 {
+            outcome.screen_diverged += 1;
+        }
+        if base_forwarded != got.2.as_slice() {
+            outcome.strict_diverged += 1;
+        }
+        let elided = strip_all(&got.2, frame);
+        if elided != base_forwarded {
+            outcome.elided_diverged += 1;
+            outcome.extra_bytes_max = outcome
+                .extra_bytes_max
+                .max(elided.len() as i64 - base_forwarded.len() as i64);
+            if outcome.first_elided_example.is_none() {
+                outcome.first_elided_example = Some(format!(
+                    "{label}: forwarded-after-eliding-frames ({} B) != baseline forwarded ({} B)",
+                    elided.len(),
+                    base_forwarded.len(),
+                ));
+            }
+        }
+    }
+
+    /// ITEM 1 REPORT. Re-runs every frame shape from `cases()` under the
+    /// BYTE-level differential oracle and prints, per shape, how the two
+    /// standards disagree.
+    ///
+    /// Two byte oracles are reported because they answer different
+    /// questions:
+    ///   * STRICT — the bytes forwarded for the muxed stream must be
+    ///     byte-identical to those forwarded for the baseline. This is the
+    ///     charter sentence read literally.
+    ///   * FRAME-ELIDED — the same, after deleting every verbatim copy of
+    ///     the intact mux frame. This asks the narrower question "did
+    ///     anything OTHER than an intact frame reach pane 0's parser".
+    #[test]
+    fn spike55_item1_byte_level_oracle_report() {
+        let (base_text, base_fmt, base_forwarded) = feed_teed(&[&baseline_bytes()[..]]);
+        let base_screen = (base_text, base_fmt);
+
+        println!("\n============ spike #55 item 1: BYTE-level differential oracle ============");
+        println!(
+            "baseline: {} stream bytes; {} bytes forwarded to vt100",
+            baseline_bytes().len(),
+            base_forwarded.len(),
+        );
+        println!(
+            "note    : the baseline's own RGP APCs ARE claimed, so fewer bytes reach vte\n\
+             \x20         than were fed in ({} claimed).",
+            baseline_bytes().len() - base_forwarded.len(),
+        );
+        println!("columns : screen = old (weaker) oracle; strict/elided = new byte oracle\n");
+
+        let families: [(&str, Vec<usize>); 2] = [
+            ("SAFE", safe_offsets()),
+            ("ADVERSARIAL", adversarial_offsets()),
+        ];
+
+        for (family, offsets) in &families {
+            println!(
+                "---- injection family: {family} ({} splices)",
+                offsets.len()
+            );
+            for case in cases() {
+                let stream = muxed(&case.frame, offsets);
+                let mut outcome = ByteOutcome::default();
+                byte_compare(
+                    &mut outcome,
+                    &base_screen,
+                    &base_forwarded,
+                    &feed_teed(&[&stream]),
+                    &case.frame,
+                    "whole",
+                );
+                for k in 0..=stream.len() {
+                    byte_compare(
+                        &mut outcome,
+                        &base_screen,
+                        &base_forwarded,
+                        &feed_teed(&[&stream[..k], &stream[k..]]),
+                        &case.frame,
+                        &format!("2-way@{k}"),
+                    );
+                }
+                let drip: Vec<&[u8]> = (0..stream.len()).map(|i| &stream[i..i + 1]).collect();
+                byte_compare(
+                    &mut outcome,
+                    &base_screen,
+                    &base_forwarded,
+                    &feed_teed(&drip),
+                    &case.frame,
+                    "1-byte-drip",
+                );
+
+                println!(
+                    "  {:<42} tearings {:>5}  screen-diverged {:>5}  BYTE-strict-diverged {:>5}  BYTE-elided-diverged {:>5}",
+                    case.name,
+                    outcome.tearings,
+                    outcome.screen_diverged,
+                    outcome.strict_diverged,
+                    outcome.elided_diverged,
+                );
+                if outcome.screen_diverged == 0 && outcome.strict_diverged > 0 {
+                    println!(
+                        "        ^^ PASSES the screen oracle, FAILS the byte oracle \
+                         (mux frame bytes are handed verbatim to vt100 at src/inline.rs:425-427)"
+                    );
+                }
+                if let Some(example) = &outcome.first_elided_example {
+                    println!("        first frame-elided divergence — {example}");
+                }
+            }
+            println!();
+        }
+        println!("=========================================================================\n");
+    }
+
+    /// ITEM 1's KEY RESULT, locked in. The one shape the screen oracle
+    /// blessed — base64 payload + `ESC \` terminator, spliced only between
+    /// whole pane-0 sequences — FAILS the byte-level oracle on every single
+    /// tearing.
+    ///
+    /// CAUSE: `handle_apc_sequence` does not claim `ratty;m` today, so
+    /// `consume_pty_output` forwards the WHOLE sequence to the vt100 parser
+    /// (src/inline.rs:425-427). Every byte of every mux frame is handed to
+    /// pane 0's parser; it is vte's APC state machine, not ratty, that
+    /// decides they are harmless. That is exactly the dependency K1 and K2
+    /// exploit.
+    #[test]
+    fn spike55_item1_byte_oracle_fails_the_shape_the_screen_oracle_passed() {
+        let (base_text, base_fmt, base_forwarded) = feed_teed(&[&baseline_bytes()[..]]);
+        let base_screen = (base_text, base_fmt);
+        let payload = base64(b"MUXPAYLOAD pane one says hi MUXTAIL");
+        let frame = mux_frame(1, payload.as_bytes(), false);
+        let stream = muxed(&frame, &safe_offsets());
+
+        let mut screen_diverged = 0usize;
+        let mut strict_diverged = 0usize;
+        let mut elided_diverged = 0usize;
+        let mut tearings = 0usize;
+        for k in 0..=stream.len() {
+            let got = feed_teed(&[&stream[..k], &stream[k..]]);
+            tearings += 1;
+            if got.0 != base_screen.0 || got.1 != base_screen.1 {
+                screen_diverged += 1;
+            }
+            if got.2 != base_forwarded {
+                strict_diverged += 1;
+            }
+            if strip_all(&got.2, &frame) != base_forwarded {
+                elided_diverged += 1;
+            }
+        }
+
+        println!(
+            "\nITEM 1 KEY RESULT (base64 + ESC-backslash, SAFE splices): {tearings} tearings, \
+             screen-diverged {screen_diverged}, BYTE-strict-diverged {strict_diverged}, \
+             BYTE-frame-elided-diverged {elided_diverged}\n"
+        );
+
+        assert_eq!(
+            screen_diverged, 0,
+            "the screen oracle is supposed to bless this shape",
+        );
+        assert_eq!(
+            strict_diverged, tearings,
+            "every tearing must fail the strict byte oracle: the frame is forwarded verbatim \
+             to vt100 at src/inline.rs:425-427",
+        );
+        assert_eq!(
+            elided_diverged, 0,
+            "nothing OTHER than intact frames should reach vt100 for this shape",
+        );
+    }
+
+    /// MUTATION-DETECTION POWER of the new oracle, item 2 of the charter.
+    ///
+    /// A verifier proved the SCREEN oracle has zero mutation-detection power
+    /// over the chunk-boundary machinery: replacing the body of
+    /// `pending_apc_prefix_start` (src/inline.rs:1196-1203) with a plain
+    /// `bytes.len()` leaves all crate tests passing while silently breaking
+    /// a split-across-the-boundary APC.
+    ///
+    /// This test pins the byte-level signal that mutation destroys: when the
+    /// stream is torn BETWEEN the `ESC` and the `_` of a claimed RGP APC,
+    /// the trailing-`ESC` retention keeps the two halves together, so the
+    /// sequence is claimed and NOTHING is forwarded. Under the mutation the
+    /// lone `ESC` is forwarded to vt100 immediately, so the tee sees an
+    /// extra byte that the screen never shows.
+    #[test]
+    fn spike55_item2_byte_oracle_detects_trailing_esc_retention() {
+        // A claimed RGP APC, torn between its ESC and its `_`.
+        let stream = b"ALPHA0\r\n\x1b_ratty;g;d\x1b\\BRAVO1\r\n".to_vec();
+        let split = stream
+            .iter()
+            .position(|b| *b == 0x1b)
+            .expect("the stream contains an ESC")
+            + 1;
+        assert_eq!(stream[split - 1], 0x1b, "split really is after the ESC");
+        assert_eq!(stream[split], b'_', "split really is before the `_`");
+
+        let whole = feed_teed(&[&stream]);
+        let torn = feed_teed(&[&stream[..split], &stream[split..]]);
+
+        println!(
+            "\nITEM 2 mutation probe:\n  whole forwarded : {:?}\n  torn  forwarded : {:?}",
+            String::from_utf8_lossy(&whole.2),
+            String::from_utf8_lossy(&torn.2),
+        );
+
+        assert_eq!(
+            whole.0, torn.0,
+            "the SCREEN is identical either way — this is why the screen oracle is blind",
+        );
+        assert_eq!(
+            whole.2, torn.2,
+            "BYTE ORACLE: tearing between ESC and `_` must not change the bytes vt100 sees. \
+             If this fails, `pending_apc_prefix_start` (src/inline.rs:1196-1203) stopped \
+             retaining the trailing ESC.",
+        );
+        assert!(
+            !whole.2.contains(&0x1b),
+            "the claimed RGP APC must contribute no bytes at all to pane 0; got {:?}",
+            String::from_utf8_lossy(&whole.2),
+        );
+    }
+
+    // ==================================================================
+    // SPIKE #55 ITEM 3 — KILL CONDITIONS K4..K7, LOCKED IN
+    //
+    // Each test asserts the CURRENT (broken) behaviour so the evidence is
+    // reproducible, and names the production line responsible.
+    // ==================================================================
+
+    /// K4 — A LOST TERMINATOR STALLS PANE 0, and it is ENCODING-INDEPENDENT:
+    /// this frame is pure base64 with the canonical `ESC \` terminator, and
+    /// only the terminator is missing.
+    ///
+    /// PRODUCTION CAUSE: src/inline.rs:404-417. When `apc_end` finds no
+    /// terminator, `consume_pty_output` drains only up to `start` and
+    /// RETAINS everything after it in `pending_bytes`, so every subsequent
+    /// byte of pane-0 output is buffered and never forwarded. The loss
+    /// window is bounded only by `MAX_APC_SEQUENCE_BYTES` = 8 MiB
+    /// (src/inline.rs:139), and even at the cap the resync
+    /// (`resync_after_overlong_apc`, src/inline.rs:440) keeps discarding
+    /// until an `ESC \` or `0x9c` actually appears.
+    ///
+    /// The existing fuzz cannot see this: every unterminated frame in its
+    /// corpus sits at END OF STREAM (src/inline.rs:2733-2800).
+    #[test]
+    fn spike55_k4_lost_terminator_stalls_pane0() {
+        let mut truncated = mux_frame(1, base64(b"MUXPAYLOAD").as_bytes(), false);
+        truncated.truncate(truncated.len() - 2); // drop the `ESC \`
+        assert!(!truncated.ends_with(b"\x1b\\"));
+
+        let (screen, _, forwarded) = feed_teed(&[
+            b"ALPHA0 first\r\n",
+            &truncated,
+            b"BRAVO1 second\r\n",
+            b"CHARLIE2 third\r\n",
+        ]);
+
+        println!(
+            "\nK4: pane 0 = {:?}\n    forwarded to vt100 = {:?}",
+            squash(&screen),
+            String::from_utf8_lossy(&forwarded),
+        );
+
+        assert!(screen.contains("ALPHA0"), "pre-frame output must survive");
+        assert!(
+            !screen.contains("BRAVO1") && !screen.contains("CHARLIE2"),
+            "K4 DID NOT REPRODUCE: post-frame pane-0 output reached the screen; got {:?}",
+            squash(&screen),
+        );
+        assert!(
+            !forwarded.windows(6).any(|w| w == b"BRAVO1"),
+            "K4 byte oracle: post-frame bytes must never reach vt100 at all",
+        );
+
+        // …and the stall ends only when an ST byte finally appears.
+        let (recovered, _, _) = feed_teed(&[
+            b"ALPHA0 first\r\n",
+            &truncated,
+            b"BRAVO1 second\r\n",
+            b"\x1b\\",
+            b"CHARLIE2 third\r\n",
+        ]);
+        println!(
+            "K4 after a late ST arrives: pane 0 = {:?}",
+            squash(&recovered)
+        );
+        assert!(
+            recovered.contains("CHARLIE2"),
+            "a later ST should end the stall; got {:?}",
+            squash(&recovered),
+        );
+        assert!(
+            !recovered.contains("BRAVO1"),
+            "the bytes buffered during the stall are consumed as APC payload, not printed; got {:?}",
+            squash(&recovered),
+        );
+    }
+
+    /// K5 — SPLICING MID-UTF-8-CODEPOINT CORRUPTS PANE 0, even for the
+    /// "safe" shape (base64 payload + `ESC \` terminator) and even when the
+    /// splice is nowhere near a pane-0 escape sequence.
+    ///
+    /// PRODUCTION CAUSE: the scanner is byte-oriented with no notion of
+    /// UTF-8 (`windows(2)` search at src/inline.rs:375-377), so a frame may
+    /// be spliced between the lead byte and the continuation bytes of one
+    /// character. vte's UTF-8 decoder then sees `ESC` mid-character and
+    /// abandons the partial codepoint.
+    ///
+    /// The existing corpus cannot express this: `baseline_parts`
+    /// (src/inline.rs:2237-2253) is pure ASCII, and `adversarial_offsets`
+    /// (src/inline.rs:2291-2304) only emits offsets adjacent to `ESC`.
+    #[test]
+    fn spike55_k5_mid_utf8_splice_corrupts_pane0() {
+        const PREFIX: &[u8] = b"\x1b[2J\x1b[H";
+        let text = "ALPHA0 café — naïve “smart” ✓ 日本語 BRAVO1\r\n";
+        let mut baseline = PREFIX.to_vec();
+        baseline.extend_from_slice(text.as_bytes());
+
+        let frame = mux_frame(1, base64(b"MUXPAYLOAD").as_bytes(), false);
+        let base = feed(&[&baseline]);
+
+        let (mut boundary_total, mut boundary_bad) = (0usize, 0usize);
+        let (mut mid_total, mut mid_bad) = (0usize, 0usize);
+        let mut first_bad = String::new();
+
+        for offset in 0..=text.len() {
+            let mut stream = PREFIX.to_vec();
+            stream.extend_from_slice(&text.as_bytes()[..offset]);
+            stream.extend_from_slice(&frame);
+            stream.extend_from_slice(&text.as_bytes()[offset..]);
+            let got = feed(&[&stream]);
+            let diverged = got.0 != base.0 || got.1 != base.1;
+            if text.is_char_boundary(offset) {
+                boundary_total += 1;
+                boundary_bad += usize::from(diverged);
+            } else {
+                mid_total += 1;
+                mid_bad += usize::from(diverged);
+                if diverged && first_bad.is_empty() {
+                    first_bad = format!(
+                        "offset {offset}: baseline {:?} vs muxed {:?}",
+                        squash(&base.0),
+                        squash(&got.0),
+                    );
+                }
+            }
+        }
+
+        println!(
+            "\nK5: splices at CHAR BOUNDARIES {boundary_bad}/{boundary_total} corrupted pane 0; \
+             splices MID-CODEPOINT {mid_bad}/{mid_total} corrupted pane 0"
+        );
+        if !first_bad.is_empty() {
+            println!("    first mid-codepoint corruption — {first_bad}");
+        }
+
+        assert_eq!(
+            boundary_bad, 0,
+            "the control must be clean: splicing at a character boundary must not corrupt pane 0",
+        );
+        assert!(
+            mid_bad > 0,
+            "K5 DID NOT REPRODUCE: no mid-codepoint splice corrupted pane 0 \
+             ({mid_bad}/{mid_total})",
+        );
+    }
+
+    /// K6 — NESTED frames leak onto pane 0. Only ADJACENT frames were
+    /// covered before ("base64 x2 back-to-back", src/inline.rs:2543-2548).
+    ///
+    /// PRODUCTION CAUSE: `apc_end` (src/inline.rs:1205-1219) scans for the
+    /// FIRST terminator and has no notion of a nested APC introducer, so the
+    /// outer frame is closed by the INNER frame's terminator and the outer
+    /// frame's tail becomes ordinary text on pane 0.
+    #[test]
+    fn spike55_k6_nested_frames_leak_onto_pane0() {
+        let mut nested = b"\x1b_ratty;m;1;QUFB".to_vec(); // outer, unterminated
+        nested.extend_from_slice(b"\x1b_ratty;m;2;QkJC\x1b\\"); // inner, terminated
+        nested.extend_from_slice(b"NESTEDTAIL"); // outer's tail
+        nested.extend_from_slice(b"\x1b\\"); // outer's terminator
+
+        let (screen, _, forwarded) =
+            feed_teed(&[b"ALPHA0 first\r\n", &nested, b"BRAVO1 second\r\n"]);
+
+        println!(
+            "\nK6: pane 0 = {:?}\n    forwarded to vt100 = {:?}",
+            squash(&screen),
+            String::from_utf8_lossy(&forwarded),
+        );
+
+        assert!(
+            screen.contains("NESTEDTAIL"),
+            "K6 DID NOT REPRODUCE: the outer frame's tail did not print; pane 0 = {:?}",
+            squash(&screen),
+        );
+    }
+
+    /// K7 — **PRE-EXISTING SHIPPED BUG. NO MUX FRAME IS INVOLVED.** This is
+    /// reachable from ordinary terminal output on today's single-pane
+    /// product and is logically separate from the #55 mux question.
+    ///
+    /// PRODUCTION CAUSE: the APC scan at src/inline.rs:375-377 is a raw
+    /// `windows(2)` byte search for `ESC _` with NO vt100 state awareness,
+    /// so it claims an `ESC _` that occurs inside a pane-0 OSC or DCS
+    /// PAYLOAD. `apc_end` then finds no `ESC \` (the OSC ends with BEL), so
+    /// the retention path at src/inline.rs:404-417 buffers all subsequent
+    /// output forever — the terminal stalls with no mux frame in sight.
+    ///
+    /// No test stream in the repo contains an OSC or DCS at all.
+    #[test]
+    fn spike55_k7_shipped_bug_esc_underscore_inside_osc_payload_stalls_terminal() {
+        // An ordinary xterm title-set whose title text happens to contain
+        // ESC _, terminated the ordinary way with BEL.
+        let stream: Vec<u8> = [
+            b"A0 before\r\n".as_slice(),
+            b"\x1b]0;ti".as_slice(),
+            b"\x1b_".as_slice(),
+            b"tle".as_slice(),
+            b"\x07".as_slice(),
+            b"B1 after\r\n".as_slice(),
+            b"C2 later\r\n".as_slice(),
+        ]
+        .concat();
+
+        let (screen, _, forwarded) = feed_teed(&[&stream]);
+        println!(
+            "\nK7 (no mux frame anywhere): pane 0 = {:?}\n    forwarded to vt100 = {:?}",
+            squash(&screen),
+            String::from_utf8_lossy(&forwarded),
+        );
+
+        assert!(screen.contains("A0"), "output before the OSC must survive");
+        assert!(
+            !screen.contains("B1") && !screen.contains("C2"),
+            "K7 DID NOT REPRODUCE: output after the OSC still reached pane 0; got {:?}",
+            squash(&screen),
+        );
+
+        // SCOPE, measured rather than assumed. A DCS carrying `ESC _` is
+        // ALSO mis-claimed, but a DCS ends with `ESC \`, which `apc_end`
+        // accepts, so the fake APC closes at the DCS's own terminator and
+        // pane 0 survives. The stall needs a host sequence that does NOT
+        // end with `ESC \` or `0x9c` — i.e. a BEL-terminated OSC.
+        let dcs: Vec<u8> = [
+            b"A0 before\r\n".as_slice(),
+            b"\x1bPtmux;\x1b_x\x1b\\".as_slice(),
+            b"B1 after\r\n".as_slice(),
+        ]
+        .concat();
+        let (dcs_screen, _, _) = feed_teed(&[&dcs]);
+        println!(
+            "K7 (DCS + ESC-backslash variant): pane 0 = {:?}",
+            squash(&dcs_screen)
+        );
+        assert!(
+            dcs_screen.contains("B1"),
+            "an ST-terminated host sequence does NOT stall; got {:?}",
+            squash(&dcs_screen),
+        );
+
+        // RECOVERY, measured rather than assumed.
+        //
+        // (a) A later `ESC \` ends the stall: ratty's fake APC closes, and
+        //     everything buffered in between is eaten as its payload.
+        let mut esc_st_recovery = stream.clone();
+        esc_st_recovery.extend_from_slice(b"\x1b\\D3 recovered\r\n");
+        let (esc_st_screen, _, _) = feed_teed(&[&esc_st_recovery]);
+        println!(
+            "K7 recovery via a later ESC-backslash: pane 0 = {:?}",
+            squash(&esc_st_screen)
+        );
+        assert!(
+            esc_st_screen.contains("D3"),
+            "a later ESC-backslash should end the stall; got {:?}",
+            squash(&esc_st_screen),
+        );
+        assert!(
+            !esc_st_screen.contains("B1") && !esc_st_screen.contains("C2"),
+            "everything buffered during the stall is eaten as APC payload; got {:?}",
+            squash(&esc_st_screen),
+        );
+
+        // (b) A later bare `0x9c` (the third byte of U+2018..U+201F — an
+        //     ordinary curly quote) ends ratty's stall but does NOT restore
+        //     the screen: `apc_end` accepts 0x9c, the unclaimed sequence is
+        //     forwarded to vte, and vte's `SosPmApcString` state has no
+        //     0x9c arm, so the parser wedges instead. This is K1 firing on
+        //     a stream that contains no mux frame at all.
+        let mut curly_recovery = stream.clone();
+        curly_recovery.extend_from_slice("D3 \u{201c}quoted\u{201d}\r\n".as_bytes());
+        curly_recovery.extend_from_slice(b"E4 finally\r\n");
+        let (curly_screen, _, _) = feed_teed(&[&curly_recovery]);
+        println!(
+            "K7 recovery attempt via a curly quote's 0x9c: pane 0 = {:?}",
+            squash(&curly_screen)
+        );
+        assert!(
+            !curly_screen.contains("E4"),
+            "a bare 0x9c must NOT restore pane 0 — it wedges vte instead (K1); got {:?}",
+            squash(&curly_screen),
+        );
+
+        // And the control: the identical title WITHOUT the ESC _ is fine.
+        let control: Vec<u8> = [
+            b"A0 before\r\n".as_slice(),
+            b"\x1b]0;title\x07".as_slice(),
+            b"B1 after\r\n".as_slice(),
+            b"C2 later\r\n".as_slice(),
+        ]
+        .concat();
+        let (control_screen, _, _) = feed_teed(&[&control]);
+        println!(
+            "K7 control (no ESC _ in the title): pane 0 = {:?}",
+            squash(&control_screen)
+        );
+        assert!(
+            control_screen.contains("B1") && control_screen.contains("C2"),
+            "the control must be clean; got {:?}",
+            squash(&control_screen),
+        );
+    }
+
+    // ==================================================================
+    // SPIKE #55 ITEM 4 — CRATE-SIDE DEMUX CPU
+    //
+    // NATIVE BUILD ONLY. These absolute numbers DO NOT TRANSFER TO WASM:
+    // wasm has no threads and no pipelined rendering (the lesson of #54).
+    // Read the RATIO, not the absolutes.
+    // ==================================================================
+
+    /// Realistic pane-0 traffic — plain text, SGR runs, EL and CR redraws —
+    /// as a list of atomic pieces. The PANE-0 PAYLOAD IS HELD CONSTANT
+    /// between the two corpora, so the mux corpus is strictly "the same
+    /// work, plus frames" rather than "the same total bytes".
+    fn bench_pane0_pieces(target: usize) -> Vec<Vec<u8>> {
+        let mut pieces = Vec::new();
+        let mut bytes = 0usize;
+        let mut n = 0u32;
+        while bytes < target {
+            for piece in [
+                format!("line {n:06} plain text output from a build log\r\n"),
+                format!("\x1b[32m  ok\x1b[0m line {n:06} \x1b[1;33mwarning\x1b[m tail\r\n"),
+                "\x1b[2Kprogress \x1b[7m####\x1b[27m 42%\r".to_string(),
+            ] {
+                bytes += piece.len();
+                pieces.push(piece.into_bytes());
+            }
+            n += 1;
+        }
+        pieces
+    }
+
+    /// Splices `frame` after every `every`-th pane-0 piece (0 = no frames)
+    /// and cuts the result into 8 KiB PTY-sized reads.
+    fn bench_chunks(pieces: &[Vec<u8>], frame: &[u8], every: usize) -> Vec<Vec<u8>> {
+        let mut stream = Vec::new();
+        for (i, piece) in pieces.iter().enumerate() {
+            stream.extend_from_slice(piece);
+            if every > 0 && i % every == every - 1 {
+                stream.extend_from_slice(frame);
+            }
+        }
+        stream.chunks(8192).map(<[u8]>::to_vec).collect()
+    }
+
+    /// Best-of-`runs` wall time for pushing `chunks` through a fresh
+    /// scanner + parser.
+    fn bench_best_secs(chunks: &[Vec<u8>], runs: usize) -> f64 {
+        // Warm up (and prove the corpus parses) before timing.
+        {
+            let mut parser = new_parser();
+            let mut inline = TerminalInlineObjects::default();
+            for chunk in chunks.iter().take(16) {
+                inline.consume_pty_output(chunk, &mut parser);
+            }
+        }
+        let mut best = f64::MAX;
+        for _ in 0..runs {
+            let mut parser = new_parser();
+            let mut inline = TerminalInlineObjects::default();
+            let started = std::time::Instant::now();
+            for chunk in chunks {
+                std::hint::black_box(
+                    inline.consume_pty_output(std::hint::black_box(chunk), &mut parser),
+                );
+            }
+            best = best.min(started.elapsed().as_secs_f64());
+        }
+        best
+    }
+
+    #[test]
+    fn spike55_item4_crate_side_demux_throughput() {
+        const TARGET: usize = 8 * 1024 * 1024;
+        const RUNS: usize = 5;
+
+        let pieces = bench_pane0_pieces(TARGET);
+        let pane0_bytes: usize = pieces.iter().map(Vec::len).sum();
+        let frame = mux_frame(
+            1,
+            base64(b"pane one output line with some colour and text").as_bytes(),
+            false,
+        );
+
+        let variants: [(&str, usize); 3] = [
+            ("(i)  pane-0 only, no mux frames", 0),
+            ("(ii) + mux frame every 3 pieces", 3),
+            ("(ii')+ mux frame every 12 pieces", 12),
+        ];
+
+        println!("\n=========== spike #55 item 4: crate-side demux throughput ===========");
+        println!(
+            "PROFILE: {}",
+            if cfg!(debug_assertions) {
+                "dev — opt-level=1 for this crate, 3 for deps, debug_assertions ON \
+                 (Cargo.toml:129-134)"
+            } else {
+                "release — opt-level=3, lto=\"fat\", codegen-units=1 (Cargo.toml:136-140)"
+            },
+        );
+        println!("NATIVE build. Absolutes DO NOT transfer to wasm (no threads, no pipelined");
+        println!("rendering — the #54 lesson of issue #54). READ THE RATIO, not the MiB/s.");
+        println!("Best of {RUNS} runs; identical pane-0 payload ({pane0_bytes} B) in every");
+        println!("variant, fed in 8 KiB PTY-sized reads through consume_pty_output into a");
+        println!("live 24x80 vt100::Parser. The #[cfg(test)] byte tee is DISABLED here.\n");
+
+        let mut baseline_secs = 0.0f64;
+        let mut baseline_ns_stream = 0.0f64;
+        for (i, (name, every)) in variants.iter().enumerate() {
+            let chunks = bench_chunks(&pieces, &frame, *every);
+            let stream_bytes: usize = chunks.iter().map(Vec::len).sum();
+            let secs = bench_best_secs(&chunks, RUNS);
+            let mibps = (stream_bytes as f64 / (1024.0 * 1024.0)) / secs;
+            let ns_stream = secs * 1e9 / stream_bytes as f64;
+            let ns_pane0 = secs * 1e9 / pane0_bytes as f64;
+            if i == 0 {
+                baseline_secs = secs;
+                baseline_ns_stream = ns_stream;
+            }
+            println!(
+                "  {name:<34} stream {stream_bytes:>9} B ({:>5.1}% frames)  {secs:>7.4} s  \
+                 {mibps:>6.1} MiB/s  {ns_stream:>5.2} ns/stream-B  {ns_pane0:>5.2} ns/pane0-B",
+                (stream_bytes - pane0_bytes) as f64 * 100.0 / stream_bytes as f64,
+            );
+            if i > 0 {
+                println!(
+                    "        RATIO vs (i): {:.3}x wall time for the SAME pane-0 payload; \
+                     {:.3}x cost per stream byte",
+                    secs / baseline_secs,
+                    ns_stream / baseline_ns_stream,
+                );
+            }
+        }
+        println!(
+            "\n  READING: the per-stream-byte ratio near or below 1.0 says a mux frame byte is\n\
+             \x20          NO MORE expensive than a pane-0 byte (frames are swallowed by vte's\n\
+             \x20          APC state; pane-0 bytes reach the grid). The wall-time ratio is the\n\
+             \x20          honest cost of carrying pane N in-band on the same stream."
+        );
+        println!("=====================================================================\n");
+
+        assert!(pane0_bytes > 0);
     }
 }
