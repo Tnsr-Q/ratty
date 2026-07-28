@@ -1418,10 +1418,61 @@ mod tests {
     /// predator-and-frame exercises the full v2 surface. If this fails, a
     /// compiler change altered shipped output — that is a regression, not
     /// a test to update casually.
+    /// Every directory under `transmissions/` that ships both a `scene.json`
+    /// and a committed `cast.silk`. Discovered rather than listed: a hardcoded
+    /// list silently fell two transmissions behind the comment above, leaving
+    /// `stone-fruit` and `the-same-animal` — the two largest, 47% of the
+    /// corpus by bytes — with no drift protection at all.
+    fn committed_transmissions(root: &Path) -> Vec<String> {
+        let mut slugs: Vec<String> = fs::read_dir(root)
+            .expect("read transmissions dir")
+            .map(|entry| entry.expect("dir entry").path())
+            .filter(|path| path.join("scene.json").is_file() && path.join("cast.silk").is_file())
+            .map(|path| {
+                path.file_name()
+                    .expect("transmission dir name")
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        slugs.sort();
+        slugs
+    }
+
+    /// The discovered set must match `index.json` exactly, so a transmission
+    /// that is committed but unindexed — or indexed but missing — fails loudly
+    /// instead of quietly dropping out of the golden proof.
+    #[test]
+    fn golden_transmission_set_matches_the_index() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../transmissions");
+        let discovered = committed_transmissions(&root);
+        let index: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(root.join("index.json")).expect("read index"))
+                .expect("parse index");
+        let mut indexed: Vec<String> = index
+            .as_array()
+            .expect("index is an array")
+            .iter()
+            .map(|entry| entry["slug"].as_str().expect("slug").to_owned())
+            .collect();
+        indexed.sort();
+        assert_eq!(
+            discovered, indexed,
+            "committed transmissions and index.json have drifted apart"
+        );
+    }
+
     #[test]
     fn golden_transmissions_compile_byte_identically() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../transmissions");
-        for slug in ["orchard-upside-down", "predator-and-frame", "soul"] {
+        let slugs = committed_transmissions(&root);
+        // Guard the classic false pass: an empty discovery would make the loop
+        // body never run and report success without proving anything.
+        assert!(
+            slugs.len() >= 5,
+            "expected at least the five committed transmissions, found {slugs:?}"
+        );
+        for slug in &slugs {
             let scene_path = root.join(slug).join("scene.json");
             let source = fs::read_to_string(&scene_path).expect("read scene");
             let scene: Scene = serde_json::from_str(&source).expect("parse scene");
