@@ -183,6 +183,12 @@ beat 1.0
 echo "    (joined, but nothing drawn yet — a participant with no reported"
 echo "     cursor renders nothing. now the cursors:)"
 beat 1.2
+# Alice sits at (8,4) on purpose: that cell is under this script's own
+# narration, so her label composites over live text while Bob's (30,9) and
+# Carol's (52,9) land on empty plane. That contrast is the whole point --
+# it is what surfaced the label-legibility finding on the first clean run,
+# and moving her somewhere prettier would retire the only case that tests
+# it. Keep her over the text.
 emit user cursor alice -x 8  -y 4
 emit user cursor bob   -x 30 -y 9
 beat 2.0
