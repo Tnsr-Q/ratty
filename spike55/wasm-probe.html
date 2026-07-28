@@ -1,0 +1,114 @@
+<!doctype html>
+<!--
+  spike #55 item 3 — WASM CONFIRMATION PROBE (throwaway, branch claude/browser-mux-spike).
+
+  Purpose: the native fuzz proves K1/K4 against consume_pty_output directly. This
+  proves they reproduce through the *shipped wasm surface* — feed() into a real
+  Bevy App on real WebGPU — closing the "nothing ran in wasm" gap that #55 exists
+  to close. consume_pty_output has exactly one production call site
+  (src/systems.rs:194, inside pump_pty_output), shared by the native PTY and the
+  wasm virtual channel, so this is the same scanner either way; the probe confirms
+  it empirically rather than by inspection.
+
+  OBSERVABLE. ratty's JS surface has no screen readback, so pane 0 is probed with
+  DSR (ESC[6n), answered at src/runtime.rs:138-141 with ESC[<row>;<col>R and
+  returned through drain_input(). TWO distinct signals, and the difference between
+  them is what separates the two kill conditions:
+    K4 (lost terminator)  -> NO REPLY AT ALL. Everything after the unterminated
+                             frame, including the DSR itself, is retained in
+                             pending_bytes (src/inline.rs:359-373) and never
+                             reaches the parser.
+    K1 (bare 0x9c)        -> REPLY ARRIVES BUT THE CURSOR ROW DOES NOT ADVANCE.
+                             apc_end accepts 0x9c (src/inline.rs:1166) and forwards
+                             the frame; vte has no 0x9c arm in SosPmApcString so it
+                             wedges and eats the text — but the DSR's own ESC byte
+                             un-wedges it, so the report still comes back.
+  Reply-absence alone would therefore MISREAD K1 as healthy. Cursor row is the
+  load-bearing observable; a plain-text control step establishes that it advances.
+
+  HOW TO RUN
+    bash site/build-wasm.sh                       # needs wasm-bindgen-cli 0.2.118
+    cp spike55/wasm-probe.html site/pkg/          # site/pkg/ is gitignored
+    python3 -m http.server 8777 -d site
+    open http://localhost:8777/pkg/wasm-probe.html   # WebGPU browser required
+
+  IMPORTANT: wait for the app to reach a steady frame loop before the first step.
+  An earlier version of this probe fed its control step too early and got a false
+  "no reply" on a HEALTHY pane — i.e. a false positive for the very stall it was
+  looking for. The 2.5 s warm-up and the two control steps below exist because of
+  that. If step 1's row does not advance past step 0's, the run is INVALID and the
+  K rows below mean nothing.
+
+  RESULT OBSERVED (Chromium/WebGPU, 28 MB unoptimized bundle):
+    0-control-a        row 6   replied        baseline
+    1-control-b        row 7   replied        control sound: row advanced
+    2-K4-unterminated  --      NO REPLY       pane 0 stalled; DSR buffered
+    3-K4-recovery      row 7   replied        stall ended, but BRAVO was eaten
+    4-K1-bare-9c       row 7   replied        DELTA swallowed; row did NOT advance
+    5-after            row 8   replied        normal operation resumes
+-->
+<html lang="en">
+  <head><meta charset="utf-8" /><title>spike55 wasm probe</title></head>
+  <body>
+    <canvas id="c" width="800" height="480"></canvas>
+    <pre id="out">booting…</pre>
+    <script type="module">
+      const enc = (x) => new TextEncoder().encode(x);
+      const cat = (...ps) => {
+        const as = ps.map((p) => (typeof p === "string" ? enc(p) : Uint8Array.from(p)));
+        const o = new Uint8Array(as.reduce((n, a) => n + a.length, 0));
+        let i = 0;
+        for (const a of as) { o.set(a, i); i += a.length; }
+        return o;
+      };
+      const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+      const DSR = "\x1b[6n";
+
+      try {
+        const mod = await import("./ratty.js");
+        await mod.default();
+        const session = mod.start("#c", "");
+        window.__session = session;
+
+        const drain = async (ms = 900) => {
+          const acc = [];
+          const end = performance.now() + ms;
+          while (performance.now() < end) {
+            await sleep(50);
+            const g = session.drain_input();
+            if (g && g.length) acc.push(...g);
+          }
+          return new Uint8Array(acc);
+        };
+        const rowOf = (u) => {
+          const m = new TextDecoder().decode(u).match(/\x1b\[(\d+);(\d+)R/);
+          return m ? Number(m[1]) : null;
+        };
+
+        // Bevy + a 28 MB module needs real time before the pump is live.
+        await sleep(2500);
+        await drain(300);
+
+        const out = [];
+        const step = async (name, payload, note) => {
+          session.feed(payload);
+          const r = await drain();
+          out.push({ step: name, replied: r.length > 0, cursorRow: rowOf(r), note });
+        };
+
+        await step("0-control-a", cat("CTRLA\r\n", DSR), "baseline row");
+        await step("1-control-b", cat("CTRLB\r\n", DSR), "CONTROL: row must advance by 1, else run is invalid");
+        await step("2-K4-unterminated", cat("\x1b_ratty;m;1;QUFB", "BRAVO\r\n", DSR), "expect NO reply: DSR itself buffered");
+        await step("3-K4-recovery", cat("\x1b\\", DSR), "expect reply returns, row unchanged (BRAVO eaten)");
+        await step("4-K1-bare-9c", cat("\x1b_ratty;m;1;QUFB", [0x9c], "DELTA\r\n", DSR), "expect reply but row NOT advanced");
+        await step("5-after", cat("ECHO\r\n", DSR), "row advances again");
+
+        const valid = out[1].cursorRow === out[0].cursorRow + 1;
+        window.__results = { ok: true, controlValid: valid, results: out };
+      } catch (e) {
+        window.__results = { ok: false, error: String(e), stack: String(e && e.stack) };
+      }
+      document.getElementById("out").textContent = JSON.stringify(window.__results, null, 2);
+    </script>
+  </body>
+</html>
