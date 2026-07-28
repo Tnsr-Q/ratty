@@ -17,6 +17,10 @@ use crate::rgp::{
 const APC_START: &[u8] = b"\x1b_";
 const ST: &[u8] = b"\x1b\\";
 const C1_ST: u8 = 0x9c;
+/// `CAN`, one of the two bytes that abort a control string outright.
+const CAN: u8 = 0x18;
+/// `SUB`, `CAN`'s sibling: same abort, and the parser executes it.
+const SUB: u8 = 0x1a;
 
 /// Integrated built-in animation state for an RGP object root entity.
 ///
@@ -320,7 +324,7 @@ impl TerminalInlineObjects {
         // An earlier chunk overran the APC cap: keep swallowing bytes until
         // this sequence's terminator, so its tail is never mistaken for
         // text and printed to the screen.
-        if self.apc_discarding && !self.resync_after_overlong_apc() {
+        if self.apc_discarding && !self.resync_after_overlong_apc(0) {
             self.osc_guard = osc_guard;
             return replies;
         }
@@ -366,21 +370,35 @@ impl TerminalInlineObjects {
                         "discarding a malformed APC sequence: unterminated past {MAX_APC_SEQUENCE_BYTES} bytes"
                     );
                     self.apc_discarding = true;
-                    self.resync_after_overlong_apc();
+                    // The buffer still leads with the `ESC _` introducer here.
+                    self.resync_after_overlong_apc(APC_START.len());
                 }
                 self.osc_guard = osc_guard;
                 return replies;
             };
-            let sequence = self.pending_bytes[start..end].to_vec();
-            let (handled, reply) =
-                self.handle_apc_sequence(&sequence, parser.screen().cursor_position());
-            if let Some(reply) = reply {
-                replies.push(reply);
+            match end {
+                ApcScan::Terminated { seq_end } => {
+                    let sequence = self.pending_bytes[start..seq_end].to_vec();
+                    let (handled, reply) =
+                        self.handle_apc_sequence(&sequence, parser.screen().cursor_position());
+                    if let Some(reply) = reply {
+                        replies.push(reply);
+                    }
+                    if !handled {
+                        osc_guard.forward(parser, &sequence);
+                    }
+                    cursor = seq_end;
+                }
+                // A truncated sequence is not a command, so it is never
+                // dispatched. Resuming *at* the aborting byte — rather than
+                // past it — leaves it to be forwarded with the run that
+                // follows, which is what puts the `ESC` of the next escape
+                // sequence back in front of the parser. `at` is always at
+                // least `start + 2`, so the cursor still advances.
+                ApcScan::Abandoned { at } => {
+                    cursor = at;
+                }
             }
-            if !handled {
-                osc_guard.forward(parser, &sequence);
-            }
-            cursor = end;
         }
     }
 
@@ -392,9 +410,21 @@ impl TerminalInlineObjects {
     /// bar a trailing lone `ESC` — which may be the first half of an
     /// `ESC \` terminator split across two PTY reads — and discarding
     /// continues into the next chunk.
-    fn resync_after_overlong_apc(&mut self) -> bool {
-        if let Some(end) = apc_end(&self.pending_bytes, 0) {
-            self.pending_bytes.drain(..end);
+    ///
+    /// `payload_start` is where the APC's *payload* begins in the retained
+    /// buffer: `APC_START.len()` on the call that first gives up on a
+    /// sequence, because the buffer still carries the `ESC _` introducer and
+    /// scanning from zero would abandon on that very `ESC`; zero on later
+    /// calls, where the buffer holds nothing but payload continuation.
+    fn resync_after_overlong_apc(&mut self, payload_start: usize) -> bool {
+        if let Some(scan) = apc_end(&self.pending_bytes, payload_start) {
+            // Either ending resumes normal parsing; an abandoned sequence
+            // keeps its aborting byte so it reaches the parser.
+            let drop_to = match scan {
+                ApcScan::Terminated { seq_end } => seq_end,
+                ApcScan::Abandoned { at } => at,
+            };
+            self.pending_bytes.drain(..drop_to);
             self.apc_discarding = false;
             true
         } else {
@@ -1157,20 +1187,51 @@ fn pending_apc_prefix_start(bytes: &[u8], cursor: usize) -> usize {
     }
 }
 
-fn apc_end(bytes: &[u8], payload_start: usize) -> Option<usize> {
+/// How an APC sequence ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApcScan {
+    /// Properly terminated. `seq_end` is one past the terminator, and is
+    /// both the end of the dispatched sequence and where scanning resumes.
+    Terminated { seq_end: usize },
+    /// Abandoned at `at` by a byte that takes vte out of its APC string
+    /// state. The partial payload is dropped — vte drops it too — and
+    /// scanning resumes *at* that byte so it is forwarded like any other.
+    Abandoned { at: usize },
+}
+
+/// Finds where an APC sequence ends, matching vte's `SosPmApcString`
+/// transitions byte for byte.
+///
+/// Every byte of an APC string goes through vte's `anywhere()`
+/// (`vte-0.15.0/src/lib.rs:182`, `:438-450`), which leaves the string on
+/// `CAN`, on `SUB`, and on `ESC` — the last of which begins a *new* escape
+/// sequence unless it is the `ESC \` string terminator. Recognising only
+/// `ESC \` and `0x9c` here is what let a truncated APC swallow the terminal
+/// indefinitely: a shell prompt is full of `ESC [`, so vte recovers from a
+/// Ctrl-C'd Kitty transfer where ratty did not.
+///
+/// A trailing lone `ESC` is indeterminate — it may be the first half of a
+/// split `ESC \` — so it yields `None` and stays buffered for the next chunk.
+fn apc_end(bytes: &[u8], payload_start: usize) -> Option<ApcScan> {
     let mut index = payload_start;
-    loop {
-        if index >= bytes.len() {
-            return None;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte == C1_ST {
+            return Some(ApcScan::Terminated { seq_end: index + 1 });
         }
-        if bytes[index] == C1_ST {
-            return Some(index + 1);
+        if byte == ST[0] {
+            return match bytes.get(index + 1) {
+                Some(&next) if next == ST[1] => Some(ApcScan::Terminated { seq_end: index + 2 }),
+                Some(_) => Some(ApcScan::Abandoned { at: index }),
+                None => None,
+            };
         }
-        if index + 1 < bytes.len() && bytes[index] == ST[0] && bytes[index + 1] == ST[1] {
-            return Some(index + 2);
+        if byte == CAN || byte == SUB {
+            return Some(ApcScan::Abandoned { at: index });
         }
         index += 1;
     }
+    None
 }
 
 /// Registered inline object.
@@ -2132,6 +2193,169 @@ mod tests {
         assert!(
             runs <= MAX_PENDING_RGP_PAYLOADS,
             "{runs} concurrent chunk runs are in flight, past the cap",
+        );
+    }
+
+    // ---- APC abandon conditions (issue #75) ------------------------------
+    //
+    // ratty's scanner sits *in front of* vt100, so anywhere the two disagree
+    // is behaviour ratty invented for a terminal it is supposed to emulate.
+    // These assert against a bare parser fed the identical bytes, and against
+    // a literal expectation as well, so a change that broke both the same way
+    // still fails.
+
+    fn wide_parser() -> vt100::Parser<crate::runtime::TerminalParserCallbacks> {
+        vt100::Parser::new_with_callbacks(
+            6,
+            60,
+            0,
+            crate::runtime::TerminalParserCallbacks::default(),
+        )
+    }
+
+    fn screen_text(parser: &vt100::Parser<crate::runtime::TerminalParserCallbacks>) -> String {
+        parser.screen().contents().replace('\n', " | ")
+    }
+
+    /// Asserts ratty renders `expected`, *and* that a bare vt100 parser fed
+    /// the same bytes renders it too.
+    fn assert_matches_bare_vt100(chunks: &[&[u8]], expected: &str) {
+        let mut parser = wide_parser();
+        let mut inline = TerminalInlineObjects::default();
+        for chunk in chunks {
+            inline.consume_pty_output(chunk, &mut parser);
+        }
+        let ratty = screen_text(&parser);
+
+        let mut reference = wide_parser();
+        for chunk in chunks {
+            reference.process(chunk);
+        }
+        let reference = screen_text(&reference);
+
+        assert_eq!(
+            reference, expected,
+            "the reference parser's own behaviour moved; re-derive the expectation deliberately"
+        );
+        assert_eq!(ratty, expected, "ratty diverged from the parser it fronts");
+    }
+
+    /// The headline of #75: Ctrl-C a `timg`/`chafa` render and the shell
+    /// prints an ANSI-coloured prompt. vte leaves its APC string on that
+    /// `ESC`; before the fix `apc_end` recognised only `ESC \` and `0x9c`, so
+    /// every later byte was buffered and the terminal went dark for good.
+    #[test]
+    fn truncated_apc_recovers_on_the_next_escape_sequence() {
+        assert_matches_bare_vt100(
+            &[
+                b"A0 before\r\n",
+                b"\x1b_Gf=24,s=1,v=1;AAAA",
+                b"\x1b[31mPROMPT\x1b[0m\r\n",
+                b"C2 later\r\n",
+            ],
+            "A0 before | PROMPT | C2 later",
+        );
+    }
+
+    #[test]
+    fn truncated_apc_is_abandoned_by_can_and_sub() {
+        for abort in [b"\x18".as_slice(), b"\x1a".as_slice()] {
+            assert_matches_bare_vt100(
+                &[
+                    b"A0 before\r\n",
+                    b"\x1b_Gf=24,s=1,v=1;AAAA",
+                    abort,
+                    b"B1 after\r\n",
+                ],
+                "A0 before | B1 after",
+            );
+        }
+    }
+
+    /// Deliberately NOT "fixed": with no abort byte in sight, swallowing is
+    /// what a terminal does. Locking it keeps a later change from widening
+    /// the recovery rule into a divergence in the other direction.
+    #[test]
+    fn truncated_apc_still_swallows_plain_text_like_vt100_does() {
+        assert_matches_bare_vt100(
+            &[
+                b"A0 before\r\n",
+                b"\x1b_Gf=24,s=1,v=1;AAAA",
+                b"B1 after\r\n",
+            ],
+            "A0 before",
+        );
+    }
+
+    /// Also deliberately not "fixed". An `ESC _` inside an OSC payload really
+    /// does close the OSC and open an APC in vte, so teaching the scanner
+    /// OSC-awareness would *introduce* a divergence rather than remove one.
+    #[test]
+    fn esc_underscore_inside_an_osc_payload_matches_vt100() {
+        assert_matches_bare_vt100(
+            &[
+                b"A0 before\r\n",
+                b"\x1b]0;ti",
+                b"\x1b_",
+                b"tle",
+                b"\x07",
+                b"B1 after\r\n",
+            ],
+            "A0 before",
+        );
+    }
+
+    #[test]
+    fn a_complete_apc_transfer_is_untouched() {
+        assert_matches_bare_vt100(
+            &[
+                b"A0 before\r\n",
+                b"\x1b_Gf=24,s=1,v=1;AAAA\x1b\\",
+                b"B1 after\r\n",
+            ],
+            "A0 before | B1 after",
+        );
+    }
+
+    /// The indeterminate case the abandon rule must not break: a trailing lone
+    /// `ESC` may still turn out to be the first half of `ESC \`, so it has to
+    /// stay buffered rather than be treated as an abort.
+    #[test]
+    fn a_terminator_split_across_chunks_still_terminates() {
+        assert_matches_bare_vt100(
+            &[
+                b"A0 before\r\n",
+                b"\x1b_Gf=24,s=1,v=1;AAAA\x1b",
+                b"\\B1 after\r\n",
+            ],
+            "A0 before | B1 after",
+        );
+    }
+
+    /// A truncated sequence is not a command, so it must not reach the
+    /// RGP/Kitty dispatch — and the bytes after the aborting one must still
+    /// reach the screen, which is what proves the scan resumed rather than
+    /// buffering the rest of the stream.
+    #[test]
+    fn an_abandoned_apc_is_dropped_and_the_stream_resumes() {
+        let mut parser = wide_parser();
+        let mut inline = TerminalInlineObjects::default();
+        inline.consume_pty_output(b"\x1b_Ga=T,f=24,s=1,v=1;AAAA\x18AFTER\r\n", &mut parser);
+
+        assert!(
+            inline.objects.is_empty(),
+            "a truncated Kitty transmit was dispatched as a command"
+        );
+        assert_eq!(
+            screen_text(&parser),
+            "AFTER",
+            "the stream did not resume at the aborting byte"
+        );
+        let (buffered, discarding) = inline.apc_buffer_state();
+        assert_eq!(buffered, 0, "the abandoned sequence stayed buffered");
+        assert!(
+            !discarding,
+            "an abandoned sequence must not arm the discarder"
         );
     }
 }
