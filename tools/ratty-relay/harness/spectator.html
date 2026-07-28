@@ -14,13 +14,19 @@
   link it arrived on. The ids are tracked out-of-band deliberately: there is
   no second OSC parser here to drift from the terminal's.
 
-  To run: build the widget with wasm-pack (`wasm-pack build widget --target
-  web`), serve this file next to the generated `pkg/` directory (any static
-  server; WebGPU requires a secure context or localhost), start a hosted
-  session with `ratty -e ratty-relay host ... zsh` (unquoted argv; the
-  exact separator story is pinned by tests/cli_seam.rs and the design
-  doc), then open this page and connect to ws://127.0.0.1:7877. Adjust
-  WIDGET_MODULE if the wasm-pack output name differs.
+  To run: build the wasm bundle with `bash site/build-wasm.sh` (it needs
+  `wasm-bindgen-cli` at the version Cargo.toml pins with a hard `=`), which
+  emits `site/pkg/ratty.js` + `site/pkg/ratty_bg.wasm`. Copy this file into
+  `site/pkg/` — or serve it beside a `pkg/` holding that output — with any
+  static server (WebGPU requires a secure context or localhost). Then start a
+  hosted session with `ratty -e ratty-relay host ... zsh` (unquoted argv; the
+  exact separator story is pinned by tests/cli_seam.rs and the design doc),
+  open this page, and connect to ws://127.0.0.1:7877.
+
+  NOT `wasm-pack build widget`: `widget/` is the crate `ratatui-ratty`, a
+  Ratatui widget with no wasm-bindgen dependency and no cdylib. The
+  `start()` / `feed()` / `drain_input()` surface this page drives is exported
+  from `src/web.rs` and is only ever built by site/build-wasm.sh.
 -->
 <html lang="en">
   <head>
@@ -43,7 +49,10 @@
     </div>
     <canvas id="ratty-canvas"></canvas>
     <script type="module">
-      const WIDGET_MODULE = "./pkg/ratatui_ratty.js";
+      // wasm-bindgen names its output after the crate (`ratty`), so
+      // site/build-wasm.sh emits site/pkg/ratty.js. Use "./ratty.js" instead
+      // when serving this file from inside site/pkg/.
+      const WIDGET_MODULE = "./pkg/ratty.js";
       const status = (t) => (document.getElementById("status").textContent = t);
 
       let session = null;
