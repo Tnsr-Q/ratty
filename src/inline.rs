@@ -2135,3 +2135,707 @@ mod tests {
         );
     }
 }
+
+/// Spike #55, charter item 3: the pane-0 corruption kill-condition fuzz.
+///
+/// THE QUESTION. Shape (b) of the browser-mux design puts pane-N content in
+/// APC frames (`ESC _ ratty;m;<pane>;<payload>` + terminator) inside the same
+/// byte stream as pane 0. Can a torn or malformed mux frame ever change what
+/// pane 0 renders? The kill condition is absolute: zero divergence.
+///
+/// THE ORACLE is differential, never self-referential:
+///   * baseline B — realistic pane-0 output (text, SGR, cursor moves, and a
+///     real RGP APC so the scanner's claim path is exercised) — is fed
+///     unchunked into a pristine `TerminalInlineObjects` + `vt100::Parser`.
+///   * muxed S — byte-for-byte B with mux frames spliced in — is fed into a
+///     fresh scanner+parser once per tearing.
+///   * the two screens must be identical, in both `contents()` (the text
+///     plane) and `contents_formatted()` (text + SGR attributes + cursor).
+///
+/// The oracle is SCREEN STATE, not intercepted bytes: `consume_pty_output`
+/// takes a concrete `vt100::Parser`, so there is no seam to shim without
+/// changing `inline.rs`. The screen is the ground truth for "did anything
+/// reach pane 0", which is the question being asked.
+#[cfg(test)]
+mod spike55_pane0_fuzz {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    // ---------------------------------------------------------------- setup
+
+    fn new_parser() -> vt100::Parser<crate::runtime::TerminalParserCallbacks> {
+        vt100::Parser::new_with_callbacks(
+            24,
+            80,
+            0,
+            crate::runtime::TerminalParserCallbacks::default(),
+        )
+    }
+
+    /// Screen state after feeding `chunks` through a fresh scanner+parser.
+    /// `.0` is the text plane, `.1` is text + attributes + cursor.
+    fn feed(chunks: &[&[u8]]) -> (String, String) {
+        let mut parser = new_parser();
+        let mut inline = TerminalInlineObjects::default();
+        for chunk in chunks {
+            inline.consume_pty_output(chunk, &mut parser);
+        }
+        let screen = parser.screen();
+        (
+            screen.contents(),
+            String::from_utf8_lossy(&screen.contents_formatted()).into_owned(),
+        )
+    }
+
+    /// Baseline pane-0 traffic, in the pieces a sequence-aware muxer would
+    /// treat as atomic. Every token is unique so loss is detectable by name.
+    fn baseline_parts() -> Vec<&'static [u8]> {
+        vec![
+            b"\x1b[2J\x1b[H",
+            b"ALPHA0 plain text line\r\n",
+            b"\x1b[31mBRAVO1 red\x1b[0m normal\r\n",
+            b"\x1b[1;33;44mCHARLIE2 bold on blue\x1b[m\r\n",
+            b"\x1b[5C\x1b[7mDELTA3\x1b[27m indented and reversed\r\n",
+            // A legitimate RGP APC: claimed by the scanner, never echoed.
+            b"\x1b_ratty;g;d\x1b\\",
+            b"ECHO4 after the rgp delete\r\n",
+            // An RGP support query: claimed, and emits a PTY reply.
+            b"\x1b_ratty;g;s\x1b\\",
+            b"FOXTROT5 after the rgp query\r\n",
+            b"\x1b[12;4HGOLF6 cursor-addressed\r\n",
+            b"\x1b[1;20r\x1b[15;1HHOTEL7 below a scroll region\r\n\x1b[r",
+        ]
+    }
+
+    const BASELINE_TOKENS: &[&str] = &[
+        "ALPHA0", "BRAVO1", "CHARLIE2", "DELTA3", "ECHO4", "FOXTROT5", "GOLF6", "HOTEL7",
+    ];
+
+    /// Bodies of pane 0's OWN escape sequences. If any of these render as
+    /// text, pane 0's control stream was destroyed — a corruption distinct
+    /// from mux payload bytes leaking through.
+    const PANE0_ESCAPE_BODIES: &[&str] = &[
+        "[2J",
+        "[31m",
+        "[1;33;44m",
+        "[5C",
+        "[7m",
+        "[12;4H",
+        "_ratty;g;d",
+        "_ratty;g;s",
+    ];
+
+    fn baseline_bytes() -> Vec<u8> {
+        baseline_parts().concat()
+    }
+
+    /// Offsets between whole baseline pieces — where an escape-sequence-aware
+    /// muxer would splice.
+    fn safe_offsets() -> Vec<usize> {
+        let mut offsets = vec![0usize];
+        let mut at = 0;
+        for part in baseline_parts() {
+            at += part.len();
+            offsets.push(at);
+        }
+        offsets
+    }
+
+    /// Offsets strictly INSIDE the baseline's own escape sequences — where a
+    /// byte-oblivious muxer would splice.
+    fn adversarial_offsets() -> Vec<usize> {
+        let bytes = baseline_bytes();
+        let mut offsets = BTreeSet::new();
+        for (i, byte) in bytes.iter().enumerate() {
+            if *byte == 0x1b {
+                offsets.insert(i + 1); // between ESC and its introducer
+                offsets.insert(i + 2); // inside the sequence body
+                if i + 4 <= bytes.len() {
+                    offsets.insert(i + 4);
+                }
+            }
+        }
+        offsets.into_iter().filter(|o| *o <= bytes.len()).collect()
+    }
+
+    /// Splices `frame` into the baseline at every offset in `offsets`.
+    fn muxed(frame: &[u8], offsets: &[usize]) -> Vec<u8> {
+        let bytes = baseline_bytes();
+        let mut out = Vec::new();
+        let mut previous = 0usize;
+        for offset in offsets {
+            out.extend_from_slice(&bytes[previous..*offset]);
+            out.extend_from_slice(frame);
+            previous = *offset;
+        }
+        out.extend_from_slice(&bytes[previous..]);
+        out
+    }
+
+    // ------------------------------------------------------------ mux frame
+
+    /// `ESC _ ratty;m; <pane> ; <payload>` + terminator.
+    fn mux_frame(pane: u32, payload: &[u8], c1_terminator: bool) -> Vec<u8> {
+        let mut frame = format!("\x1b_ratty;m;{pane};").into_bytes();
+        frame.extend_from_slice(payload);
+        if c1_terminator {
+            frame.push(0x9c);
+        } else {
+            frame.extend_from_slice(b"\x1b\\");
+        }
+        frame
+    }
+
+    fn base64(data: &[u8]) -> String {
+        const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::new();
+        for group in data.chunks(3) {
+            let bytes = [
+                group[0],
+                *group.get(1).unwrap_or(&0),
+                *group.get(2).unwrap_or(&0),
+            ];
+            let n = (u32::from(bytes[0]) << 16) | (u32::from(bytes[1]) << 8) | u32::from(bytes[2]);
+            out.push(ALPHABET[((n >> 18) & 63) as usize] as char);
+            out.push(ALPHABET[((n >> 12) & 63) as usize] as char);
+            out.push(if group.len() > 1 {
+                ALPHABET[((n >> 6) & 63) as usize] as char
+            } else {
+                '='
+            });
+            out.push(if group.len() > 2 {
+                ALPHABET[(n & 63) as usize] as char
+            } else {
+                '='
+            });
+        }
+        out
+    }
+
+    // -------------------------------------------------------------- oracle
+
+    #[derive(Default, Clone)]
+    struct Outcome {
+        tearings: usize,
+        mismatches: usize,
+        leaked: usize,
+        lost: usize,
+        mangled: usize,
+        first_example: Option<String>,
+    }
+
+    struct Case {
+        name: String,
+        frame: Vec<u8>,
+        /// Substrings that, if they appear on pane 0, are mux bytes.
+        needles: Vec<String>,
+    }
+
+    /// Compares one muxed run against the baseline. Returns `None` when the
+    /// screens are byte-identical, i.e. nothing about pane 0 changed.
+    fn compare(
+        base: &(String, String),
+        got: &(String, String),
+        needles: &[String],
+        label: &str,
+    ) -> Option<(bool, bool, bool, String)> {
+        if base.0 == got.0 && base.1 == got.1 {
+            return None;
+        }
+        let leaked = needles
+            .iter()
+            .any(|needle| got.0.contains(needle.as_str()) && !base.0.contains(needle.as_str()));
+        let lost = BASELINE_TOKENS
+            .iter()
+            .any(|token| base.0.contains(token) && !got.0.contains(token));
+        let missing: Vec<&str> = BASELINE_TOKENS
+            .iter()
+            .copied()
+            .filter(|token| base.0.contains(token) && !got.0.contains(token))
+            .collect();
+        let found: Vec<&str> = needles
+            .iter()
+            .map(String::as_str)
+            .filter(|needle| got.0.contains(needle) && !base.0.contains(needle))
+            .collect();
+        let mangled: Vec<&str> = PANE0_ESCAPE_BODIES
+            .iter()
+            .copied()
+            .filter(|body| got.0.contains(body) && !base.0.contains(body))
+            .collect();
+        let kind = if base.0 != got.0 { "TEXT" } else { "ATTR-ONLY" };
+        let detail = format!(
+            "{label}: {kind} divergence; pane-0 tokens lost {missing:?}; mux needles on pane 0 {found:?}; \
+             pane-0 escapes printed as text {mangled:?}\n\
+             \x20   baseline text : {:?}\n\x20   muxed    text : {:?}",
+            squash(&base.0),
+            squash(&got.0),
+        );
+        Some((leaked, lost, !mangled.is_empty(), detail))
+    }
+
+    /// Collapses a screen dump to one line of non-blank content.
+    fn squash(screen: &str) -> String {
+        let joined = screen
+            .lines()
+            .map(str::trim_end)
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        if joined.chars().count() > 300 {
+            format!("{}…", joined.chars().take(300).collect::<String>())
+        } else {
+            joined
+        }
+    }
+
+    fn record(outcome: &mut Outcome, verdict: Option<(bool, bool, bool, String)>) {
+        outcome.tearings += 1;
+        if let Some((leaked, lost, mangled, detail)) = verdict {
+            outcome.mismatches += 1;
+            if leaked {
+                outcome.leaked += 1;
+            }
+            if lost {
+                outcome.lost += 1;
+            }
+            if mangled {
+                outcome.mangled += 1;
+            }
+            if outcome.first_example.is_none() {
+                outcome.first_example = Some(detail);
+            }
+        }
+    }
+
+    /// Every tearing strategy the charter asks for, over one muxed stream.
+    fn tear_all(stream: &[u8], base: &(String, String), needles: &[String]) -> Outcome {
+        let mut outcome = Outcome::default();
+
+        // 0-way: the whole stream in one write.
+        record(
+            &mut outcome,
+            compare(base, &feed(&[stream]), needles, "whole"),
+        );
+
+        // 2-way: the chunk boundary at EVERY byte offset.
+        for k in 0..=stream.len() {
+            let got = feed(&[&stream[..k], &stream[k..]]);
+            record(
+                &mut outcome,
+                compare(base, &got, needles, &format!("2-way@{k}")),
+            );
+        }
+
+        // 3-way: sampled pairs of boundaries.
+        for i in (0..stream.len()).step_by(29) {
+            for j in (i..=stream.len()).step_by(31) {
+                let got = feed(&[&stream[..i], &stream[i..j], &stream[j..]]);
+                record(
+                    &mut outcome,
+                    compare(base, &got, needles, &format!("3-way@{i},{j}")),
+                );
+            }
+        }
+
+        // 1-byte drip: the pathological chunking, one write per byte.
+        let drip: Vec<&[u8]> = (0..stream.len()).map(|i| &stream[i..i + 1]).collect();
+        record(
+            &mut outcome,
+            compare(base, &feed(&drip), needles, "1-byte-drip"),
+        );
+
+        outcome
+    }
+
+    fn cases() -> Vec<Case> {
+        let ascii = b"MUXPAYLOAD pane one says hi MUXTAIL".to_vec();
+        // U+201C LEFT DOUBLE QUOTATION MARK is E2 80 9C - it carries a 0x9c
+        // byte, which `apc_end` treats as a bare C1 ST terminator.
+        let smart = "MUXPAYLOAD \u{201C}smart\u{201D} quotes MUXTAIL"
+            .as_bytes()
+            .to_vec();
+        // Realistic raw pane-1 traffic: another terminal's output, escapes
+        // and all.
+        let ansi = b"MUXPAYLOAD \x1b[31mred\x1b[0m \x1b[2J MUXTAIL".to_vec();
+        // The two hazards combined: a smart quote (embedded 0x9c, which
+        // `apc_end` mistakes for a C1 ST) followed by real pane-1 escapes.
+        let smart_ansi = "MUXPAYLOAD \u{201C}q\u{201D} \u{1b}[31mred\u{1b}[0m MUXTAIL"
+            .as_bytes()
+            .to_vec();
+        // Pane-1 content that happens to contain a literal ST.
+        let inner_st = b"MUXPAYLOAD\x1b\\MUXTAIL".to_vec();
+
+        let mut cases = Vec::new();
+        for (terminator_name, c1) in [("ESC-backslash", false), ("bare-0x9c", true)] {
+            for (encoding, payload) in [
+                ("base64(ascii)", base64(&ascii).into_bytes()),
+                ("base64(ansi)", base64(&ansi).into_bytes()),
+                ("raw-ascii", ascii.clone()),
+                ("raw-utf8-smartquote", smart.clone()),
+                ("raw-smartquote+ansi", smart_ansi.clone()),
+                ("raw-ansi", ansi.clone()),
+                ("raw-inner-ST", inner_st.clone()),
+            ] {
+                let needles = vec![
+                    "MUXPAYLOAD".to_string(),
+                    "MUXTAIL".to_string(),
+                    "ratty;m".to_string(),
+                    String::from_utf8_lossy(&payload).into_owned(),
+                ];
+                cases.push(Case {
+                    name: format!("{encoding} / {terminator_name}"),
+                    frame: mux_frame(1, &payload, c1),
+                    needles,
+                });
+            }
+        }
+
+        // Back-to-back frames with no separator.
+        let back_to_back = {
+            let mut f = mux_frame(1, base64(&ascii).as_bytes(), false);
+            f.extend_from_slice(&mux_frame(2, base64(&ascii).as_bytes(), false));
+            f
+        };
+        cases.push(Case {
+            name: "base64 x2 back-to-back / ESC-backslash".to_string(),
+            frame: back_to_back,
+            needles: vec!["MUXPAYLOAD".into(), "ratty;m".into(), base64(&ascii)],
+        });
+
+        // Near miss: one character off the claimed prefix. Still an APC.
+        cases.push(Case {
+            name: "near-miss prefix rattyX;m / ESC-backslash".to_string(),
+            frame: b"\x1b_rattyX;m;1;MUXPAYLOAD near miss MUXTAIL\x1b\\".to_vec(),
+            needles: vec!["MUXPAYLOAD".into(), "rattyX".into(), "MUXTAIL".into()],
+        });
+
+        cases
+    }
+
+    // ------------------------------------------------------- the main fuzz
+
+    #[test]
+    fn spike55_item3_pane0_corruption_report() {
+        let base = feed(&[&baseline_bytes()[..]]);
+        assert!(
+            BASELINE_TOKENS.iter().all(|t| base.0.contains(t)),
+            "the baseline itself must render every token; got {:?}",
+            squash(&base.0),
+        );
+        assert!(
+            !base.0.contains("ratty"),
+            "the baseline's own RGP APCs must be claimed, not echoed; got {:?}",
+            squash(&base.0),
+        );
+
+        let families: [(&str, Vec<usize>); 2] = [
+            (
+                "SAFE (frames spliced between whole pane-0 sequences)",
+                safe_offsets(),
+            ),
+            (
+                "ADVERSARIAL (frames spliced INSIDE pane-0 escape sequences)",
+                adversarial_offsets(),
+            ),
+        ];
+
+        println!("\n================ spike #55 item 3: pane-0 corruption fuzz ================");
+        println!("baseline: {} bytes, screen 24x80", baseline_bytes().len());
+        println!("oracle  : differential — vt100 contents() AND contents_formatted()\n");
+
+        let mut grand_tearings = 0usize;
+        let mut grand_leaked = 0usize;
+        let mut grand_lost = 0usize;
+        let mut grand_mangled = 0usize;
+
+        for (family, offsets) in &families {
+            println!("---- injection family: {family}");
+            println!("     splice offsets: {} per stream\n", offsets.len());
+            for case in cases() {
+                let stream = muxed(&case.frame, offsets);
+                let outcome = tear_all(&stream, &base, &case.needles);
+                grand_tearings += outcome.tearings;
+                grand_leaked += outcome.leaked;
+                grand_lost += outcome.lost;
+                grand_mangled += outcome.mangled;
+                let verdict = if outcome.mismatches == 0 {
+                    "PASS"
+                } else {
+                    "FAIL"
+                };
+                println!(
+                    "  [{verdict}] {:<42} stream {:>5}B  tearings {:>6}  diverged {:>6}  leaked {:>6}  lost {:>6}  mangled {:>6}",
+                    case.name,
+                    stream.len(),
+                    outcome.tearings,
+                    outcome.mismatches,
+                    outcome.leaked,
+                    outcome.lost,
+                    outcome.mangled,
+                );
+                if let Some(example) = &outcome.first_example {
+                    println!("        first divergence — {example}");
+                }
+            }
+            println!();
+        }
+
+        println!(
+            "---- totals: {grand_tearings} tearings, {grand_leaked} leaked, {grand_lost} lost, \
+             {grand_mangled} with pane-0 escapes printed as text"
+        );
+        println!("=========================================================================\n");
+    }
+
+    // ------------------------------------------- the specific hypothesis
+
+    /// CHARTER HYPOTHESIS. `apc_end` (src/inline.rs:1160-1174) terminates on a
+    /// BARE 0x9c. U+201C LEFT DOUBLE QUOTATION MARK encodes as E2 80 9C, so a
+    /// mux frame carrying RAW UTF-8 pane content with a smart quote is cut
+    /// short mid-character, and its remainder is handed to the parser as
+    /// ordinary bytes. This test isolates that one frame and reports exactly
+    /// what pane 0 rendered.
+    #[test]
+    fn spike55_hypothesis_raw_utf8_0x9c_early_termination() {
+        println!("\n==== hypothesis probe: raw UTF-8 mux payload carrying U+201C ====");
+        let base = feed(&[&baseline_bytes()[..]]);
+
+        let variants: Vec<(&str, Vec<u8>, bool)> = vec![
+            (
+                "smart quote only, ESC-backslash terminator",
+                "hello \u{201C}quoted\u{201D} world".into(),
+                false,
+            ),
+            (
+                "smart quote only, bare 0x9c terminator",
+                "hello \u{201C}quoted\u{201D} world".into(),
+                true,
+            ),
+            (
+                "smart quote + real pane-1 ANSI, ESC-backslash terminator",
+                "hello \u{201C}q\u{201D} \u{1b}[31mLEAKED\u{1b}[0m world".into(),
+                false,
+            ),
+        ];
+
+        let mut any_early = false;
+        for (name, payload, c1) in variants {
+            assert!(
+                payload.windows(3).any(|w| w == [0xe2, 0x80, 0x9c]),
+                "the payload must actually carry an embedded 0x9c",
+            );
+            let frame = mux_frame(1, &payload, c1);
+            // Where does `apc_end` think the frame ends? (payload_start = +2)
+            let end = apc_end(&frame, 2).expect("the frame terminates somewhere");
+            let honest_end = frame.len();
+            any_early |= end < honest_end;
+
+            println!("\n-- {name}");
+            println!(
+                "   frame            : {:?}",
+                String::from_utf8_lossy(&frame)
+            );
+            println!("   frame bytes      : {frame:02x?}");
+            println!("   frame length     : {honest_end}");
+            println!(
+                "   apc_end() says   : {end}   ({} bytes early)",
+                honest_end - end
+            );
+            println!(
+                "   consumed as APC  : {:?}",
+                String::from_utf8_lossy(&frame[..end])
+            );
+            println!(
+                "   spilled remainder: {:?}",
+                String::from_utf8_lossy(&frame[end..])
+            );
+
+            // End-to-end consequence, differentially, over every 2-way tear.
+            let needles: Vec<String> = vec!["quoted".into(), "LEAKED".into(), "world".into()];
+            let stream = muxed(&frame, &safe_offsets());
+            let (mut diverged, mut leaked, mut lost) = (0usize, 0usize, 0usize);
+            for k in 0..=stream.len() {
+                let got = feed(&[&stream[..k], &stream[k..]]);
+                if let Some((l, o, _, _)) = compare(&base, &got, &needles, "") {
+                    diverged += 1;
+                    leaked += usize::from(l);
+                    lost += usize::from(o);
+                }
+            }
+            println!(
+                "   end-to-end       : {} tearings, {diverged} diverged, {leaked} leaked, {lost} lost",
+                stream.len() + 1,
+            );
+            println!(
+                "   pane 0 (muxed)   : {:?}",
+                squash(&feed(&[&stream[..]]).0)
+            );
+        }
+
+        println!("   pane 0 (baseline): {:?}", squash(&base.0));
+        println!("=================================================================\n");
+
+        assert!(
+            any_early,
+            "HYPOTHESIS REFUTED: apc_end consumed the whole frame",
+        );
+    }
+
+    // ------------------------------------------- adversarial near misses
+
+    #[test]
+    fn spike55_near_miss_corpus() {
+        let base_text = "ALPHA0 plain\r\n";
+        println!("\n---- near-miss corpus (each fed after {base_text:?}) ----");
+
+        let corpus: Vec<(&str, Vec<u8>)> = vec![
+            ("dangling ESC _ at end of stream", b"\x1b_".to_vec()),
+            ("truncated ESC _ ratt", b"\x1b_ratt".to_vec()),
+            ("truncated ESC _ ratty;", b"\x1b_ratty;".to_vec()),
+            ("truncated ESC _ ratty;m", b"\x1b_ratty;m".to_vec()),
+            (
+                "truncated ESC _ ratty;m;1; with payload, no ST",
+                b"\x1b_ratty;m;1;MUXPAYLOAD".to_vec(),
+            ),
+            (
+                "literal text, no APC intro",
+                b"ratty;m;0;hello MUXPAYLOAD".to_vec(),
+            ),
+        ];
+
+        for (name, tail) in corpus {
+            let mut stream = base_text.as_bytes().to_vec();
+            stream.extend_from_slice(&tail);
+            let screen = feed(&[&stream]);
+            let mut torn_worst = String::new();
+            for k in 0..=stream.len() {
+                let got = feed(&[&stream[..k], &stream[k..]]);
+                if got.0 != screen.0 && torn_worst.is_empty() {
+                    torn_worst = format!(" (tear@{k} differs: {:?})", squash(&got.0));
+                }
+            }
+            println!("  {name:<44} pane 0 = {:?}{torn_worst}", squash(&screen.0));
+        }
+
+        // The literal-text near miss MUST reach pane 0 untouched.
+        let literal = b"ALPHA0 plain\r\nratty;m;0;hello MUXPAYLOAD".to_vec();
+        for k in 0..=literal.len() {
+            let got = feed(&[&literal[..k], &literal[k..]]);
+            assert!(
+                got.0.contains("ratty;m;0;hello MUXPAYLOAD"),
+                "tear@{k}: a literal, non-APC near miss must reach pane 0 verbatim; got {:?}",
+                squash(&got.0),
+            );
+        }
+
+        // A terminator torn across the chunk boundary (ESC | backslash).
+        let frame = mux_frame(1, base64(b"MUXPAYLOAD").as_bytes(), false);
+        let mut stream = base_text.as_bytes().to_vec();
+        stream.extend_from_slice(&frame);
+        stream.extend_from_slice(b"BRAVO1 after\r\n");
+        let split = stream.len() - b"BRAVO1 after\r\n".len() - 1; // between ESC and '\'
+        assert_eq!(
+            stream[split - 1],
+            0x1b,
+            "the split really is mid-terminator"
+        );
+        let got = feed(&[&stream[..split], &stream[split..]]);
+        println!(
+            "  {:<44} pane 0 = {:?}",
+            "ST torn across the chunk boundary",
+            squash(&got.0)
+        );
+        assert!(
+            got.0.contains("ALPHA0") && got.0.contains("BRAVO1") && !got.0.contains("MUX"),
+            "a torn ST must not corrupt pane 0; got {:?}",
+            squash(&got.0),
+        );
+        println!("-------------------------------------------------------------\n");
+    }
+
+    // --------------------------------------------------- locked-in verdicts
+
+    /// The shape that SURVIVES: base64 payload, `ESC \` terminator. Zero
+    /// divergence across every tearing, when frames are spliced only between
+    /// whole pane-0 sequences.
+    #[test]
+    fn spike55_base64_esc_st_framing_never_touches_pane0() {
+        let base = feed(&[&baseline_bytes()[..]]);
+        let payload = base64(b"MUXPAYLOAD pane one says hi MUXTAIL");
+        let frame = mux_frame(1, payload.as_bytes(), false);
+        let stream = muxed(&frame, &safe_offsets());
+        let needles = vec!["MUXPAYLOAD".to_string(), "ratty;m".to_string(), payload];
+
+        for k in 0..=stream.len() {
+            let got = feed(&[&stream[..k], &stream[k..]]);
+            if let Some((_, _, _, detail)) = compare(&base, &got, &needles, &format!("2-way@{k}")) {
+                panic!("base64 + ESC-backslash framing corrupted pane 0 — {detail}");
+            }
+        }
+        let drip: Vec<&[u8]> = (0..stream.len()).map(|i| &stream[i..i + 1]).collect();
+        if let Some((_, _, _, detail)) = compare(&base, &feed(&drip), &needles, "1-byte-drip") {
+            panic!("base64 + ESC-backslash framing corrupted pane 0 under a drip — {detail}");
+        }
+    }
+
+    /// KILL CONDITION 1. A bare 0x9c terminator destroys pane 0 even when the
+    /// payload is pure base64. `apc_end` accepts 0x9c and hands it to vte,
+    /// but vte's `SosPmApcString` state does NOT accept it as a terminator —
+    /// the parser wedges and swallows pane-0 bytes until the next ESC.
+    #[test]
+    fn spike55_bare_c1_st_terminator_swallows_pane0() {
+        let base = feed(&[&baseline_bytes()[..]]);
+        let frame = mux_frame(1, base64(b"MUXPAYLOAD").as_bytes(), true);
+        let stream = muxed(&frame, &safe_offsets());
+        let got = feed(&[&stream[..]]);
+
+        assert_ne!(
+            base.0, got.0,
+            "a bare-0x9c mux frame left pane 0 untouched — re-derive the finding",
+        );
+        let swallowed: Vec<&str> = BASELINE_TOKENS
+            .iter()
+            .copied()
+            .filter(|token| base.0.contains(token) && !got.0.contains(token))
+            .collect();
+        assert!(
+            !swallowed.is_empty(),
+            "expected pane-0 text to be swallowed by the wedged parser",
+        );
+        assert!(
+            !got.0.contains("MUX"),
+            "the loss is a wedge, not a leak; pane 0 = {:?}",
+            squash(&got.0),
+        );
+    }
+
+    /// KILL CONDITION 2. A RAW (un-encoded) payload carrying real pane-1
+    /// terminal output executes against pane 0. The payload's own `ESC`
+    /// pulls vte out of the APC string, so the rest of the frame runs as
+    /// control sequences and prints as text. This is what makes base64
+    /// load-bearing for shape (b).
+    #[test]
+    fn spike55_raw_payload_executes_against_pane0() {
+        let base = feed(&[&baseline_bytes()[..]]);
+        let payload = b"BEFORE \x1b[2J LEAKED";
+        let frame = mux_frame(1, payload, false);
+        let stream = muxed(&frame, &safe_offsets());
+        let got = feed(&[&stream[..]]);
+
+        assert!(
+            got.0.contains("LEAKED"),
+            "expected raw mux payload text on pane 0; pane 0 = {:?}",
+            squash(&got.0),
+        );
+        assert!(
+            BASELINE_TOKENS.iter().all(|token| !got.0.contains(token)),
+            "expected the payload's ED to have cleared pane 0; pane 0 = {:?}",
+            squash(&got.0),
+        );
+        assert!(
+            base.0 != got.0,
+            "the baseline must not already look like this",
+        );
+    }
+}
