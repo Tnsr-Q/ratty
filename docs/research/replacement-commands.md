@@ -1,5 +1,47 @@
 # The replacement command family: terminals on the wire (`term.*`)
 
+> **Superseded in part — the lock happened.** #56 resolved on 2026-07-29 in one
+> dated resolution:
+> <https://github.com/Tnsr-Q/ratty/issues/56#issuecomment-5114257976>.
+> **Read it before acting on this document; where the two disagree, the
+> resolution wins.** The family shape, creator-scope plus default-DENY, terminal
+> #1 wire-unkillable by construction, control-plane + wire-origin-only, and the
+> pane four staying `unsupported` were all confirmed. What changed:
+>
+> - **§4's spawn ack breaks a shipped invariant and is replaced.**
+>   `protocols/query.md:102-104` states that **absence from `state.executions` is
+>   the completion signal**, so acking `code=started` while deliberately keeping
+>   the handle out of that roster makes a conforming caller poll, find nothing,
+>   and conclude the spawn **finished** — while it is still spawning. #56
+>   decision 19: `term.spawn` is **not** an #18 long-running operation. It acks
+>   `ok=1` immediate-commit carrying the handle, and readiness is the explicit
+>   `state` field on the `state.terminals` row (`spawning → ready`). Stated
+>   affirmatively so nobody later "restores consistency" by adding `code=started`
+>   back — a terminal is not transport-epoch metadata.
+> - **§3's single `TerminalLifecycle` bit is split in two.** #51 established that
+>   focus is the keystroke-capture primitive, not a convenience verb; under one
+>   bit an operator granting workspace choreography (spawn + place — this
+>   document's own named future work) must also grant keystroke redirection. #56
+>   decision 18: **`TerminalLifecycle`** (spawn/close/place) and
+>   **`TerminalFocus`** (focus), both default DENY. `place` deliberately stays in
+>   the lifecycle bit rather than folding under the default-*granted*
+>   `SceneStage`.
+> - **Reconciliation item 5 is void.** #56 decision 2 split `TerminalId`
+>   (monotonic, never reused) from a **recyclable** 128-slot namespace pool, so
+>   you can no longer exhaust by lifetime and the `session-budget` vocabulary is
+>   not borrowed for terminals. The pool size **is** the live cap; the initial
+>   config default is **4**, gated on a shared parley `FontContext` before rising.
+>   Recycling is safe only under decision 17's rule: **every persisted stamp keys
+>   on `TerminalId`, never on the namespace.**
+> - **Reconciliation item 1's conclusion stands but its supporting argument is
+>   stale** — it cited `term=` staying unsquatted, and #56 decision 6 retired
+>   `term=` entirely.
+> - **Item 4 never stated `state.terminals`' scope**, though its rows carry
+>   `creator`. #56 decision 15: scene-scoped for embodiment fields, **`creator`
+>   own-scoped**.
+> - **§8 handed focus behavior back to #51, which had handed spawn-auto-focus and
+>   close-fallback here** — neither ticket owned them. #56 decision 8 adopts them.
+
 Research asset for [wayfinder ticket #49](https://github.com/Tnsr-Q/ratty/issues/49)
 (map [#42](https://github.com/Tnsr-Q/ratty/issues/42)). **Recommendation only —
 the lock happens at the spine grilling
