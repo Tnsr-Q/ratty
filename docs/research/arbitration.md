@@ -1,5 +1,40 @@
 # Screen-global vs per-runtime arbitration
 
+> **Superseded in part — the lock happened.** #56 resolved on 2026-07-29 in one
+> dated resolution:
+> <https://github.com/Tnsr-Q/ratty/issues/56#issuecomment-5114257976>.
+> **Read it before acting on this document; where the two disagree, the
+> resolution wins.** Items 1, 3, 4, 5, 7, 8 and 9 were ratified substantially as
+> written. What changed:
+>
+> - **§4's rationale for `SceneStage` defaulting to granted is replaced.** The
+>   conclusion stands; "directing your own camera is single-tenant
+>   self-direction" does not — at N>1 the camera is by definition not
+>   single-tenant, so as stated it argues for the opposite. The surviving reason:
+>   this class is **ungated today** (`SceneCapability` appears nowhere in
+>   `src/ai.rs`), so default-grant is a *tightening*, while default-DENY would be
+>   a tightening plus a behavior break. That makes it the same principle as #50's
+>   default-DENY, not a contradiction: both pick the default that does not change
+>   shipped behavior.
+> - **§4 left undefined what happens when a verb spans both halves.** `mode` has
+>   an ungated shape half and a gated view half. #56 decision 13: **whole-command
+>   refusal** — no `SceneStage`, `mode` acks `not-permitted` and applies neither.
+> - **§1's effects render "knob" is not a knob.** The compositor is a single
+>   8000×8000 flat-color sprite (`src/effects.rs:341-364`); strict per-surface
+>   cannot be expressed against it at all and means abandoning the overlay for
+>   per-plane material tinting. Focused-wash is locked for v1 and strict
+>   per-surface is **reclassified as future work**, joining return #1. Stated
+>   gap: under focused-wash an **unfocused agent's mood does not render at all**.
+> - **§3's offer to pin the old warp/camera-tween coupling is declined.** Pinning
+>   it would let an **ungated** `warp` cancel **`SceneStage`-gated** state, and
+>   "pin it for the arrival runtime" does not localize anything because every
+>   command has an arrival runtime. Channel-scoped cancellation is the rule.
+> - **§5 never stated `state.terminals`' scope**, and its rows carry `creator`.
+>   #56 decision 15: scene-scoped for embodiment fields, **`creator` own-scoped**.
+> - Two things are now stated as decisions rather than left implicit: the scene
+>   lock stays **fail-fast** (a real cross-runtime rejection at N>1), and the
+>   holder key's 7 bits, the 128-slot pool and the wire's `& 0x7F` **must agree**.
+
 Research asset for [wayfinder ticket #52](https://github.com/Tnsr-Q/ratty/issues/52)
 (map [#42](https://github.com/Tnsr-Q/ratty/issues/42)). **Recommendation only —
 the lock happens at the spine grilling

@@ -1,5 +1,37 @@
 # Focus and input routing for N runtimes
 
+> **Superseded in part — the lock happened.** #56 resolved on 2026-07-29 in one
+> dated resolution:
+> <https://github.com/Tnsr-Q/ratty/issues/56#issuecomment-5114257976>.
+> **Read it before acting on this document; where the two disagree, the
+> resolution wins.** This document's core recommendations were ratified —
+> Shape R, the single-writer `FocusRequest` drain, the eight invariants as a
+> block, mesh-UV picking, selections surviving focus loss. What changed:
+>
+> - **Spawn-auto-focus and close-time focus fallback** (this doc routes them to
+>   #49 at the "does NOT decide" list). **#49 routed them back here and never
+>   listed them** — they were owned by nobody. #56 decision 8 adopts this
+>   document's recorded recommendation and adds boot: startup focuses terminal
+>   #1 via `SpawnPolicy`, user spawns focus, **wire spawns never** (no grant
+>   exception), MRU succession on death.
+> - **Invariant 8 is restated.** It bans resurrecting the singleton
+>   (fallback-to-terminal-#1) and focus from nothing; it does **not** ban
+>   succession among live terminals, which MRU requires.
+> - **The two claims handed to #54 were never measured.** #54's resolution
+>   covers resource access, redraw, texture-per-surface, reader threads and
+>   structural bites, and neither claim appears. #56 decision 9 closes the UV
+>   raycast claim by argument (1,280 triangles/plane with AABB early-out is a
+>   rounding error against the measured 4.1 ms Vello submission) and restates
+>   the N-invariance claim: it is true for *texture* work only —
+>   `animate_terminal_plane_warp` rebuilds both meshes every frame in the 3D
+>   modes and is not focus-gated, so an idle unfocused terminal is free in 2D
+>   and costs a full mesh rebuild per frame in 3D.
+> - **A focus-cycle keybinding is added as a rider** so that 3D picking — new
+>   capability, not a port — never gates N in the build order. Without it the
+>   first N=2 has no way to focus terminal #2 at all.
+> - The bracketed-paste note in passing is filed as
+>   [#79](https://github.com/Tnsr-Q/ratty/issues/79).
+
 Research asset for [wayfinder ticket #51](https://github.com/Tnsr-Q/ratty/issues/51)
 (map [#42](https://github.com/Tnsr-Q/ratty/issues/42)). **Recommendation only —
 the lock happens at the spine grilling
