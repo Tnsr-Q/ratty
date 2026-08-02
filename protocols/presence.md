@@ -186,14 +186,15 @@ the scene — the row itself stays queryable). Cursor markers are small
 unlit caret meshes in the main scene, live in all three presentation
 modes (screen-space in the flat view, pinned to the warped surface
 through the RGP projection in 3D), with the participant's name label
-beside the cell in the participant's color; notes draw as subtle filled
-rectangles with an accent border and their text, in-texture, warping
-with the plane. The wire carries no color on `note`, so the border is
-the fixed presence accent, never per-participant. Out-of-grid cells
-clamp to the nearest edge cell at render; the stored value is
-untouched. Every roster mutation *and* every fresh→expired flip
-requests a terminal redraw, so an expiring note disappears from an
-otherwise idle terminal.
+beside the cell in the participant's color, backed by the note panels'
+translucent scrim (no border) so the name stays legible over occupied
+cells; notes draw as subtle filled rectangles with an accent border and
+their text, in-texture, warping with the plane. The wire carries no
+color on `note`, so the border is the fixed presence accent, never
+per-participant. Out-of-grid cells clamp to the nearest edge cell at
+render; the stored value is untouched. Every roster mutation *and*
+every fresh→expired flip requests a terminal redraw, so an expiring
+note disappears from an otherwise idle terminal.
 
 ## wasm
 

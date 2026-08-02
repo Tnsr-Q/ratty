@@ -645,6 +645,12 @@ const NOTE_BORDER: [f32; 4] = [0.35, 0.76, 1.0, 0.9];
 /// Note text color.
 const NOTE_TEXT: [f32; 4] = [0.91, 0.93, 0.96, 1.0];
 
+/// Label scrim fill: the note scrim's translucent posture, so a name
+/// over occupied cells reads against a backing instead of superimposing
+/// on the text beneath (#78). No border — labels are short where notes
+/// are prose.
+const LABEL_FILL: [f32; 4] = [0.05, 0.05, 0.08, 0.82];
+
 /// One fresh, cursor-bearing participant queued for rendering: the
 /// (namespace, id) key, the record, and its reported cursor cell.
 type LabeledParticipant<'a> = ((u8, &'a str), &'a ParticipantRecord, (u16, u16));
@@ -785,10 +791,11 @@ fn note_underlay(
     (rect, ops)
 }
 
-/// One participant name label: participant-colored stroke text beside
-/// the (clamped) cursor cell, shifted left at the grid's right edge so
-/// it stays on the texture. `None` only for an unparseable stored color,
-/// which apply-time validation makes unreachable.
+/// One participant name label: a subtle scrim, then participant-colored
+/// stroke text beside the (clamped) cursor cell, shifted left at the
+/// grid's right edge so it stays on the texture. `None` only for an
+/// unparseable stored color, which apply-time validation makes
+/// unreachable.
 fn label_underlay(
     record: &ParticipantRecord,
     cursor: (u16, u16),
@@ -804,19 +811,26 @@ fn label_underlay(
     let width = glyph_height * GLYPH_ASPECT * text.chars().count() as f32;
     let x = ((f32::from(col) + 1.0) * cell_width + cell_width * LABEL_GAP_FRACTION)
         .min((f32::from(cols) * cell_width - width).max(0.0));
-    let ops = vec![VizDrawOp::Text {
-        pos: (0.0, (1.0 - LABEL_GLYPH_HEIGHT_FRACTION) * 0.5),
-        height: LABEL_GLYPH_HEIGHT_FRACTION,
-        text,
-        color: [
-            f32::from(rgb[0]) / 255.0,
-            f32::from(rgb[1]) / 255.0,
-            f32::from(rgb[2]) / 255.0,
-            1.0,
-        ],
-        align: TextAlign::Left,
-        max_width: None,
-    }];
+    let ops = vec![
+        VizDrawOp::Fill {
+            min: (0.0, 0.0),
+            max: (1.0, 1.0),
+            color: LABEL_FILL,
+        },
+        VizDrawOp::Text {
+            pos: (0.0, (1.0 - LABEL_GLYPH_HEIGHT_FRACTION) * 0.5),
+            height: LABEL_GLYPH_HEIGHT_FRACTION,
+            text,
+            color: [
+                f32::from(rgb[0]) / 255.0,
+                f32::from(rgb[1]) / 255.0,
+                f32::from(rgb[2]) / 255.0,
+                1.0,
+            ],
+            align: TextAlign::Left,
+            max_width: None,
+        },
+    ];
     Some((
         UnderlayRect {
             x,
@@ -1713,11 +1727,19 @@ mod tests {
         assert!(matches!(&ops[2], VizDrawOp::Text { text, .. } if text == "HI"));
 
         // The label sits one cell right of the cursor cell (plus the
-        // gap), on the cursor row, in the participant's color.
+        // gap), on the cursor row: the scrim, then the name in the
+        // participant's color (#78 — bare glyphs over occupied cells
+        // were illegible).
         let (rect, ops) = &underlays[1];
         assert!((rect.x - (60.0 + 10.0 * LABEL_GAP_FRACTION)).abs() < 1e-3);
         assert!((rect.y - 40.0).abs() < 1e-4);
-        match &ops[0] {
+        assert_eq!(ops.len(), 2);
+        assert!(
+            matches!(&ops[0], VizDrawOp::Fill { min, max, color }
+                if *min == (0.0, 0.0) && *max == (1.0, 1.0) && *color == LABEL_FILL),
+            "the scrim backs the whole label rect"
+        );
+        match &ops[1] {
             VizDrawOp::Text { text, color, .. } => {
                 assert_eq!(text, "AL");
                 assert!(color[0].abs() < 1e-6 && (color[1] - 1.0).abs() < 1e-6);
@@ -1809,9 +1831,9 @@ mod tests {
         let expected_width = glyph_height * GLYPH_ASPECT * 16.0;
         assert!((rect.width - expected_width).abs() < 1e-3);
         assert!((rect.x - (800.0 - expected_width)).abs() < 1e-3);
-        match &ops[0] {
+        match &ops[1] {
             VizDrawOp::Text { text, .. } => assert_eq!(text, "SIXTEEN-GLYPH-NA"),
-            other => panic!("expected a text op, got {other:?}"),
+            other => panic!("expected the text op after the scrim, got {other:?}"),
         }
     }
 
