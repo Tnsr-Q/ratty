@@ -80,7 +80,8 @@ every new claim below lives on the spectator surfaces.
    seam emits an unpaired string terminator once, at startup. Benign in
    both runs — but the #55 spike established that terminator handling on
    this parser is where the bodies are buried, so it should not stay
-   unexplained. Unfiled; needs its own small ticket.
+   unexplained. Filed as
+   [#84](https://github.com/Tnsr-Q/ratty/issues/84).
 3. **The committed wasm bundle is a stale-binary hazard.** `site/pkg/`
    held a Jul 27 bundle — pre-#81 — and the demo's first pre-flight caught
    it: the web spectator would have rendered pre-scrim labels and read as
