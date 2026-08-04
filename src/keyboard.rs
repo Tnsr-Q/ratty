@@ -484,11 +484,7 @@ pub fn handle_keyboard_input(
                 }
                 BindingAction::Paste => {
                     if let Some(text) = params.clipboard.paste() {
-                        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
-                        let mut bytes = Vec::from(b"\x1b[200~".as_slice());
-                        bytes.extend_from_slice(normalized.as_bytes());
-                        bytes.extend_from_slice(b"\x1b[201~");
-                        params.runtime.write_input(&bytes);
+                        write_paste(&params.runtime, &text);
                     } else {
                         warn!("failed to read clipboard contents for paste");
                     }
@@ -558,6 +554,21 @@ pub fn handle_keyboard_input(
             }
             params.runtime.write_input(&input);
         }
+    }
+}
+
+/// Writes clipboard text to the terminal, wrapping it in the
+/// bracketed-paste sentinels only when the program has enabled the
+/// mode (`CSI ? 2004 h`); otherwise the normalized bytes go bare.
+fn write_paste(runtime: &TerminalRuntime, text: &str) {
+    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+    if runtime.parser.screen().bracketed_paste() {
+        let mut bytes = Vec::from(b"\x1b[200~".as_slice());
+        bytes.extend_from_slice(normalized.as_bytes());
+        bytes.extend_from_slice(b"\x1b[201~");
+        runtime.write_input(&bytes);
+    } else {
+        runtime.write_input(normalized.as_bytes());
     }
 }
 
@@ -1037,5 +1048,37 @@ fn ctrl_keycode_byte(key: KeyCode) -> Option<u8> {
         KeyCode::KeyY => Some(0x19),
         KeyCode::KeyZ => Some(0x1a),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn paste_without_bracketed_mode_sends_bare_bytes() {
+        let config = AppConfig::default();
+        let (runtime, host) = TerminalRuntime::virtual_channel(&config);
+        write_paste(&runtime, "hi\r\nthere\r");
+        assert_eq!(
+            host.input_rx
+                .try_recv()
+                .expect("paste should reach the host"),
+            b"hi\nthere\n".to_vec()
+        );
+    }
+
+    #[test]
+    fn paste_with_bracketed_mode_wraps_in_sentinels() {
+        let config = AppConfig::default();
+        let (mut runtime, host) = TerminalRuntime::virtual_channel(&config);
+        runtime.parser.process(b"\x1b[?2004h");
+        write_paste(&runtime, "hi");
+        assert_eq!(
+            host.input_rx
+                .try_recv()
+                .expect("paste should reach the host"),
+            b"\x1b[200~hi\x1b[201~".to_vec()
+        );
     }
 }
