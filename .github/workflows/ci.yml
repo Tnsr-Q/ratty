@@ -136,10 +136,21 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        manifest:
-          - tools/ratty-ai/Cargo.toml
-          - tools/silk/Cargo.toml
-          - tools/ratty-relay/Cargo.toml
+        include:
+          # The root crate runs --lib only: the lib suite is headless by
+          # construction, while integration tests may assume a display.
+          # M4.1 exit criterion (#58): this job gates every seam-migration
+          # commit, so it must exist before any swap lands.
+          - manifest: Cargo.toml
+            args: --lib
+          - manifest: widget/Cargo.toml
+            args: --lib
+          - manifest: tools/ratty-ai/Cargo.toml
+            args: ""
+          - manifest: tools/silk/Cargo.toml
+            args: ""
+          - manifest: tools/ratty-relay/Cargo.toml
+            args: ""
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -161,4 +172,4 @@ jobs:
       - name: Cache Cargo dependencies
         uses: Swatinem/rust-cache@v2
       - name: Run tests
-        run: cargo test --manifest-path ${{ matrix.manifest }}
+        run: cargo test --manifest-path ${{ matrix.manifest }} ${{ matrix.args }}
