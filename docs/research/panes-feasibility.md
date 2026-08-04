@@ -97,3 +97,39 @@ Phases 1–2 alone look like multiple sessions each.
 Recommendation to carry into #22: **B**, with an explicit check against the
 ecosystem vision before committing — if terminals-as-agents is the real
 destination, B's split-tree may be the wrong shape and C is honest.
+
+## The pane-0 contract (locked at #57, 2026-08-04)
+
+The browser story locked at
+[#57](https://github.com/Tnsr-Q/ratty/issues/57) as a staged decision; this
+section is Stage 1's contract, binding until the fork ticket
+([#86](https://github.com/Tnsr-Q/ratty/issues/86)) rules otherwise.
+
+- **The widget renders exactly one grid** — "pane 0", which under the
+  #56-locked spine is **terminal #1** (creator-less, wire-unkillable).
+  *Pane* is widget-surface vocabulary for a rendered grid slot; the wire and
+  roster noun remains *terminal* (`term.*`, `state.terminals`).
+- **Any future pane-addressed content MUST degrade to pane 0.** This is the
+  degradation target every fork option needs anyway; it is specified here as
+  primary contract rather than reverse-engineered later.
+- **Discovery, not inference:** the `caps` reply carries `panes: 1`
+  (append-only surface, `src/query_channel.rs`). Hosts introspect; no
+  signature ever changes for versioning — that is the widget's versioning
+  contract.
+- **Widget setters target the focused terminal.** `set_warp` and `set_mode`'s
+  surface-shape half apply to the focused terminal per #52's locked
+  arbitration table ("the user on the focused terminal"); `set_view` is
+  scene-global. At `panes: 1` the focused terminal is the only terminal, so
+  today's behavior is byte-identical; the fork inherits a defined shape.
+- **Honest cost, stated at lock time:** this freezes multi-grid content out
+  of the **silk art format**, not just the widget, until the fork —
+  `protocols/silk.md` records the same from the format's side.
+- **Chartered pre-work for whichever fork shape wins:** the pane-keyed
+  `PENDING_QUERIES` disposal fix (today's page-global `Drop` rejects every
+  in-flight query, `src/web.rs`).
+
+The (a)-vs-(b) fork itself is deferred with the evidence lean recorded in
+#57's resolution; it re-enters at #86 under enforceable triggers with an
+anti-calcification clause. The #25 interpretive question was ruled there
+too: pane addressing in transport framing is **permitted — narrowly**; the
+out-of-band lock is scoped to identity and trust.
