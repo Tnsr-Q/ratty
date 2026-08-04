@@ -260,3 +260,21 @@ change** — the new sequences are just more `"o"` bytes. The `x_ratty` stage
 directives exist only because RGP v1 has no in-band way to set the opening
 presentation; if that arrives, headers keep working and the directives become
 optional conveniences.
+
+## Multi-pane content
+
+**Multi-pane content does not exist in silk/1.** This was locked at
+[ratty#57](https://github.com/Tnsr-Q/ratty/issues/57) (2026-08-04) as part
+of the browser story's Stage 1: the playback surface renders exactly one
+grid, and the format has no way to author a second one — stated here as a
+capability freeze on the art format, accepted at lock time rather than
+discovered later. The freeze holds until the fork ticket
+([ratty#86](https://github.com/Tnsr-Q/ratty/issues/86)) rules on the
+multi-grid wire shape.
+
+Any future extension MUST ride the **unknown-event-code seam**: players MUST
+ignore event codes they do not recognize, so a hypothetical pane-carrying
+code (for example `"o@<id>"`) lawfully reduces to pane-0 playback on every
+shipped player. A fourth tuple element is **not** a lawful extension path —
+cast parsing rejects it — and no extension may violate byte-reproducibility
+(no session ids, nonces, or wall-clock in authored casts).

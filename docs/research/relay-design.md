@@ -353,6 +353,27 @@ drops that client (into the rejoin path below), never backpressures the
 pump — the relay sits in the primary's critical path, so slow-spectator
 backpressure must be structurally impossible.
 
+### Pane mirror (#57 Stage 1 — contract, not code)
+
+Locked at [#57](https://github.com/Tnsr-Q/ratty/issues/57) (2026-08-04) as
+part of the pane-0 contract: a spectator of a future multi-terminal primary
+receives **exactly one terminal's byte stream** — pane 0 or the focused
+terminal, the host's choice — and the selection is declared, not inferred:
+
+- `hello` gains an **optional** `pane: {id, of}` field beside the existing
+  `degraded` flag — absent means single-terminal primary, exactly today's
+  wire, so every shipped spectator keeps parsing (the control-frame set is
+  append-only in the same spirit as the `caps` reply).
+- **Mirror-switch mid-session = `reset-notice` + snapshot.** ratty has no
+  external resize and the terminals' geometries may differ, so switching the
+  mirrored stream is a session cut on the spectator's side, never a splice —
+  the late-join snapshot machinery below is reused as-is.
+
+No multi-terminal primary exists yet; this section is the written contract
+the (a)-vs-(b) fork ([#86](https://github.com/Tnsr-Q/ratty/issues/86))
+builds against, so relay compatibility is a stated property rather than an
+assumption.
+
 ### Late-join snapshot semantics
 
 The snapshot is a synthesized composite emitted at a single instant, the

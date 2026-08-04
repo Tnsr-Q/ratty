@@ -569,6 +569,11 @@ fn caps(ctx: &QueryCtx<'_>, source: IngressSource) -> Value {
         "v": 1,
         "session": ctx.session.nonce_hex(),
         "ops": SUPPORTED_OPS,
+        // The #57 pane-0 contract: the widget renders exactly one grid, and
+        // any future pane-addressed content MUST degrade to it. Hosts
+        // introspect this key instead of inferring from behavior; it grows
+        // only when a multi-grid browser story actually ships (#86).
+        "panes": 1,
         "ack": { "key": ACK_TOKEN_KEY },
         "limits": {
             "max_query_bytes": query::MAX_QUERY_SEQUENCE_BYTES,
@@ -1290,6 +1295,9 @@ mod tests {
         let caps = payload(&reply);
         assert_eq!(caps["v"], json!(1));
         assert_eq!(caps["ack"]["key"], json!("tok"));
+        // The #57 pane-0 contract key: exactly one rendered grid until the
+        // browser fork (#86) ships more.
+        assert_eq!(caps["panes"], json!(1));
         assert_eq!(
             caps["session"].as_str().expect("session hex").len(),
             16,
