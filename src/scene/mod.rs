@@ -592,18 +592,16 @@ pub(crate) fn apply_terminal_presentation(
         };
     }
 
+    // Presentation owns the back sheet's rotation and its depth behind the
+    // front plane; X/Y are placement and stay untouched.
     for mut transform in &mut plane_transforms.p1() {
         if is_3d {
             transform.rotation =
                 Quat::from_euler(EulerRot::XYZ, pitch, yaw + std::f32::consts::PI, 0.0);
-            transform.translation = if is_mobius {
-                Vec3::ZERO
-            } else {
-                Vec3::new(0.0, 0.0, -2.0)
-            };
+            transform.translation.z = if is_mobius { 0.0 } else { -2.0 };
         } else {
             transform.rotation = Quat::IDENTITY;
-            transform.translation = Vec3::new(0.0, 0.0, -2.0);
+            transform.translation.z = -2.0;
         }
     }
 
@@ -748,5 +746,66 @@ mod tests {
         );
         assert!(!changed);
         assert!(!mobius.active);
+    }
+
+    // ── App tier: the presentation applier over real entities ──
+
+    fn back_translation(app: &App, entity: Entity) -> Vec3 {
+        app.world()
+            .get::<Transform>(entity)
+            .expect("the back sheet should still exist")
+            .translation
+    }
+
+    #[test]
+    fn back_plane_placement_survives_presentation_changes() {
+        let mut app = App::new();
+        app.insert_resource(TerminalPresentation {
+            mode: TerminalPresentationMode::Plane3d,
+        });
+        app.insert_resource(TerminalPlaneView::default());
+        app.insert_resource(MobiusTransition::default());
+        app.init_resource::<Assets<StandardMaterial>>();
+        app.add_systems(Update, apply_terminal_presentation);
+
+        // A second terminal's back sheet would sit off-origin exactly like
+        // this; presentation changes must not snap it back to (0, 0).
+        let back = app
+            .world_mut()
+            .spawn((
+                TerminalPlaneBack,
+                Transform {
+                    translation: Vec3::new(120.0, 40.0, -2.0),
+                    rotation: Quat::from_rotation_y(std::f32::consts::PI),
+                    scale: Vec3::ONE,
+                },
+                Visibility::Hidden,
+            ))
+            .id();
+
+        app.update();
+        assert_eq!(
+            back_translation(&app, back),
+            Vec3::new(120.0, 40.0, -2.0),
+            "Plane3d keeps placement and applies the presentation depth"
+        );
+
+        app.world_mut().resource_mut::<TerminalPresentation>().mode =
+            TerminalPresentationMode::Mobius3d;
+        app.update();
+        assert_eq!(
+            back_translation(&app, back),
+            Vec3::new(120.0, 40.0, 0.0),
+            "Mobius zeroes only the presentation-owned depth"
+        );
+
+        app.world_mut().resource_mut::<TerminalPresentation>().mode =
+            TerminalPresentationMode::Flat2d;
+        app.update();
+        assert_eq!(
+            back_translation(&app, back),
+            Vec3::new(120.0, 40.0, -2.0),
+            "the flat-mode reset also keeps placement"
+        );
     }
 }
