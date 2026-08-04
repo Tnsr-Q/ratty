@@ -163,15 +163,24 @@ pub(crate) fn shutdown_terminal_runtime_on_exit(
 ///
 /// It also updates scroll-coupled inline anchors before the redraw and sync passes rebuild the
 /// scene.
+///
+/// On transport disconnect the runtime is reaped in place and the final screen is retained
+/// (the `--hold` semantic); the app exits only through
+/// [`request_exit_on_primary_window_close`].
 pub fn pump_pty_output(
     mut runtime: ResMut<TerminalRuntime>,
     mut inline_objects: ResMut<TerminalInlineObjects>,
     mut viz_registry: ResMut<crate::viz::VizRegistry>,
-    mut app_exit: MessageWriter<AppExit>,
     mut ai_commands: MessageWriter<crate::ai::AiCommand>,
     mut queries: MessageWriter<crate::query_channel::QueryRequest>,
     mut redraw: ResMut<TerminalRedrawState>,
 ) {
+    // A reaped transport has nothing more to say; leave the retained final
+    // screen untouched.
+    if runtime.pty_disconnected {
+        return;
+    }
+
     let screen_rows = |screen: &vt100::Screen| {
         let (_, cols) = screen.size();
         screen.rows(0, cols).collect::<Vec<_>>()
@@ -229,9 +238,11 @@ pub fn pump_pty_output(
             }
             Err(TryRecvError::Empty) => break,
             Err(TryRecvError::Disconnected) => {
+                // The shell exited. Reap the transport in place (the same
+                // path Drop takes) but keep the final screen readable; the
+                // app exits only through the primary-window close latch.
                 if !runtime.pty_disconnected {
-                    runtime.pty_disconnected = true;
-                    app_exit.write(AppExit::Success);
+                    runtime.shutdown();
                 }
                 break;
             }
@@ -263,6 +274,99 @@ fn infer_upward_scroll(prev_rows: &[String], next_rows: &[String]) -> u16 {
         }
     }
     0
+}
+
+#[cfg(test)]
+mod pump_disconnect_tests {
+    use super::*;
+    use bevy::ecs::message::Messages;
+
+    fn pump_app(runtime: TerminalRuntime) -> App {
+        let mut app = App::new();
+        app.insert_resource(runtime)
+            .init_resource::<TerminalInlineObjects>()
+            .init_resource::<VizRegistry>()
+            .init_resource::<TerminalRedrawState>()
+            .add_message::<AppExit>()
+            .add_message::<crate::ai::AiCommand>()
+            .add_message::<crate::query_channel::QueryRequest>()
+            .add_systems(Update, pump_pty_output);
+        app
+    }
+
+    fn drained_exits(app: &mut App) -> Vec<AppExit> {
+        app.world_mut()
+            .resource_mut::<Messages<AppExit>>()
+            .drain()
+            .collect()
+    }
+
+    #[test]
+    fn disconnect_does_not_exit_the_app_and_retains_the_final_screen() {
+        let (runtime, host) = TerminalRuntime::virtual_channel(&AppConfig::default());
+        let mut app = pump_app(runtime);
+        host.feed_tx
+            .send(b"final words".to_vec())
+            .expect("virtual feed should accept bytes");
+        // Dropping the host drops the feed sender: the same update's drain
+        // sees the buffered chunk, then Disconnected — the `-e /bin/echo hi`
+        // shape, headless.
+        drop(host);
+
+        app.update();
+        assert!(
+            drained_exits(&mut app).is_empty(),
+            "disconnect must not write AppExit"
+        );
+        let screen = app
+            .world()
+            .resource::<TerminalRuntime>()
+            .parser
+            .screen()
+            .contents();
+        assert!(
+            screen.contains("final words"),
+            "the final screen stays readable"
+        );
+
+        // The retained screen survives subsequent quiet frames (the
+        // stop-pumping guard path).
+        app.update();
+        app.update();
+        assert!(
+            drained_exits(&mut app).is_empty(),
+            "disconnect must not write AppExit on later frames either"
+        );
+        let screen = app
+            .world()
+            .resource::<TerminalRuntime>()
+            .parser
+            .screen()
+            .contents();
+        assert!(
+            screen.contains("final words"),
+            "the retained screen survives quiet frames"
+        );
+    }
+
+    #[test]
+    fn disconnect_reaps_the_transport_through_the_shutdown_path() {
+        let (runtime, host) = TerminalRuntime::virtual_channel(&AppConfig::default());
+        let mut app = pump_app(runtime);
+        drop(host);
+
+        app.update();
+        let runtime = app.world().resource::<TerminalRuntime>();
+        assert!(runtime.pty_disconnected, "the disconnect must be latched");
+        assert!(
+            runtime
+                .writer
+                .lock()
+                .expect("writer lock should not be poisoned")
+                .is_none(),
+            "shutdown took the input writer: a dead terminal discards input"
+        );
+    }
 }
 
 #[derive(SystemParam)]
