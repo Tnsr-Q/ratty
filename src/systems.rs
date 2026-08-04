@@ -832,8 +832,17 @@ pub(crate) fn sync_inline_objects(mut params: SyncInlineParams) {
         }
     }
 
-    let Ok((plane_entity, _plane_transform)) = plane_query.single() else {
-        return;
+    let (plane_entity, _plane_transform) = match plane_query.single() {
+        Ok(plane) => plane,
+        Err(err) => {
+            // Latched once per process: inline objects parent to THE terminal
+            // plane, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!(
+                "sync_inline_objects: inline objects need exactly one terminal plane: {err}"
+            );
+            return;
+        }
     };
 
     let cell_width = viewport.size.x / terminal.cols.max(1) as f32;
@@ -1420,9 +1429,15 @@ pub(crate) fn sync_rgp_objects(mut params: RgpSyncParams) {
                 *visibility = Visibility::Visible;
             }
             TerminalPresentationMode::Plane3d | TerminalPresentationMode::Mobius3d => {
-                let Ok(plane_transform) = plane_query.single() else {
-                    *visibility = Visibility::Hidden;
-                    continue;
+                let plane_transform = match plane_query.single() {
+                    Ok(plane_transform) => plane_transform,
+                    Err(err) => {
+                        warn_once!(
+                            "sync_rgp_objects: RGP projection needs exactly one terminal plane: {err}"
+                        );
+                        *visibility = Visibility::Hidden;
+                        continue;
+                    }
                 };
                 let local_position = plane_surface_point(
                     presentation.mode,
@@ -2339,9 +2354,15 @@ pub(crate) fn sync_viz_objects(mut params: VizSyncParams) {
                 *visibility = Visibility::Visible;
             }
             TerminalPresentationMode::Plane3d | TerminalPresentationMode::Mobius3d => {
-                let Ok(plane_transform) = plane_query.single() else {
-                    *visibility = Visibility::Hidden;
-                    continue;
+                let plane_transform = match plane_query.single() {
+                    Ok(plane_transform) => plane_transform,
+                    Err(err) => {
+                        warn_once!(
+                            "sync_viz_objects: viz projection needs exactly one terminal plane: {err}"
+                        );
+                        *visibility = Visibility::Hidden;
+                        continue;
+                    }
                 };
                 let local_position = plane_surface_point(
                     presentation.mode,
@@ -2892,8 +2913,14 @@ fn cursor_pose(
             },
         ),
         TerminalPresentationMode::Plane3d | TerminalPresentationMode::Mobius3d => {
-            let Ok(plane_transform) = ctx.plane_query.single() else {
-                return (Vec3::ZERO, Quat::IDENTITY, scale, Visibility::Hidden);
+            let plane_transform = match ctx.plane_query.single() {
+                Ok(plane_transform) => plane_transform,
+                Err(err) => {
+                    warn_once!(
+                        "sync_asset_to_terminal_cursor: the cursor model needs exactly one terminal plane: {err}"
+                    );
+                    return (Vec3::ZERO, Quat::IDENTITY, scale, Visibility::Hidden);
+                }
             };
             let plane_local_x = cursor_x / cols - 0.5;
             let plane_local_y = 0.5 - (cursor_row + 0.5) / rows + plane_bob;
@@ -3564,5 +3591,267 @@ mod viz_render_tests {
         let (_, died_scale) =
             viz_effect_pose(VizEffectKind::Died, base_translation, base_scale, 1.0);
         assert_eq!(died_scale, Vec3::ZERO, "died shrinks to nothing");
+    }
+}
+
+#[cfg(test)]
+mod single_plane_degrade_tests {
+    use super::*;
+    use crate::viz::{PsItem, PsV1, VizAnchor, VizCapture, VizPayload};
+    use bevy::asset::AssetPlugin;
+    use bevy::ecs::system::RunSystemOnce;
+
+    // Each of these tests asserts a `warn_once!` call site. The latch is
+    // process-global, so exactly ONE test in the whole binary may assert
+    // each site's warn, and no other test may drive that system into the
+    // wrong-plane-count state before or in parallel with it.
+
+    /// Runs `f` with a thread-local WARN-capturing subscriber installed and
+    /// returns the captured messages. Sound only because every system under
+    /// test runs inline on this thread via `run_system_once` — an
+    /// `app.update()` could run systems on task-pool threads this
+    /// subscriber cannot see.
+    fn capture_warns(f: impl FnOnce()) -> Vec<String> {
+        use bevy::log::tracing::field::{Field, Visit};
+        use bevy::log::tracing::{Event, Level, Metadata, Subscriber, span};
+        use std::sync::{Arc, Mutex};
+
+        struct WarnCollector(Arc<Mutex<Vec<String>>>);
+
+        impl Subscriber for WarnCollector {
+            fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+                *metadata.level() == Level::WARN
+            }
+            fn new_span(&self, _span: &span::Attributes<'_>) -> span::Id {
+                span::Id::from_u64(1)
+            }
+            fn record(&self, _span: &span::Id, _values: &span::Record<'_>) {}
+            fn record_follows_from(&self, _span: &span::Id, _follows: &span::Id) {}
+            fn event(&self, event: &Event<'_>) {
+                struct MessageVisitor<'a>(&'a mut String);
+                impl Visit for MessageVisitor<'_> {
+                    fn record_debug(&mut self, field: &Field, value: &dyn core::fmt::Debug) {
+                        if field.name() == "message" {
+                            *self.0 = format!("{value:?}");
+                        }
+                    }
+                }
+                let mut message = String::new();
+                event.record(&mut MessageVisitor(&mut message));
+                if let Ok(mut messages) = self.0.lock() {
+                    messages.push(message);
+                }
+            }
+            fn enter(&self, _span: &span::Id) {}
+            fn exit(&self, _span: &span::Id) {}
+        }
+
+        let messages = Arc::new(Mutex::new(Vec::new()));
+        let collector = WarnCollector(Arc::clone(&messages));
+        bevy::log::tracing::subscriber::with_default(collector, f);
+        messages
+            .lock()
+            .expect("the warn collector lock should not be poisoned")
+            .clone()
+    }
+
+    fn warns_naming(warns: &[String], system: &str) -> usize {
+        warns.iter().filter(|warn| warn.contains(system)).count()
+    }
+
+    fn base_resources(world: &mut World, mode: TerminalPresentationMode) {
+        world.insert_resource(
+            TerminalSurface::new(&AppConfig::default()).expect("surface construction is CPU-only"),
+        );
+        world.insert_resource(TerminalViewport {
+            size: Vec2::new(800.0, 480.0),
+            center: Vec2::ZERO,
+        });
+        world.insert_resource(TerminalPresentation { mode });
+        world.insert_resource(TerminalPlaneWarp::default());
+        world.init_resource::<Time>();
+    }
+
+    #[test]
+    fn inline_sync_warns_once_when_the_plane_is_not_unique() {
+        // A real AssetServer resource is required for the system to run at
+        // all; AssetPlugin::build constructs one without task pools and no
+        // load is ever issued (app.update() is never called).
+        let mut app = App::new();
+        app.add_plugins(AssetPlugin::default());
+        let world = app.world_mut();
+        // The default last_viewport_size differs from the viewport below, so
+        // needs_sync reports a full sync and the plane resolution is reached.
+        world.init_resource::<TerminalInlineObjects>();
+        base_resources(world, TerminalPresentationMode::Flat2d);
+        world.init_resource::<Assets<StandardMaterial>>();
+        world.init_resource::<Assets<Image>>();
+        world.init_resource::<Assets<Mesh>>();
+        world.spawn((TerminalPlane, Transform::default()));
+        world.spawn((TerminalPlane, Transform::default()));
+
+        let warns = capture_warns(|| {
+            world
+                .run_system_once(sync_inline_objects)
+                .expect("the system should run");
+            world
+                .run_system_once(sync_inline_objects)
+                .expect("the system should run");
+        });
+        // == 1 also pins the latch: a plain warn! regression would capture 2.
+        assert_eq!(
+            warns_naming(&warns, "sync_inline_objects"),
+            1,
+            "two wrong-plane frames must produce exactly one latched warn: {warns:?}"
+        );
+    }
+
+    #[test]
+    fn rgp_projection_warns_once_and_hides_without_a_unique_plane() {
+        let mut world = World::new();
+        world.insert_resource(AppConfig::default());
+        base_resources(&mut world, TerminalPresentationMode::Plane3d);
+        world.init_resource::<MobiusTransition>();
+        let mut inline_objects = TerminalInlineObjects::default();
+        inline_objects.anchors.insert(
+            1,
+            InlineAnchor {
+                row: 0,
+                col: 0,
+                columns: 2,
+                rows: 2,
+                style: InlineStyle::default(),
+            },
+        );
+        world.insert_resource(inline_objects);
+        let object = world
+            .spawn((
+                TerminalRgpObject { object_id: 1 },
+                Transform::default(),
+                Visibility::Visible,
+                RgpAnimationState::default(),
+            ))
+            .id();
+        world.spawn((TerminalPlane, Transform::default()));
+        world.spawn((TerminalPlane, Transform::default()));
+
+        let warns = capture_warns(|| {
+            world
+                .run_system_once(sync_rgp_objects)
+                .expect("the system should run");
+            world
+                .run_system_once(sync_rgp_objects)
+                .expect("the system should run");
+        });
+        assert_eq!(
+            warns_naming(&warns, "sync_rgp_objects"),
+            1,
+            "two wrong-plane frames must produce exactly one latched warn: {warns:?}"
+        );
+        assert_eq!(
+            world.get::<Visibility>(object).copied(),
+            Some(Visibility::Hidden),
+            "the 3D projection hides the object while the plane count is wrong"
+        );
+    }
+
+    #[test]
+    fn viz_projection_warns_once_and_hides_without_a_unique_plane() {
+        const ID: u32 = 0x8000_0001;
+        let mut world = World::new();
+        base_resources(&mut world, TerminalPresentationMode::Plane3d);
+        world.init_resource::<MobiusTransition>();
+        let mut registry = VizRegistry::default();
+        registry.upsert(
+            ID,
+            VizPayload::Ps(PsV1 {
+                capture: VizCapture {
+                    source: "test/synthetic".to_string(),
+                    ts: "2026-08-04T00:00:00Z".to_string(),
+                },
+                items: vec![PsItem {
+                    pid: 1,
+                    name: "proc1".to_string(),
+                    cpu: 1.0,
+                    mem: 0,
+                    state: "R".to_string(),
+                }],
+            }),
+            Some(VizAnchor {
+                row: 0,
+                col: 0,
+                cols: 4,
+                rows: 2,
+            }),
+        );
+        world.insert_resource(registry);
+        let root = world
+            .spawn((
+                VizObjectRoot {
+                    viz_id: ID,
+                    children: HashMap::new(),
+                },
+                Transform::default(),
+                Visibility::Visible,
+            ))
+            .id();
+        world.spawn((TerminalPlane, Transform::default()));
+        world.spawn((TerminalPlane, Transform::default()));
+
+        let warns = capture_warns(|| {
+            world
+                .run_system_once(sync_viz_objects)
+                .expect("the system should run");
+            world
+                .run_system_once(sync_viz_objects)
+                .expect("the system should run");
+        });
+        assert_eq!(
+            warns_naming(&warns, "sync_viz_objects"),
+            1,
+            "two wrong-plane frames must produce exactly one latched warn: {warns:?}"
+        );
+        assert_eq!(
+            world.get::<Visibility>(root).copied(),
+            Some(Visibility::Hidden),
+            "the 3D projection hides the root while the plane count is wrong"
+        );
+    }
+
+    #[test]
+    fn cursor_sync_warns_once_and_hides_without_a_unique_plane() {
+        let config = AppConfig::default();
+        let mut world = World::new();
+        world.insert_resource(AppConfig::default());
+        world.init_resource::<CursorSettings>();
+        world.insert_resource(TerminalRuntime::virtual_channel(&config).0);
+        base_resources(&mut world, TerminalPresentationMode::Plane3d);
+        world.init_resource::<MobiusTransition>();
+        let cursor = world
+            .spawn((CursorModel, Transform::default(), Visibility::Visible))
+            .id();
+        world.spawn((TerminalPlane, Transform::default()));
+        world.spawn((TerminalPlane, Transform::default()));
+
+        let warns = capture_warns(|| {
+            world
+                .run_system_once(sync_asset_to_terminal_cursor)
+                .expect("the system should run");
+            world
+                .run_system_once(sync_asset_to_terminal_cursor)
+                .expect("the system should run");
+        });
+        // The Hidden assert alone would pass pre-fix — the warn is the
+        // discriminator.
+        assert_eq!(
+            warns_naming(&warns, "sync_asset_to_terminal_cursor"),
+            1,
+            "two wrong-plane frames must produce exactly one latched warn: {warns:?}"
+        );
+        assert_eq!(
+            world.get::<Visibility>(cursor).copied(),
+            Some(Visibility::Hidden),
+            "the cursor model hides while the plane count is wrong"
+        );
     }
 }

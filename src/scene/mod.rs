@@ -553,8 +553,8 @@ pub(crate) fn apply_terminal_presentation(
         };
     }
 
-    if let Ok(front_material) = plane_materials.single() {
-        let cull_mode = if is_mobius { None } else { Some(Face::Back) };
+    let cull_mode = if is_mobius { None } else { Some(Face::Back) };
+    for front_material in plane_materials.iter() {
         // `get_mut` marks the material modified and re-prepares it on the
         // GPU; only take it when the cull mode actually changes.
         let needs_update = materials
@@ -749,6 +749,62 @@ mod tests {
     }
 
     // ── App tier: the presentation applier over real entities ──
+
+    #[test]
+    fn cull_mode_toggle_reaches_every_plane() {
+        use bevy::ecs::system::RunSystemOnce;
+
+        let mut world = World::new();
+        world.insert_resource(TerminalPresentation {
+            mode: TerminalPresentationMode::Mobius3d,
+        });
+        world.insert_resource(TerminalPlaneView::default());
+        world.insert_resource(MobiusTransition::default());
+        world.init_resource::<Assets<StandardMaterial>>();
+        let (first, second) = {
+            let mut materials = world.resource_mut::<Assets<StandardMaterial>>();
+            // The default cull mode is Some(Face::Back), the Plane3d value.
+            (
+                materials.add(StandardMaterial::default()),
+                materials.add(StandardMaterial::default()),
+            )
+        };
+        world.spawn((TerminalPlane, MeshMaterial3d(first.clone())));
+        world.spawn((TerminalPlane, MeshMaterial3d(second.clone())));
+
+        world
+            .run_system_once(apply_terminal_presentation)
+            .expect("the system should run");
+        {
+            let materials = world.resource::<Assets<StandardMaterial>>();
+            for handle in [&first, &second] {
+                assert_eq!(
+                    materials
+                        .get(handle)
+                        .expect("the material exists")
+                        .cull_mode,
+                    None,
+                    "Mobius renders every plane's front material double-sided"
+                );
+            }
+        }
+
+        world.resource_mut::<TerminalPresentation>().mode = TerminalPresentationMode::Plane3d;
+        world
+            .run_system_once(apply_terminal_presentation)
+            .expect("the system should run");
+        let materials = world.resource::<Assets<StandardMaterial>>();
+        for handle in [&first, &second] {
+            assert_eq!(
+                materials
+                    .get(handle)
+                    .expect("the material exists")
+                    .cull_mode,
+                Some(Face::Back),
+                "leaving Mobius restores back-face culling on every plane"
+            );
+        }
+    }
 
     fn back_translation(app: &App, entity: Entity) -> Vec3 {
         app.world()
