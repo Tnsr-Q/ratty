@@ -1,0 +1,187 @@
+<!doctype html>
+<!--
+  web-spectator — the minimal static harness the relay design scoped for the
+  #47 demo (docs/research/relay-design.md: "web spectator = a minimal static
+  harness feeding feed()"). It is a READ-ONLY spectator: it never forwards
+  input (drained and discarded, the wasm twin of `watch` sinking stdin), and
+  the fan-out server ignores inbound frames anyway.
+
+  Serve from the REPO ROOT so the wasm bundle resolves:
+
+      site/build-wasm.sh                # fresh bundle first — a stale
+                                        # site/pkg predates recent render
+                                        # fixes and mimics rendering defects
+      python3 -m http.server 8000       # from the repo root
+      open http://localhost:8000/tools/ratty-relay/examples/web-spectator.html
+
+  Contract mirrored from tools/ratty-relay/src/watch.rs, deliberately the
+  same shapes:
+
+  - Binary WebSocket frames are gated session bytes → RattySession.feed().
+  - JSON text frames are Control (frames.rs): hello / resize / reset-notice /
+    snapshot-begin / snapshot-end / presence-mirror / end.
+  - presence-mirror announces the mirrored roster this spectator holds
+    ({kind: "participant"|"note", id: "r<ns>.<id>"}); `add` arrives before
+    the joining bytes and `remove` after the clearing bytes, so the tracked
+    set is always a superset of what was applied.
+  - Spectator instances are connection-ephemeral: on ANY socket close (clean
+    `end` or drop) every tracked row is released by feeding synthesized
+    BEL-terminated OSC 777 `user.leave` / `note.remove` — rows the relay
+    already cleared answer `unknown-id`, harmless noise in this instance's
+    own error ring (the watch.rs trade, kept identical).
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>ratty-relay web spectator</title>
+    <style>
+      body {
+        margin: 0;
+        background: #0b0b10;
+        color: #b8c0cc;
+        font: 13px/1.5 ui-monospace, monospace;
+      }
+      #bar {
+        display: flex;
+        gap: 8px;
+        align-items: center;
+        padding: 8px 12px;
+      }
+      #url {
+        width: 22em;
+        background: #14141c;
+        color: inherit;
+        border: 1px solid #2a2a38;
+        padding: 4px 6px;
+      }
+      button {
+        background: #1c2733;
+        color: #cfe3ff;
+        border: 1px solid #33475c;
+        padding: 4px 12px;
+        cursor: pointer;
+      }
+      #status {
+        white-space: pre;
+      }
+      #ratty-canvas {
+        display: block;
+        width: 100vw;
+        height: calc(100vh - 40px);
+        background: #000;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="bar">
+      <input id="url" value="ws://127.0.0.1:7877" />
+      <button id="connect">Connect</button>
+      <span id="status">idle</span>
+    </div>
+    <canvas id="ratty-canvas" aria-label="GPU terminal (read-only spectator)"></canvas>
+    <script type="module">
+      const statusEl = document.getElementById("status");
+      const show = (t) => (statusEl.textContent = t);
+
+      let session = null;
+      let ws = null;
+      // MirrorId set, folded exactly as watch.rs folds presence-mirror
+      // frames: key "<kind>:<id>", cleared as a unit on `clear: true`.
+      const mirrored = new Map();
+
+      // The OSC 777 grammar, matching osc::osc_sequence (BEL-terminated)
+      // and osc::percent_encode closely enough for mirror ids, which are
+      // alnum/dot after the relay's 48-byte truncate+hash.
+      const OSC = (cmd, params) =>
+        `\x1b]777;ratty:${cmd};${params}\x07`;
+      const enc = encodeURIComponent;
+
+      function tearDownMirrors() {
+        if (!session || mirrored.size === 0) return;
+        const encoder = new TextEncoder();
+        for (const { kind, id } of mirrored.values()) {
+          const seq =
+            kind === "note"
+              ? OSC("note.remove", `id=${enc(id)}`)
+              : OSC("user.leave", `id=${enc(id)}`);
+          session.feed(encoder.encode(seq));
+        }
+        show(`released ${mirrored.size} mirrored presence rows`);
+        mirrored.clear();
+      }
+
+      function onControl(frame) {
+        switch (frame.type) {
+          case "hello":
+            show(
+              `session "${frame.session}" ${frame.cols}x${frame.rows} seq=${frame.seq}` +
+                (frame.degraded ? " (degraded snapshot: blank anchor)" : ""),
+            );
+            break;
+          case "resize":
+            show(`primary resized to ${frame.cols}x${frame.rows}`);
+            break;
+          case "snapshot-begin":
+            show("late-join snapshot…");
+            break;
+          case "snapshot-end":
+            show("snapshot complete; live");
+            break;
+          case "reset-notice":
+            // Bytes already reset the screen; roster cleared via the
+            // presence-mirror clear that accompanies it.
+            break;
+          case "presence-mirror": {
+            if (frame.clear) mirrored.clear();
+            for (const m of frame.add ?? [])
+              mirrored.set(`${m.kind}:${m.id}`, m);
+            for (const m of frame.remove ?? [])
+              mirrored.delete(`${m.kind}:${m.id}`);
+            break;
+          }
+          case "end":
+            show(`session ended: ${frame.reason}`);
+            break;
+        }
+      }
+
+      async function connect() {
+        const { default: init, start } = await import("/site/pkg/ratty.js");
+        await init();
+        session = start("#ratty-canvas");
+        // Read-only spectator: drain the input buffer and discard, so
+        // stray keystrokes into the canvas can never accumulate.
+        setInterval(() => session.drain_input(), 250);
+
+        ws = new WebSocket(document.getElementById("url").value);
+        ws.binaryType = "arraybuffer";
+        ws.onmessage = (ev) => {
+          if (typeof ev.data === "string") {
+            try {
+              onControl(JSON.parse(ev.data));
+            } catch {
+              /* unknown control frames are advisory; ignore */
+            }
+          } else {
+            session.feed(new Uint8Array(ev.data));
+          }
+        };
+        ws.onclose = () => {
+          tearDownMirrors();
+          statusEl.textContent += " — connection closed";
+        };
+        ws.onerror = () => show("websocket error");
+        show("connecting…");
+      }
+
+      document.getElementById("connect").addEventListener(
+        "click",
+        () => {
+          if (session?.user_gesture) session.user_gesture();
+          connect().catch((e) => show(`failed: ${e}`));
+        },
+        { once: true },
+      );
+    </script>
+  </body>
+</html>
