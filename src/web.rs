@@ -339,8 +339,6 @@ pub fn start(canvas_selector: &str, config_toml: Option<String>) -> Result<Ratty
         (app_config.window.opacity.clamp(0.0, 1.0) * 255.0).round() as u8,
     )))
     .insert_resource(app_config.clone())
-    .insert_resource(runtime)
-    .insert_resource(terminal)
     .insert_resource(controls)
     // Continuous updates: transmissions animate even without input focus.
     .insert_resource(WinitSettings::continuous())
@@ -393,6 +391,12 @@ pub fn start(canvas_selector: &str, config_toml: Option<String>) -> Result<Ratty
         expire_query_promises.after(crate::query_channel::answer_queries),
     );
 
+    // The terminal seat is born here, where the surface and runtime values
+    // are born; setup_scene finds it at Startup and dresses it with the
+    // world-derived per-terminal components. Nothing runs between this spawn
+    // and run().
+    app.world_mut().spawn((terminal, runtime));
+
     // Bevy's winit runner on wasm spawns onto the browser event loop and
     // returns, so the session handle is live after this call.
     app.run();
@@ -407,13 +411,35 @@ pub fn start(canvas_selector: &str, config_toml: Option<String>) -> Result<Ratty
 fn drain_web_controls(
     queue: Res<WebControlQueue>,
     mut presentation: ResMut<TerminalPresentation>,
-    mut warp: ResMut<TerminalPlaneWarp>,
+    mut warp: Query<&mut TerminalPlaneWarp>,
     mut view: ResMut<TerminalPlaneView>,
     mut mobius: ResMut<MobiusTransition>,
     mut stage_tween: ResMut<StageTween>,
-    mut redraw: ResMut<TerminalRedrawState>,
+    mut redraw: Query<&mut TerminalRedrawState>,
     mut sound: ResMut<crate::sound::SoundState>,
 ) {
+    let mut warp = match warp.single_mut() {
+        Ok(warp) => warp,
+        Err(err) => {
+            // Latched once per process: the warp lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!("drain_web_controls: the plane warp needs exactly one terminal seat: {err}");
+            return;
+        }
+    };
+    let mut redraw = match redraw.single_mut() {
+        Ok(redraw) => redraw,
+        Err(err) => {
+            // Latched once per process: the redraw flag lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!(
+                "drain_web_controls: the redraw flag needs exactly one terminal seat: {err}"
+            );
+            return;
+        }
+    };
     let pending = match queue.0.lock() {
         Ok(mut controls) => std::mem::take(&mut *controls),
         Err(_) => return,

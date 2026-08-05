@@ -55,56 +55,59 @@ fn main() -> anyhow::Result<()> {
     std::fs::create_dir_all(&asset_root)?;
     let window_icon = load_window_icon()?;
 
-    App::new()
-        .insert_resource(ClearColor(Color::srgba_u8(
-            app_config.theme.background[0],
-            app_config.theme.background[1],
-            app_config.theme.background[2],
-            (app_config.window.opacity.clamp(0.0, 1.0) * 255.0).round() as u8,
-        )))
-        .insert_resource(app_config.clone())
-        .insert_resource(runtime)
-        .insert_resource(terminal)
-        .insert_non_send(AppWindowIcon { icon: window_icon })
-        // Always update continuously, focused or not. Bevy's default switches
-        // unfocused windows to a reactive mode, which would delay background
-        // PTY output.
-        .insert_resource(WinitSettings::continuous())
-        .add_plugins(
-            DefaultPlugins
-                .set(WindowPlugin {
-                    primary_window: Some(Window {
-                        title: window_title.clone(),
-                        name: Some(window_title),
-                        resolution: window_resolution(&app_config),
-                        resize_constraints: WindowResizeConstraints {
-                            min_width: 1.0,
-                            min_height: 1.0,
-                            ..default()
-                        },
-                        transparent: app_config.window.opacity < 1.0,
-                        visible: false,
+    let mut app = App::new();
+    app.insert_resource(ClearColor(Color::srgba_u8(
+        app_config.theme.background[0],
+        app_config.theme.background[1],
+        app_config.theme.background[2],
+        (app_config.window.opacity.clamp(0.0, 1.0) * 255.0).round() as u8,
+    )))
+    .insert_resource(app_config.clone())
+    .insert_non_send(AppWindowIcon { icon: window_icon })
+    // Always update continuously, focused or not. Bevy's default switches
+    // unfocused windows to a reactive mode, which would delay background
+    // PTY output.
+    .insert_resource(WinitSettings::continuous())
+    .add_plugins(
+        DefaultPlugins
+            .set(WindowPlugin {
+                primary_window: Some(Window {
+                    title: window_title.clone(),
+                    name: Some(window_title),
+                    resolution: window_resolution(&app_config),
+                    resize_constraints: WindowResizeConstraints {
+                        min_width: 1.0,
+                        min_height: 1.0,
                         ..default()
-                    }),
-                    ..default()
-                })
-                .set(AssetPlugin {
-                    file_path: asset_root.to_string_lossy().into_owned(),
-                    ..default()
-                })
-                .set(RenderPlugin {
-                    render_creation: bevy::render::settings::RenderCreation::Automatic(Box::new(
-                        WgpuSettings {
-                            priority: WgpuSettingsPriority::WebGPU,
-                            ..default()
-                        },
-                    )),
+                    },
+                    transparent: app_config.window.opacity < 1.0,
+                    visible: false,
                     ..default()
                 }),
-        )
-        .add_systems(Update, apply_window_icon)
-        .add_plugins(TerminalPlugin)
-        .run();
+                ..default()
+            })
+            .set(AssetPlugin {
+                file_path: asset_root.to_string_lossy().into_owned(),
+                ..default()
+            })
+            .set(RenderPlugin {
+                render_creation: bevy::render::settings::RenderCreation::Automatic(Box::new(
+                    WgpuSettings {
+                        priority: WgpuSettingsPriority::WebGPU,
+                        ..default()
+                    },
+                )),
+                ..default()
+            }),
+    )
+    .add_systems(Update, apply_window_icon)
+    .add_plugins(TerminalPlugin);
+    // The terminal seat is born here, where the surface and runtime values
+    // are born; setup_scene finds it at Startup and dresses it with the
+    // world-derived per-terminal components. Nothing runs between this spawn
+    // and run().
+    app.world_mut().spawn((terminal, runtime));
+    app.run();
 
     Ok(())
 }

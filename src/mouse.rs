@@ -237,15 +237,15 @@ impl TerminalSelection {
 #[derive(SystemParam)]
 pub struct MouseSystemParams<'w, 's> {
     primary_window: Query<'w, 's, (Entity, &'static Window), With<PrimaryWindow>>,
-    runtime: ResMut<'w, TerminalRuntime>,
-    terminal: Res<'w, TerminalSurface>,
-    viewport: Res<'w, TerminalViewport>,
+    runtime: Query<'w, 's, &'static mut TerminalRuntime>,
+    terminal: Query<'w, 's, &'static TerminalSurface>,
+    viewport: Query<'w, 's, &'static TerminalViewport>,
     presentation: Res<'w, TerminalPresentation>,
     mobius_transition: Res<'w, MobiusTransition>,
     plane_view: ResMut<'w, TerminalPlaneView>,
     stage_tween: ResMut<'w, StageTween>,
     selection: ResMut<'w, TerminalSelection>,
-    redraw: ResMut<'w, crate::terminal::TerminalRedrawState>,
+    redraw: Query<'w, 's, &'static mut crate::terminal::TerminalRedrawState>,
 }
 
 /// Handles terminal mouse input.
@@ -269,6 +269,48 @@ pub(crate) fn handle_mouse_input(
         selection,
         redraw,
     } = &mut params;
+    let terminal = match terminal.single() {
+        Ok(terminal) => terminal,
+        Err(err) => {
+            // Latched once per process: the surface lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!("handle_mouse_input: the surface needs exactly one terminal seat: {err}");
+            return;
+        }
+    };
+    let viewport = match viewport.single() {
+        Ok(viewport) => viewport,
+        Err(err) => {
+            // Latched once per process: the viewport lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!("handle_mouse_input: the viewport needs exactly one terminal seat: {err}");
+            return;
+        }
+    };
+    let mut runtime = match runtime.single_mut() {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            // Latched once per process: the runtime lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!("handle_mouse_input: the runtime needs exactly one terminal seat: {err}");
+            return;
+        }
+    };
+    let mut redraw = match redraw.single_mut() {
+        Ok(redraw) => redraw,
+        Err(err) => {
+            // Latched once per process: the redraw flag lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!(
+                "handle_mouse_input: the redraw flag needs exactly one terminal seat: {err}"
+            );
+            return;
+        }
+    };
     let Ok((primary_window, window)) = primary_window.single() else {
         return;
     };

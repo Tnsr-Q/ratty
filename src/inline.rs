@@ -82,7 +82,7 @@ pub struct TerminalRgpObject {
 }
 
 /// Inline object registry and anchor state.
-#[derive(Resource, Default)]
+#[derive(Component, Default)]
 pub struct TerminalInlineObjects {
     pending_bytes: Vec<u8>,
     pending_rgp_payloads: HashMap<u32, PendingRgpPayload>,

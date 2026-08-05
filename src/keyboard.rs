@@ -329,20 +329,20 @@ impl TerminalKeyboard {
 pub struct KeyboardSystemParams<'w, 's> {
     keys: Res<'w, ButtonInput<KeyCode>>,
     selection: ResMut<'w, TerminalSelection>,
-    plane_warp: ResMut<'w, TerminalPlaneWarp>,
+    plane_warp: Query<'w, 's, &'static mut TerminalPlaneWarp>,
     plane_view: ResMut<'w, TerminalPlaneView>,
     presentation: ResMut<'w, TerminalPresentation>,
     mobius_transition: ResMut<'w, MobiusTransition>,
     stage_tween: ResMut<'w, StageTween>,
     clipboard: NonSendMut<'w, TerminalClipboard>,
-    runtime: ResMut<'w, TerminalRuntime>,
-    terminal: ResMut<'w, TerminalSurface>,
+    runtime: Query<'w, 's, &'static mut TerminalRuntime>,
+    terminal: Query<'w, 's, &'static mut TerminalSurface>,
     primary_window: Query<'w, 's, &'static Window, With<PrimaryWindow>>,
-    viewport: ResMut<'w, TerminalViewport>,
+    viewport: Query<'w, 's, &'static mut TerminalViewport>,
     plane_query: TerminalPlaneLayoutQuery<'w, 's>,
     plane_back_query: TerminalPlaneBackLayoutQuery<'w, 's>,
     bindings: Res<'w, TerminalKeyBindings>,
-    redraw: ResMut<'w, TerminalRedrawState>,
+    redraw: Query<'w, 's, &'static mut TerminalRedrawState>,
     _marker: std::marker::PhantomData<&'s ()>,
 }
 
@@ -352,6 +352,38 @@ pub fn handle_keyboard_input(
     mut keyboard: Local<TerminalKeyboard>,
     mut params: KeyboardSystemParams,
 ) {
+    let mut terminal = match params.terminal.single_mut() {
+        Ok(terminal) => terminal,
+        Err(err) => {
+            // Latched once per process: the surface lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!("handle_keyboard_input: the surface needs exactly one terminal seat: {err}");
+            return;
+        }
+    };
+    let mut runtime = match params.runtime.single_mut() {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            // Latched once per process: the runtime lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!("handle_keyboard_input: the runtime needs exactly one terminal seat: {err}");
+            return;
+        }
+    };
+    let mut redraw = match params.redraw.single_mut() {
+        Ok(redraw) => redraw,
+        Err(err) => {
+            // Latched once per process: the redraw flag lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!(
+                "handle_keyboard_input: the redraw flag needs exactly one terminal seat: {err}"
+            );
+            return;
+        }
+    };
     for event in keyboard_events.read() {
         let binding_key_code = navigation_key_code(&event.logical_key).unwrap_or(event.key_code);
         let modifiers = current_modifiers(&params.keys).union(keyboard.modifiers());
@@ -384,7 +416,7 @@ pub fn handle_keyboard_input(
                         params.stage_tween.stop();
                     }
                     params.selection.clear();
-                    params.redraw.request();
+                    redraw.request();
                     continue;
                 }
                 BindingAction::ToggleMobiusMode => {
@@ -408,7 +440,7 @@ pub fn handle_keyboard_input(
                             .begin_enter(previous_mode, &params.plane_view);
                     }
                     params.selection.clear();
-                    params.redraw.request();
+                    redraw.request();
                     continue;
                 }
                 BindingAction::ScrollPageUp
@@ -417,7 +449,7 @@ pub fn handle_keyboard_input(
                 | BindingAction::ScrollDown => {
                     let amount = match action {
                         BindingAction::ScrollPageUp | BindingAction::ScrollPageDown => {
-                            usize::from(params.terminal.rows.saturating_sub(1).max(1))
+                            usize::from(terminal.rows.saturating_sub(1).max(1))
                         }
                         BindingAction::ScrollUp | BindingAction::ScrollDown => 1,
                         _ => unreachable!(),
@@ -428,22 +460,22 @@ pub fn handle_keyboard_input(
                         _ => unreachable!(),
                     };
 
-                    let mouse_mode = params.runtime.parser.screen().mouse_protocol_mode();
+                    let mouse_mode = runtime.parser.screen().mouse_protocol_mode();
                     if params.presentation.mode == TerminalPresentationMode::Flat2d
                         && mouse_mode != vt100::MouseProtocolMode::None
                     {
-                        let encoding = params.runtime.parser.screen().mouse_protocol_encoding();
-                        let (row, col) = params.runtime.parser.screen().cursor_position();
+                        let encoding = runtime.parser.screen().mouse_protocol_encoding();
+                        let (row, col) = runtime.parser.screen().cursor_position();
                         let cell = UVec2::new(col as u32, row as u32);
                         for _ in 0..amount {
-                            params.runtime.write_input(&encode_mouse_wheel(
+                            runtime.write_input(&encode_mouse_wheel(
                                 cell,
                                 direction.is_positive(),
                                 encoding,
                             ));
                         }
                     } else {
-                        let screen = params.runtime.parser.screen_mut();
+                        let screen = runtime.parser.screen_mut();
                         let current = screen.scrollback();
                         let next = if direction.is_positive() {
                             current.saturating_add(amount)
@@ -452,7 +484,7 @@ pub fn handle_keyboard_input(
                         };
                         screen.set_scrollback(next);
                         params.selection.clear();
-                        params.redraw.request();
+                        redraw.request();
                     }
                     continue;
                 }
@@ -465,31 +497,41 @@ pub fn handle_keyboard_input(
                     if params.stage_tween.active {
                         params.stage_tween.stop();
                     }
-                    params.plane_warp.adjust(delta);
-                    params.redraw.request();
+                    let mut plane_warp = match params.plane_warp.single_mut() {
+                        Ok(plane_warp) => plane_warp,
+                        Err(err) => {
+                            // Latched once per process: the warp lives on THE
+                            // terminal seat, and the miss must name its system
+                            // (#54's silent-.single() finding).
+                            warn_once!(
+                                "handle_keyboard_input: the plane warp needs exactly one terminal seat: {err}"
+                            );
+                            continue;
+                        }
+                    };
+                    plane_warp.adjust(delta);
+                    redraw.request();
                     continue;
                 }
                 BindingAction::Copy => {
-                    if let Some(text) = params
-                        .selection
-                        .selected_text(params.runtime.parser.screen())
+                    if let Some(text) = params.selection.selected_text(runtime.parser.screen())
                         && !text.is_empty()
                     {
                         params.clipboard.copy(&text);
                     }
                     if params.selection.clear() {
-                        params.redraw.request();
+                        redraw.request();
                     }
                     continue;
                 }
                 BindingAction::Paste => {
                     if let Some(text) = params.clipboard.paste() {
-                        write_paste(&params.runtime, &text);
+                        write_paste(&runtime, &text);
                     } else {
                         warn!("failed to read clipboard contents for paste");
                     }
                     if params.selection.clear() {
-                        params.redraw.request();
+                        redraw.request();
                     }
                     continue;
                 }
@@ -497,12 +539,12 @@ pub fn handle_keyboard_input(
                 | BindingAction::DecreaseFontSize
                 | BindingAction::ResetFontSize => {
                     let resized = match action {
-                        BindingAction::IncreaseFontSize => params.terminal.adjust_font_size(1),
-                        BindingAction::DecreaseFontSize => params.terminal.adjust_font_size(-1),
+                        BindingAction::IncreaseFontSize => terminal.adjust_font_size(1),
+                        BindingAction::DecreaseFontSize => terminal.adjust_font_size(-1),
                         BindingAction::ResetFontSize => {
                             let target = FontConfig::default().size;
-                            let delta = target - params.terminal.font_size();
-                            delta != 0 && params.terminal.adjust_font_size(delta)
+                            let delta = target - terminal.font_size();
+                            delta != 0 && terminal.adjust_font_size(delta)
                         }
                         _ => false,
                     };
@@ -510,24 +552,36 @@ pub fn handle_keyboard_input(
                         let Ok(window) = params.primary_window.single() else {
                             continue;
                         };
-                        let layout = params.terminal.resize_to_fit(
+                        let layout = terminal.resize_to_fit(
                             window.resolution.size().max(Vec2::ONE),
                             render_scale_for_window(window),
                         );
                         let pty_pixels = layout.pty_pixels();
-                        params.runtime.resize(
+                        runtime.resize(
                             layout.cols,
                             layout.rows,
                             pty_pixels.x as u16,
                             pty_pixels.y as u16,
                         );
+                        let mut viewport = match params.viewport.single_mut() {
+                            Ok(viewport) => viewport,
+                            Err(err) => {
+                                // Latched once per process: the viewport lives
+                                // on THE terminal seat, and the miss must name
+                                // its system (#54's silent-.single() finding).
+                                warn_once!(
+                                    "handle_keyboard_input: the viewport needs exactly one terminal seat: {err}"
+                                );
+                                continue;
+                            }
+                        };
                         sync_terminal_layout(
                             layout,
-                            &mut params.viewport,
+                            &mut viewport,
                             &mut params.plane_query,
                             &mut params.plane_back_query,
                         );
-                        params.redraw.request();
+                        redraw.request();
                     }
                     continue;
                 }
@@ -538,21 +592,21 @@ pub fn handle_keyboard_input(
             && !is_modifier_key(binding_key_code)
             && params.selection.clear()
         {
-            params.redraw.request();
+            redraw.request();
         }
 
         if let Some(input) = keyboard.handle_event_with_modes(
             event,
-            params.runtime.parser.screen().application_cursor(),
-            params.runtime.kitty_keyboard_flags(),
-            params.runtime.modify_other_keys(),
+            runtime.parser.screen().application_cursor(),
+            runtime.kitty_keyboard_flags(),
+            runtime.modify_other_keys(),
         ) {
-            let screen = params.runtime.parser.screen_mut();
+            let screen = runtime.parser.screen_mut();
             if screen.scrollback() != 0 {
                 screen.set_scrollback(0);
-                params.redraw.request();
+                redraw.request();
             }
-            params.runtime.write_input(&input);
+            runtime.write_input(&input);
         }
     }
 }

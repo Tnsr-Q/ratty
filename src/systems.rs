@@ -141,9 +141,21 @@ pub(crate) fn request_exit_on_primary_window_close(
 /// Shuts down the PTY runtime when Bevy begins exiting.
 pub(crate) fn shutdown_terminal_runtime_on_exit(
     mut app_exit: MessageReader<AppExit>,
-    mut runtime: ResMut<TerminalRuntime>,
+    mut runtime: Query<&mut TerminalRuntime>,
     mut shutdown_started: Local<bool>,
 ) {
+    let mut runtime = match runtime.single_mut() {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            // Latched once per process: the runtime lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!(
+                "shutdown_terminal_runtime_on_exit: the runtime needs exactly one terminal seat: {err}"
+            );
+            return;
+        }
+    };
     if *shutdown_started {
         app_exit.clear();
         return;
@@ -168,13 +180,43 @@ pub(crate) fn shutdown_terminal_runtime_on_exit(
 /// (the `--hold` semantic); the app exits only through
 /// [`request_exit_on_primary_window_close`].
 pub fn pump_pty_output(
-    mut runtime: ResMut<TerminalRuntime>,
-    mut inline_objects: ResMut<TerminalInlineObjects>,
+    mut runtime: Query<&mut TerminalRuntime>,
+    mut inline_objects: Query<&mut TerminalInlineObjects>,
     mut viz_registry: ResMut<crate::viz::VizRegistry>,
     mut ai_commands: MessageWriter<crate::ai::AiCommand>,
     mut queries: MessageWriter<crate::query_channel::QueryRequest>,
-    mut redraw: ResMut<TerminalRedrawState>,
+    mut redraw: Query<&mut TerminalRedrawState>,
 ) {
+    let mut inline_objects = match inline_objects.single_mut() {
+        Ok(inline_objects) => inline_objects,
+        Err(err) => {
+            // Latched once per process: the inline registry lives on THE
+            // terminal seat, and the miss must name its system (#54's
+            // silent-.single() finding).
+            warn_once!("pump_pty_output: inline objects need exactly one terminal seat: {err}");
+            return;
+        }
+    };
+    let mut runtime = match runtime.single_mut() {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            // Latched once per process: the runtime lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!("pump_pty_output: the runtime needs exactly one terminal seat: {err}");
+            return;
+        }
+    };
+    let mut redraw = match redraw.single_mut() {
+        Ok(redraw) => redraw,
+        Err(err) => {
+            // Latched once per process: the redraw flag lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!("pump_pty_output: the redraw flag needs exactly one terminal seat: {err}");
+            return;
+        }
+    };
     // A reaped transport has nothing more to say; leave the retained final
     // screen untouched.
     if runtime.pty_disconnected {
@@ -283,10 +325,12 @@ mod pump_disconnect_tests {
 
     fn pump_app(runtime: TerminalRuntime) -> App {
         let mut app = App::new();
-        app.insert_resource(runtime)
-            .init_resource::<TerminalInlineObjects>()
-            .init_resource::<VizRegistry>()
-            .init_resource::<TerminalRedrawState>()
+        app.world_mut().spawn((
+            TerminalInlineObjects::default(),
+            TerminalRedrawState::default(),
+            runtime,
+        ));
+        app.init_resource::<VizRegistry>()
             .add_message::<AppExit>()
             .add_message::<crate::ai::AiCommand>()
             .add_message::<crate::query_channel::QueryRequest>()
@@ -318,9 +362,11 @@ mod pump_disconnect_tests {
             drained_exits(&mut app).is_empty(),
             "disconnect must not write AppExit"
         );
-        let screen = app
-            .world()
-            .resource::<TerminalRuntime>()
+        let world = app.world_mut();
+        let mut runtime_query = world.query::<&TerminalRuntime>();
+        let screen = runtime_query
+            .single(world)
+            .expect("exactly one terminal seat")
             .parser
             .screen()
             .contents();
@@ -337,9 +383,11 @@ mod pump_disconnect_tests {
             drained_exits(&mut app).is_empty(),
             "disconnect must not write AppExit on later frames either"
         );
-        let screen = app
-            .world()
-            .resource::<TerminalRuntime>()
+        let world = app.world_mut();
+        let mut runtime_query = world.query::<&TerminalRuntime>();
+        let screen = runtime_query
+            .single(world)
+            .expect("exactly one terminal seat")
             .parser
             .screen()
             .contents();
@@ -356,7 +404,11 @@ mod pump_disconnect_tests {
         drop(host);
 
         app.update();
-        let runtime = app.world().resource::<TerminalRuntime>();
+        let world = app.world_mut();
+        let mut runtime_query = world.query::<&TerminalRuntime>();
+        let runtime = runtime_query
+            .single(world)
+            .expect("exactly one terminal seat");
         assert!(runtime.pty_disconnected, "the disconnect must be latched");
         assert!(
             runtime
@@ -372,10 +424,10 @@ mod pump_disconnect_tests {
 #[derive(SystemParam)]
 pub(crate) struct ResizeParams<'w, 's> {
     primary_window: Query<'w, 's, (Entity, &'static Window), With<PrimaryWindow>>,
-    runtime: ResMut<'w, TerminalRuntime>,
-    terminal: ResMut<'w, TerminalSurface>,
-    redraw: ResMut<'w, TerminalRedrawState>,
-    viewport: ResMut<'w, TerminalViewport>,
+    runtime: Query<'w, 's, &'static mut TerminalRuntime>,
+    terminal: Query<'w, 's, &'static mut TerminalSurface>,
+    redraw: Query<'w, 's, &'static mut TerminalRedrawState>,
+    viewport: Query<'w, 's, &'static mut TerminalViewport>,
     plane_query: TerminalPlaneLayoutQuery<'w, 's>,
     plane_back_query: TerminalPlaneBackLayoutQuery<'w, 's>,
 }
@@ -401,6 +453,48 @@ pub(crate) fn handle_window_resize(
         plane_query,
         plane_back_query,
     } = &mut params;
+    let mut viewport = match viewport.single_mut() {
+        Ok(viewport) => viewport,
+        Err(err) => {
+            // Latched once per process: the viewport lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!("handle_window_resize: the viewport needs exactly one terminal seat: {err}");
+            return;
+        }
+    };
+    let mut terminal = match terminal.single_mut() {
+        Ok(terminal) => terminal,
+        Err(err) => {
+            // Latched once per process: the surface lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!("handle_window_resize: the surface needs exactly one terminal seat: {err}");
+            return;
+        }
+    };
+    let mut runtime = match runtime.single_mut() {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            // Latched once per process: the runtime lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!("handle_window_resize: the runtime needs exactly one terminal seat: {err}");
+            return;
+        }
+    };
+    let mut redraw = match redraw.single_mut() {
+        Ok(redraw) => redraw,
+        Err(err) => {
+            // Latched once per process: the redraw flag lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!(
+                "handle_window_resize: the redraw flag needs exactly one terminal seat: {err}"
+            );
+            return;
+        }
+    };
     let Ok((primary_window, window)) = primary_window.single() else {
         return;
     };
@@ -432,7 +526,7 @@ pub(crate) fn handle_window_resize(
         pty_pixels.x as u16,
         pty_pixels.y as u16,
     );
-    sync_terminal_layout(layout, viewport, plane_query, plane_back_query);
+    sync_terminal_layout(layout, &mut viewport, plane_query, plane_back_query);
     redraw.request();
 }
 
@@ -475,7 +569,7 @@ pub fn apply_inline_objects(
 
 /// Redraw system parameters.
 /// Tracks whether the terminal frame was redrawn during the current update.
-#[derive(Resource, Default)]
+#[derive(Component, Default)]
 pub(crate) struct TerminalFrameDirty(pub bool);
 
 /// Ordered terminal redraw pipeline:
@@ -492,15 +586,15 @@ const BLINK_TICK_SECS: f32 = 0.25;
 pub(crate) struct RenderWidgetParams<'w, 's> {
     app_config: Res<'w, AppConfig>,
     cursor_settings: Res<'w, CursorSettings>,
-    runtime: Res<'w, TerminalRuntime>,
-    terminal: ResMut<'w, TerminalSurface>,
+    runtime: Query<'w, 's, &'static TerminalRuntime>,
+    terminal: Query<'w, 's, &'static mut TerminalSurface>,
     selection: Res<'w, TerminalSelection>,
     time: Res<'w, Time>,
-    redraw: ResMut<'w, TerminalRedrawState>,
+    redraw: Query<'w, 's, &'static mut TerminalRedrawState>,
     images: ResMut<'w, Assets<Image>>,
     direct_render: Res<'w, DirectTerminalSceneExchange>,
     model_load_state: Res<'w, ModelLoadState>,
-    frame_dirty: ResMut<'w, TerminalFrameDirty>,
+    frame_dirty: Query<'w, 's, &'static mut TerminalFrameDirty>,
     viz_registry: Res<'w, VizRegistry>,
     presence: Res<'w, crate::presence::PresenceRegistry>,
     blink_phase: Local<'s, u64>,
@@ -528,6 +622,54 @@ pub(crate) fn render_terminal_widget(mut params: RenderWidgetParams) {
         presence,
         blink_phase,
     } = &mut params;
+    let mut terminal = match terminal.single_mut() {
+        Ok(terminal) => terminal,
+        Err(err) => {
+            // Latched once per process: the surface lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!(
+                "render_terminal_widget: the surface needs exactly one terminal seat: {err}"
+            );
+            return;
+        }
+    };
+    let mut frame_dirty = match frame_dirty.single_mut() {
+        Ok(frame_dirty) => frame_dirty,
+        Err(err) => {
+            // Latched once per process: the dirty flag lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!(
+                "render_terminal_widget: the frame-dirty flag needs exactly one terminal seat: {err}"
+            );
+            return;
+        }
+    };
+    let runtime = match runtime.single() {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            // Latched once per process: the runtime lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!(
+                "render_terminal_widget: the runtime needs exactly one terminal seat: {err}"
+            );
+            return;
+        }
+    };
+    let mut redraw = match redraw.single_mut() {
+        Ok(redraw) => redraw,
+        Err(err) => {
+            // Latched once per process: the redraw flag lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!(
+                "render_terminal_widget: the redraw flag needs exactly one terminal seat: {err}"
+            );
+            return;
+        }
+    };
     let needs_redraw = redraw.take();
     // The texture content only changes with terminal state or blink phase;
     // warp and camera animations are mesh- and camera-side. Rebuilding on
@@ -573,8 +715,8 @@ pub(crate) fn render_terminal_widget(mut params: RenderWidgetParams) {
 
 #[derive(SystemParam)]
 pub(crate) struct SyncMaterialsParams<'w, 's> {
-    runtime: Res<'w, TerminalRuntime>,
-    terminal: Res<'w, TerminalSurface>,
+    runtime: Query<'w, 's, &'static TerminalRuntime>,
+    terminal: Query<'w, 's, &'static TerminalSurface>,
     presentation: Res<'w, TerminalPresentation>,
     images: ResMut<'w, Assets<Image>>,
     materials: ResMut<'w, Assets<StandardMaterial>>,
@@ -591,7 +733,7 @@ pub(crate) struct SyncMaterialsParams<'w, 's> {
         &'static MeshMaterial2d<TerminalPresentMaterial>,
         With<crate::scene::TerminalSprite>,
     >,
-    frame_dirty: Res<'w, TerminalFrameDirty>,
+    frame_dirty: Query<'w, 's, &'static TerminalFrameDirty>,
 }
 
 /// Refreshes the debug back texture and plane materials after a redraw.
@@ -608,6 +750,42 @@ pub(crate) fn sync_terminal_materials(mut params: SyncMaterialsParams) {
         present_query,
         frame_dirty,
     } = &mut params;
+    let terminal = match terminal.single() {
+        Ok(terminal) => terminal,
+        Err(err) => {
+            // Latched once per process: the surface lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!(
+                "sync_terminal_materials: the surface needs exactly one terminal seat: {err}"
+            );
+            return;
+        }
+    };
+    let frame_dirty = match frame_dirty.single() {
+        Ok(frame_dirty) => frame_dirty,
+        Err(err) => {
+            // Latched once per process: the dirty flag lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!(
+                "sync_terminal_materials: the frame-dirty flag needs exactly one terminal seat: {err}"
+            );
+            return;
+        }
+    };
+    let runtime = match runtime.single() {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            // Latched once per process: the runtime lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!(
+                "sync_terminal_materials: the runtime needs exactly one terminal seat: {err}"
+            );
+            return;
+        }
+    };
     if !frame_dirty.0 {
         return;
     }
@@ -649,13 +827,13 @@ pub(crate) struct ModelLoadParams<'w, 's> {
     app_config: Res<'w, AppConfig>,
     cursor_settings: ResMut<'w, CursorSettings>,
     model_load_state: ResMut<'w, ModelLoadState>,
-    redraw: ResMut<'w, TerminalRedrawState>,
+    redraw: Query<'w, 's, &'static mut TerminalRedrawState>,
     commands: Commands<'w, 's>,
     meshes: ResMut<'w, Assets<Mesh>>,
     materials: ResMut<'w, Assets<StandardMaterial>>,
     images: ResMut<'w, Assets<Image>>,
     asset_server: Res<'w, AssetServer>,
-    frame_dirty: Res<'w, TerminalFrameDirty>,
+    frame_dirty: Query<'w, 's, &'static TerminalFrameDirty>,
 }
 
 /// Completes deferred cursor-model loading once the first frame is uploaded.
@@ -675,6 +853,30 @@ pub(crate) fn finish_terminal_model_load(mut params: ModelLoadParams) {
         asset_server,
         frame_dirty,
     } = &mut params;
+    let frame_dirty = match frame_dirty.single() {
+        Ok(frame_dirty) => frame_dirty,
+        Err(err) => {
+            // Latched once per process: the dirty flag lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!(
+                "finish_terminal_model_load: the frame-dirty flag needs exactly one terminal seat: {err}"
+            );
+            return;
+        }
+    };
+    let mut redraw = match redraw.single_mut() {
+        Ok(redraw) => redraw,
+        Err(err) => {
+            // Latched once per process: the redraw flag lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!(
+                "finish_terminal_model_load: the redraw flag needs exactly one terminal seat: {err}"
+            );
+            return;
+        }
+    };
     if !frame_dirty.0 {
         return;
     }
@@ -755,11 +957,11 @@ pub(crate) fn respawn_cursor_model(mut params: RespawnCursorParams) {
 #[derive(SystemParam)]
 pub(crate) struct SyncInlineParams<'w, 's> {
     commands: Commands<'w, 's>,
-    inline_objects: ResMut<'w, TerminalInlineObjects>,
-    terminal: Res<'w, TerminalSurface>,
-    viewport: Res<'w, TerminalViewport>,
+    inline_objects: Query<'w, 's, &'static mut TerminalInlineObjects>,
+    terminal: Query<'w, 's, &'static TerminalSurface>,
+    viewport: Query<'w, 's, &'static TerminalViewport>,
     presentation: Res<'w, TerminalPresentation>,
-    plane_warp: Res<'w, TerminalPlaneWarp>,
+    plane_warp: Query<'w, 's, &'static TerminalPlaneWarp>,
     time: Res<'w, Time>,
     plane_query: Query<'w, 's, (Entity, &'static Transform), With<TerminalPlane>>,
     sprite_query: Query<'w, 's, Entity, With<TerminalInlineObjectSprite>>,
@@ -798,6 +1000,48 @@ pub(crate) fn sync_inline_objects(mut params: SyncInlineParams) {
         images,
         meshes,
     } = &mut params;
+    let terminal = match terminal.single() {
+        Ok(terminal) => terminal,
+        Err(err) => {
+            // Latched once per process: the surface lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!("sync_inline_objects: the surface needs exactly one terminal seat: {err}");
+            return;
+        }
+    };
+    let viewport = match viewport.single() {
+        Ok(viewport) => viewport,
+        Err(err) => {
+            // Latched once per process: the viewport lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!("sync_inline_objects: the viewport needs exactly one terminal seat: {err}");
+            return;
+        }
+    };
+    let plane_warp = match plane_warp.single() {
+        Ok(plane_warp) => plane_warp,
+        Err(err) => {
+            // Latched once per process: the warp lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!(
+                "sync_inline_objects: the plane warp needs exactly one terminal seat: {err}"
+            );
+            return;
+        }
+    };
+    let mut inline_objects = match inline_objects.single_mut() {
+        Ok(inline_objects) => inline_objects,
+        Err(err) => {
+            // Latched once per process: the inline registry lives on THE
+            // terminal seat, and the miss must name its system (#54's
+            // silent-.single() finding).
+            warn_once!("sync_inline_objects: inline objects need exactly one terminal seat: {err}");
+            return;
+        }
+    };
     // Per-object rebuilds (queued by `depth` updates and glTF restyles) only
     // run when no full rebuild is due; a full rebuild subsumes them.
     let full_sync = inline_objects.needs_sync(viewport.size, terminal.cols, terminal.rows);
@@ -1144,11 +1388,23 @@ fn write_kitty_plane_positions(
 /// warp is active, instead of rebuilding inline entities every frame.
 pub(crate) fn animate_inline_kitty_planes(
     presentation: Res<TerminalPresentation>,
-    warp: Res<TerminalPlaneWarp>,
+    warp: Query<&TerminalPlaneWarp>,
     time: Res<Time>,
     query: Query<(&InlineKittyPlaneLayout, &Mesh3d), With<TerminalInlineObjectPlane>>,
     mut meshes: ResMut<Assets<Mesh>>,
 ) {
+    let warp = match warp.single() {
+        Ok(warp) => warp,
+        Err(err) => {
+            // Latched once per process: the warp lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!(
+                "animate_inline_kitty_planes: the plane warp needs exactly one terminal seat: {err}"
+            );
+            return;
+        }
+    };
     if !matches!(
         presentation.mode,
         TerminalPresentationMode::Plane3d | TerminalPresentationMode::Mobius3d
@@ -1331,14 +1587,14 @@ fn apply_brightness(material: &mut StandardMaterial, brightness: f32) {
 #[derive(SystemParam)]
 pub(crate) struct RgpSyncParams<'w, 's> {
     app_config: Res<'w, AppConfig>,
-    terminal: Res<'w, TerminalSurface>,
-    viewport: Res<'w, TerminalViewport>,
+    terminal: Query<'w, 's, &'static TerminalSurface>,
+    viewport: Query<'w, 's, &'static TerminalViewport>,
     presentation: Res<'w, TerminalPresentation>,
     mobius_transition: Res<'w, MobiusTransition>,
-    plane_warp: Res<'w, TerminalPlaneWarp>,
+    plane_warp: Query<'w, 's, &'static TerminalPlaneWarp>,
     time: Res<'w, Time>,
     plane_query: PlaneTransformQuery<'w, 's>,
-    inline_objects: Res<'w, TerminalInlineObjects>,
+    inline_objects: Query<'w, 's, &'static TerminalInlineObjects>,
     query: Query<
         'w,
         's,
@@ -1372,6 +1628,46 @@ pub(crate) fn sync_rgp_objects(mut params: RgpSyncParams) {
         inline_objects,
         query,
     } = &mut params;
+    let terminal = match terminal.single() {
+        Ok(terminal) => terminal,
+        Err(err) => {
+            // Latched once per process: the surface lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!("sync_rgp_objects: the surface needs exactly one terminal seat: {err}");
+            return;
+        }
+    };
+    let viewport = match viewport.single() {
+        Ok(viewport) => viewport,
+        Err(err) => {
+            // Latched once per process: the viewport lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!("sync_rgp_objects: the viewport needs exactly one terminal seat: {err}");
+            return;
+        }
+    };
+    let plane_warp = match plane_warp.single() {
+        Ok(plane_warp) => plane_warp,
+        Err(err) => {
+            // Latched once per process: the warp lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!("sync_rgp_objects: the plane warp needs exactly one terminal seat: {err}");
+            return;
+        }
+    };
+    let inline_objects = match inline_objects.single() {
+        Ok(inline_objects) => inline_objects,
+        Err(err) => {
+            // Latched once per process: the inline registry lives on THE
+            // terminal seat, and the miss must name its system (#54's
+            // silent-.single() finding).
+            warn_once!("sync_rgp_objects: inline objects need exactly one terminal seat: {err}");
+            return;
+        }
+    };
     let cell_width = viewport.size.x / terminal.cols.max(1) as f32;
     let cell_height = viewport.size.y / terminal.rows.max(1) as f32;
     let elapsed_secs = time.elapsed_secs();
@@ -1604,7 +1900,7 @@ mod rgp_animation_tests {
 /// Restyle application parameters.
 #[derive(SystemParam)]
 pub(crate) struct RgpRestyleParams<'w, 's> {
-    inline_objects: ResMut<'w, TerminalInlineObjects>,
+    inline_objects: Query<'w, 's, &'static mut TerminalInlineObjects>,
     rgp_roots: Query<'w, 's, (Entity, &'static TerminalRgpObject)>,
     parent_query: Query<'w, 's, &'static ChildOf>,
     material_query: Query<
@@ -1640,6 +1936,16 @@ pub(crate) fn apply_rgp_restyle(mut params: RgpRestyleParams) {
         materials,
         commands,
     } = &mut params;
+    let mut inline_objects = match inline_objects.single_mut() {
+        Ok(inline_objects) => inline_objects,
+        Err(err) => {
+            // Latched once per process: the inline registry lives on THE
+            // terminal seat, and the miss must name its system (#54's
+            // silent-.single() finding).
+            warn_once!("apply_rgp_restyle: inline objects need exactly one terminal seat: {err}");
+            return;
+        }
+    };
     let restyle = inline_objects.take_restyle_objects();
     if restyle.is_empty() {
         return;
@@ -1688,7 +1994,7 @@ pub(crate) fn apply_rgp_restyle(mut params: RgpRestyleParams) {
 #[derive(SystemParam)]
 pub(crate) struct BrightnessParams<'w, 's> {
     cursor_settings: Res<'w, CursorSettings>,
-    inline_objects: Res<'w, TerminalInlineObjects>,
+    inline_objects: Query<'w, 's, &'static TerminalInlineObjects>,
     rgp_roots: Query<'w, 's, (Entity, &'static TerminalRgpObject)>,
     cursor_roots: Query<'w, 's, Entity, With<CursorModel>>,
     parent_query: Query<'w, 's, &'static ChildOf>,
@@ -1726,6 +2032,18 @@ pub(crate) fn apply_instance_brightness(mut params: BrightnessParams) {
         materials,
         commands,
     } = &mut params;
+    let inline_objects = match inline_objects.single() {
+        Ok(inline_objects) => inline_objects,
+        Err(err) => {
+            // Latched once per process: the inline registry lives on THE
+            // terminal seat, and the miss must name its system (#54's
+            // silent-.single() finding).
+            warn_once!(
+                "apply_instance_brightness: inline objects need exactly one terminal seat: {err}"
+            );
+            return;
+        }
+    };
     if material_query.is_empty() {
         return;
     }
@@ -2290,11 +2608,11 @@ type VizAnimatedQuery<'w, 's> = Query<
 #[derive(SystemParam)]
 pub(crate) struct VizSyncParams<'w, 's> {
     registry: Res<'w, VizRegistry>,
-    terminal: Res<'w, TerminalSurface>,
-    viewport: Res<'w, TerminalViewport>,
+    terminal: Query<'w, 's, &'static TerminalSurface>,
+    viewport: Query<'w, 's, &'static TerminalViewport>,
     presentation: Res<'w, TerminalPresentation>,
     mobius_transition: Res<'w, MobiusTransition>,
-    plane_warp: Res<'w, TerminalPlaneWarp>,
+    plane_warp: Query<'w, 's, &'static TerminalPlaneWarp>,
     time: Res<'w, Time>,
     plane_query: VizPlaneQuery<'w, 's>,
     roots: Query<
@@ -2330,6 +2648,36 @@ pub(crate) fn sync_viz_objects(mut params: VizSyncParams) {
         plane_query,
         roots,
     } = &mut params;
+    let terminal = match terminal.single() {
+        Ok(terminal) => terminal,
+        Err(err) => {
+            // Latched once per process: the surface lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!("sync_viz_objects: the surface needs exactly one terminal seat: {err}");
+            return;
+        }
+    };
+    let viewport = match viewport.single() {
+        Ok(viewport) => viewport,
+        Err(err) => {
+            // Latched once per process: the viewport lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!("sync_viz_objects: the viewport needs exactly one terminal seat: {err}");
+            return;
+        }
+    };
+    let plane_warp = match plane_warp.single() {
+        Ok(plane_warp) => plane_warp,
+        Err(err) => {
+            // Latched once per process: the warp lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!("sync_viz_objects: the plane warp needs exactly one terminal seat: {err}");
+            return;
+        }
+    };
     let cell_width = viewport.size.x / terminal.cols.max(1) as f32;
     let cell_height = viewport.size.y / terminal.rows.max(1) as f32;
     let elapsed_secs = time.elapsed_secs();
@@ -2550,10 +2898,36 @@ pub fn animate_terminal_plane_warp(
     time: Res<Time>,
     presentation: Res<TerminalPresentation>,
     mobius_transition: Res<MobiusTransition>,
-    warp: Res<TerminalPlaneWarp>,
-    plane_meshes: Res<TerminalPlaneMeshes>,
+    warp: Query<Ref<TerminalPlaneWarp>>,
+    plane_meshes: Query<&TerminalPlaneMeshes>,
     mut meshes: ResMut<Assets<Mesh>>,
 ) {
+    let plane_meshes = match plane_meshes.single() {
+        Ok(plane_meshes) => plane_meshes,
+        Err(err) => {
+            // Latched once per process: the warp writes THE seat's meshes,
+            // and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!(
+                "animate_terminal_plane_warp: plane meshes need exactly one terminal seat: {err}"
+            );
+            return;
+        }
+    };
+    // `Ref` carries the same last-run change ticks as `Res` did, so the
+    // `warp.is_changed()` gate below keeps its exact cadence.
+    let warp = match warp.single() {
+        Ok(warp) => warp,
+        Err(err) => {
+            // Latched once per process: the warp lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!(
+                "animate_terminal_plane_warp: the plane warp needs exactly one terminal seat: {err}"
+            );
+            return;
+        }
+    };
     if presentation.mode == TerminalPresentationMode::Flat2d {
         return;
     }
@@ -2596,8 +2970,20 @@ pub fn animate_mobius_transition(
     mut presentation: ResMut<TerminalPresentation>,
     mut mobius_transition: ResMut<MobiusTransition>,
     mut plane_view: ResMut<TerminalPlaneView>,
-    mut redraw: ResMut<TerminalRedrawState>,
+    mut redraw: Query<&mut TerminalRedrawState>,
 ) {
+    let mut redraw = match redraw.single_mut() {
+        Ok(redraw) => redraw,
+        Err(err) => {
+            // Latched once per process: the redraw flag lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!(
+                "animate_mobius_transition: the redraw flag needs exactly one terminal seat: {err}"
+            );
+            return;
+        }
+    };
     if presentation.mode != TerminalPresentationMode::Mobius3d {
         mobius_transition.stop();
         return;
@@ -2628,14 +3014,44 @@ pub fn animate_mobius_transition(
 /// dispatch instantly (the Möbius transition owns its own clock); the other
 /// fields apply instantly or start a [`StageTween`] when `dur` is set.
 pub fn apply_rgp_stage(
-    mut inline_objects: ResMut<TerminalInlineObjects>,
+    mut inline_objects: Query<&mut TerminalInlineObjects>,
     mut presentation: ResMut<TerminalPresentation>,
-    mut plane_warp: ResMut<TerminalPlaneWarp>,
+    mut plane_warp: Query<&mut TerminalPlaneWarp>,
     mut plane_view: ResMut<TerminalPlaneView>,
     mut mobius_transition: ResMut<MobiusTransition>,
     mut stage_tween: ResMut<StageTween>,
-    mut redraw: ResMut<TerminalRedrawState>,
+    mut redraw: Query<&mut TerminalRedrawState>,
 ) {
+    let mut plane_warp = match plane_warp.single_mut() {
+        Ok(plane_warp) => plane_warp,
+        Err(err) => {
+            // Latched once per process: the warp lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!("apply_rgp_stage: the plane warp needs exactly one terminal seat: {err}");
+            return;
+        }
+    };
+    let mut redraw = match redraw.single_mut() {
+        Ok(redraw) => redraw,
+        Err(err) => {
+            // Latched once per process: the redraw flag lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!("apply_rgp_stage: the redraw flag needs exactly one terminal seat: {err}");
+            return;
+        }
+    };
+    let mut inline_objects = match inline_objects.single_mut() {
+        Ok(inline_objects) => inline_objects,
+        Err(err) => {
+            // Latched once per process: the inline registry lives on THE
+            // terminal seat, and the miss must name its system (#54's
+            // silent-.single() finding).
+            warn_once!("apply_rgp_stage: inline objects need exactly one terminal seat: {err}");
+            return;
+        }
+    };
     for update in inline_objects.take_stage_updates() {
         let mut applied = false;
 
@@ -2727,10 +3143,34 @@ pub fn apply_rgp_stage(
 pub fn animate_stage_tween(
     time: Res<Time>,
     mut stage_tween: ResMut<StageTween>,
-    mut plane_warp: ResMut<TerminalPlaneWarp>,
+    mut plane_warp: Query<&mut TerminalPlaneWarp>,
     mut plane_view: ResMut<TerminalPlaneView>,
-    mut redraw: ResMut<TerminalRedrawState>,
+    mut redraw: Query<&mut TerminalRedrawState>,
 ) {
+    let mut plane_warp = match plane_warp.single_mut() {
+        Ok(plane_warp) => plane_warp,
+        Err(err) => {
+            // Latched once per process: the warp lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!(
+                "animate_stage_tween: the plane warp needs exactly one terminal seat: {err}"
+            );
+            return;
+        }
+    };
+    let mut redraw = match redraw.single_mut() {
+        Ok(redraw) => redraw,
+        Err(err) => {
+            // Latched once per process: the redraw flag lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!(
+                "animate_stage_tween: the redraw flag needs exactly one terminal seat: {err}"
+            );
+            return;
+        }
+    };
     if !stage_tween.active {
         return;
     }
@@ -2817,12 +3257,12 @@ fn apply_plane_warp(
 pub(crate) struct CursorSyncParams<'w, 's> {
     app_config: Res<'w, AppConfig>,
     cursor_settings: Res<'w, CursorSettings>,
-    runtime: Res<'w, TerminalRuntime>,
-    terminal: Res<'w, TerminalSurface>,
-    viewport: Res<'w, TerminalViewport>,
+    runtime: Query<'w, 's, &'static TerminalRuntime>,
+    terminal: Query<'w, 's, &'static TerminalSurface>,
+    viewport: Query<'w, 's, &'static TerminalViewport>,
     presentation: Res<'w, TerminalPresentation>,
     mobius_transition: Res<'w, MobiusTransition>,
-    plane_warp: Res<'w, TerminalPlaneWarp>,
+    plane_warp: Query<'w, 's, &'static TerminalPlaneWarp>,
     time: Res<'w, Time>,
     plane_query: Query<'w, 's, &'static Transform, (With<TerminalPlane>, Without<CursorModel>)>,
     query: CursorTransformQuery<'w, 's>,
@@ -2850,6 +3290,54 @@ pub(crate) fn sync_asset_to_terminal_cursor(mut params: CursorSyncParams) {
         plane_query,
         query,
     } = &mut params;
+    let terminal = match terminal.single() {
+        Ok(terminal) => terminal,
+        Err(err) => {
+            // Latched once per process: the surface lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!(
+                "sync_asset_to_terminal_cursor: the surface needs exactly one terminal seat: {err}"
+            );
+            return;
+        }
+    };
+    let viewport = match viewport.single() {
+        Ok(viewport) => viewport,
+        Err(err) => {
+            // Latched once per process: the viewport lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!(
+                "sync_asset_to_terminal_cursor: the viewport needs exactly one terminal seat: {err}"
+            );
+            return;
+        }
+    };
+    let plane_warp = match plane_warp.single() {
+        Ok(plane_warp) => plane_warp,
+        Err(err) => {
+            // Latched once per process: the warp lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!(
+                "sync_asset_to_terminal_cursor: the plane warp needs exactly one terminal seat: {err}"
+            );
+            return;
+        }
+    };
+    let runtime = match runtime.single() {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            // Latched once per process: the runtime lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!(
+                "sync_asset_to_terminal_cursor: the runtime needs exactly one terminal seat: {err}"
+            );
+            return;
+        }
+    };
     if query.is_empty() {
         return;
     }
@@ -3660,15 +4148,15 @@ mod single_plane_degrade_tests {
     }
 
     fn base_resources(world: &mut World, mode: TerminalPresentationMode) {
-        world.insert_resource(
+        world.spawn((
             TerminalSurface::new(&AppConfig::default()).expect("surface construction is CPU-only"),
-        );
-        world.insert_resource(TerminalViewport {
-            size: Vec2::new(800.0, 480.0),
-            center: Vec2::ZERO,
-        });
+            TerminalViewport {
+                size: Vec2::new(800.0, 480.0),
+                center: Vec2::ZERO,
+            },
+            TerminalPlaneWarp::default(),
+        ));
         world.insert_resource(TerminalPresentation { mode });
-        world.insert_resource(TerminalPlaneWarp::default());
         world.init_resource::<Time>();
     }
 
@@ -3682,7 +4170,7 @@ mod single_plane_degrade_tests {
         let world = app.world_mut();
         // The default last_viewport_size differs from the viewport below, so
         // needs_sync reports a full sync and the plane resolution is reached.
-        world.init_resource::<TerminalInlineObjects>();
+        world.spawn(TerminalInlineObjects::default());
         base_resources(world, TerminalPresentationMode::Flat2d);
         world.init_resource::<Assets<StandardMaterial>>();
         world.init_resource::<Assets<Image>>();
@@ -3723,7 +4211,7 @@ mod single_plane_degrade_tests {
                 style: InlineStyle::default(),
             },
         );
-        world.insert_resource(inline_objects);
+        world.spawn(inline_objects);
         let object = world
             .spawn((
                 TerminalRgpObject { object_id: 1 },
@@ -3824,7 +4312,7 @@ mod single_plane_degrade_tests {
         let mut world = World::new();
         world.insert_resource(AppConfig::default());
         world.init_resource::<CursorSettings>();
-        world.insert_resource(TerminalRuntime::virtual_channel(&config).0);
+        world.spawn(TerminalRuntime::virtual_channel(&config).0);
         base_resources(&mut world, TerminalPresentationMode::Plane3d);
         world.init_resource::<MobiusTransition>();
         let cursor = world

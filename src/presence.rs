@@ -924,11 +924,11 @@ pub(crate) struct PresenceMarkerParams<'w, 's> {
     commands: Commands<'w, 's>,
     time: Res<'w, Time>,
     registry: Res<'w, PresenceRegistry>,
-    terminal: Res<'w, TerminalSurface>,
-    viewport: Res<'w, TerminalViewport>,
+    terminal: Query<'w, 's, &'static TerminalSurface>,
+    viewport: Query<'w, 's, &'static TerminalViewport>,
     presentation: Res<'w, TerminalPresentation>,
     mobius_transition: Res<'w, MobiusTransition>,
-    plane_warp: Res<'w, TerminalPlaneWarp>,
+    plane_warp: Query<'w, 's, &'static TerminalPlaneWarp>,
     plane_query: Query<'w, 's, &'static Transform, With<TerminalPlane>>,
     markers: PresenceMarkerQuery<'w, 's>,
     meshes: ResMut<'w, Assets<Mesh>>,
@@ -961,6 +961,42 @@ pub(crate) fn sync_presence_cursor_markers(mut params: PresenceMarkerParams) {
         materials,
         marker_mesh,
     } = &mut params;
+    let terminal = match terminal.single() {
+        Ok(terminal) => terminal,
+        Err(err) => {
+            // Latched once per process: the surface lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!(
+                "sync_presence_cursor_markers: the surface needs exactly one terminal seat: {err}"
+            );
+            return;
+        }
+    };
+    let viewport = match viewport.single() {
+        Ok(viewport) => viewport,
+        Err(err) => {
+            // Latched once per process: the viewport lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!(
+                "sync_presence_cursor_markers: the viewport needs exactly one terminal seat: {err}"
+            );
+            return;
+        }
+    };
+    let plane_warp = match plane_warp.single() {
+        Ok(plane_warp) => plane_warp,
+        Err(err) => {
+            // Latched once per process: the warp lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!(
+                "sync_presence_cursor_markers: the plane warp needs exactly one terminal seat: {err}"
+            );
+            return;
+        }
+    };
     let now = time.elapsed();
     let elapsed_secs = time.elapsed_secs();
     let cols = terminal.cols;
@@ -1113,9 +1149,21 @@ fn presence_texture_stamp(registry: &PresenceRegistry, now: Duration) -> (u64, u
 pub(crate) fn request_presence_expiry_redraw(
     time: Res<Time>,
     registry: Res<PresenceRegistry>,
-    mut redraw: ResMut<TerminalRedrawState>,
+    mut redraw: Query<&mut TerminalRedrawState>,
     mut drawn_stamp: Local<Option<(u64, usize)>>,
 ) {
+    let mut redraw = match redraw.single_mut() {
+        Ok(redraw) => redraw,
+        Err(err) => {
+            // Latched once per process: the redraw flag lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!(
+                "request_presence_expiry_redraw: the redraw flag needs exactly one terminal seat: {err}"
+            );
+            return;
+        }
+    };
     let stamp = presence_texture_stamp(&registry, time.elapsed());
     if *drawn_stamp == Some(stamp) {
         return;
@@ -1179,10 +1227,22 @@ pub fn apply_presence_commands(
     time: Res<Time>,
     mut commands: MessageReader<AiCommand>,
     mut registry: ResMut<PresenceRegistry>,
-    mut redraw: ResMut<TerminalRedrawState>,
+    mut redraw: Query<&mut TerminalRedrawState>,
     mut acks: MessageWriter<AckOutcome>,
     mut diagnostics: ResMut<AiDiagnostics>,
 ) {
+    let mut redraw = match redraw.single_mut() {
+        Ok(redraw) => redraw,
+        Err(err) => {
+            // Latched once per process: the redraw flag lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!(
+                "apply_presence_commands: the redraw flag needs exactly one terminal seat: {err}"
+            );
+            return;
+        }
+    };
     let now = time.elapsed();
     for AiCommand {
         source,
@@ -1987,14 +2047,24 @@ mod tests {
 
     fn app_test() -> App {
         let mut app = App::new();
+        app.world_mut().spawn(TerminalRedrawState::default());
         app.init_resource::<PresenceRegistry>();
         app.init_resource::<AiDiagnostics>();
-        app.init_resource::<TerminalRedrawState>();
         app.init_resource::<Time>();
         app.add_message::<AiCommand>();
         app.add_message::<AckOutcome>();
         app.add_systems(Update, apply_presence_commands);
         app
+    }
+
+    /// Takes the seat's redraw flag, the component-era `resource_mut().take()`.
+    fn take_redraw(app: &mut App) -> bool {
+        let world = app.world_mut();
+        let mut query = world.query::<&mut TerminalRedrawState>();
+        query
+            .single_mut(world)
+            .expect("exactly one terminal seat")
+            .take()
     }
 
     fn send(app: &mut App, ack: Option<&str>, origin: CommandOrigin, command: RattyAiCommand) {
@@ -2144,8 +2214,8 @@ mod tests {
     #[test]
     fn expiry_flips_redraw_an_otherwise_idle_terminal() {
         let mut app = App::new();
+        app.world_mut().spawn(TerminalRedrawState::default());
         app.init_resource::<PresenceRegistry>();
-        app.init_resource::<TerminalRedrawState>();
         app.init_resource::<Time>();
         app.add_systems(Update, request_presence_expiry_redraw);
         app.world_mut()
@@ -2153,15 +2223,12 @@ mod tests {
             .set_note(0, "n1", "REVIEW", 2, 3, Some(1.0), false, Duration::ZERO)
             .expect("registry op ok");
         // Clear the boot-time pending redraw so requests are observable.
-        let _ = app.world_mut().resource_mut::<TerminalRedrawState>().take();
+        let _ = take_redraw(&mut app);
+        app.update();
+        assert!(take_redraw(&mut app), "a fresh note is a texture change");
         app.update();
         assert!(
-            app.world_mut().resource_mut::<TerminalRedrawState>().take(),
-            "a fresh note is a texture change"
-        );
-        app.update();
-        assert!(
-            !app.world_mut().resource_mut::<TerminalRedrawState>().take(),
+            !take_redraw(&mut app),
             "an unchanged fresh roster requests nothing"
         );
         app.world_mut()
@@ -2169,12 +2236,12 @@ mod tests {
             .advance_by(Duration::from_secs(2));
         app.update();
         assert!(
-            app.world_mut().resource_mut::<TerminalRedrawState>().take(),
+            take_redraw(&mut app),
             "the fresh→expired flip redraws the idle terminal"
         );
         app.update();
         assert!(
-            !app.world_mut().resource_mut::<TerminalRedrawState>().take(),
+            !take_redraw(&mut app),
             "expiry redraws once, not every frame"
         );
     }
@@ -2241,18 +2308,18 @@ mod tests {
         // The plane resolution runs before the roster loop, so an empty
         // registry reaches it (run_system_once also bypasses the run_if).
         world.init_resource::<PresenceRegistry>();
-        world.insert_resource(
+        world.spawn((
             TerminalSurface::new(&AppConfig::default()).expect("surface construction is CPU-only"),
-        );
-        world.insert_resource(TerminalViewport {
-            size: Vec2::new(800.0, 480.0),
-            center: Vec2::ZERO,
-        });
+            TerminalViewport {
+                size: Vec2::new(800.0, 480.0),
+                center: Vec2::ZERO,
+            },
+            TerminalPlaneWarp::default(),
+        ));
         world.insert_resource(TerminalPresentation {
             mode: TerminalPresentationMode::Plane3d,
         });
         world.init_resource::<MobiusTransition>();
-        world.insert_resource(TerminalPlaneWarp::default());
         world.init_resource::<Assets<Mesh>>();
         world.init_resource::<Assets<StandardMaterial>>();
         world.spawn((TerminalPlane, Transform::default()));

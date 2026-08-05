@@ -179,16 +179,37 @@ impl Plugin for RattyAiPlugin {
 pub fn apply_ai_commands(
     mut commands: MessageReader<AiCommand>,
     mut presentation: ResMut<TerminalPresentation>,
-    mut plane_warp: ResMut<TerminalPlaneWarp>,
+    mut plane_warp: Query<&mut TerminalPlaneWarp>,
     mut plane_view: ResMut<TerminalPlaneView>,
     mut mobius: ResMut<MobiusTransition>,
     mut stage_tween: ResMut<StageTween>,
-    mut redraw: ResMut<TerminalRedrawState>,
+    mut redraw: Query<&mut TerminalRedrawState>,
     mut acks: MessageWriter<crate::query_channel::AckOutcome>,
     mut diagnostics: ResMut<crate::query_channel::AiDiagnostics>,
 ) {
     use crate::query::codes;
     use crate::query_channel::{ack_commit, reject};
+
+    let mut plane_warp = match plane_warp.single_mut() {
+        Ok(plane_warp) => plane_warp,
+        Err(err) => {
+            // Latched once per process: the warp lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!("apply_ai_commands: the plane warp needs exactly one terminal seat: {err}");
+            return;
+        }
+    };
+    let mut redraw = match redraw.single_mut() {
+        Ok(redraw) => redraw,
+        Err(err) => {
+            // Latched once per process: the redraw flag lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!("apply_ai_commands: the redraw flag needs exactly one terminal seat: {err}");
+            return;
+        }
+    };
 
     for AiCommand {
         source,
@@ -334,17 +355,42 @@ pub fn apply_ai_commands(
 #[allow(clippy::too_many_arguments)]
 pub fn apply_ai_object_commands(
     mut commands: MessageReader<AiCommand>,
-    mut inline_objects: ResMut<TerminalInlineObjects>,
+    mut inline_objects: Query<&mut TerminalInlineObjects>,
     mut registry: ResMut<AiObjectRegistry>,
     mut removals: MessageWriter<AiObjectRemoved>,
     mut cursor: ResMut<CursorSettings>,
     app_config: Res<AppConfig>,
-    mut redraw: ResMut<TerminalRedrawState>,
+    mut redraw: Query<&mut TerminalRedrawState>,
     mut acks: MessageWriter<crate::query_channel::AckOutcome>,
     mut diagnostics: ResMut<crate::query_channel::AiDiagnostics>,
 ) {
     use crate::query::codes;
     use crate::query_channel::ack_commit;
+
+    let mut inline_objects = match inline_objects.single_mut() {
+        Ok(inline_objects) => inline_objects,
+        Err(err) => {
+            // Latched once per process: the inline registry lives on THE
+            // terminal seat, and the miss must name its system (#54's
+            // silent-.single() finding).
+            warn_once!(
+                "apply_ai_object_commands: inline objects need exactly one terminal seat: {err}"
+            );
+            return;
+        }
+    };
+    let mut redraw = match redraw.single_mut() {
+        Ok(redraw) => redraw,
+        Err(err) => {
+            // Latched once per process: the redraw flag lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!(
+                "apply_ai_object_commands: the redraw flag needs exactly one terminal seat: {err}"
+            );
+            return;
+        }
+    };
 
     for AiCommand {
         source,
@@ -686,10 +732,12 @@ mod tests {
     fn test_app() -> App {
         let mut app = App::new();
         app.insert_resource(AppConfig::default());
-        app.init_resource::<TerminalInlineObjects>();
+        app.world_mut().spawn((
+            TerminalInlineObjects::default(),
+            crate::terminal::TerminalRedrawState::default(),
+        ));
         app.init_resource::<AiObjectRegistry>();
         app.init_resource::<CursorSettings>();
-        app.init_resource::<crate::terminal::TerminalRedrawState>();
         app.init_resource::<crate::query_channel::AiDiagnostics>();
         app.init_resource::<crate::viz::VizRegistry>();
         app.init_resource::<RemovedLog>();
@@ -732,15 +780,21 @@ mod tests {
         );
     }
 
-    fn contains(app: &App, id: u32) -> bool {
-        app.world()
-            .resource::<TerminalInlineObjects>()
+    fn contains(app: &mut App, id: u32) -> bool {
+        let world = app.world_mut();
+        let mut query = world.query::<&TerminalInlineObjects>();
+        query
+            .single(world)
+            .expect("exactly one terminal seat")
             .contains_object(id)
     }
 
-    fn anchor_col(app: &App, id: u32) -> u16 {
-        app.world()
-            .resource::<TerminalInlineObjects>()
+    fn anchor_col(app: &mut App, id: u32) -> u16 {
+        let world = app.world_mut();
+        let mut query = world.query::<&TerminalInlineObjects>();
+        query
+            .single(world)
+            .expect("exactly one terminal seat")
             .anchors
             .get(&id)
             .expect("anchor exists")
@@ -761,38 +815,45 @@ mod tests {
         let mut app = test_app();
         // Below the AI range: rejected.
         spawn(&mut app, 42, false);
-        assert!(!contains(&app, 42));
+        assert!(!contains(&mut app, 42));
         // In range and namespace 0: spawns.
         spawn(&mut app, ID, false);
-        assert!(contains(&app, ID));
+        assert!(contains(&mut app, ID));
         // Wrong namespace for the local source: rejected.
         spawn(&mut app, 0x8100_0001, false);
-        assert!(!contains(&app, 0x8100_0001));
+        assert!(!contains(&mut app, 0x8100_0001));
         // Removal emits the per-object event; the id never comes back.
         send(&mut app, RattyAiCommand::RemoveObject { id: ID });
-        assert!(!contains(&app, ID));
+        assert!(!contains(&mut app, ID));
         assert_eq!(app.world().resource::<RemovedLog>().0, vec![ID]);
         spawn(&mut app, ID, false);
-        assert!(!contains(&app, ID), "ids are never reused within a session");
+        assert!(
+            !contains(&mut app, ID),
+            "ids are never reused within a session"
+        );
     }
 
     #[test]
     fn replace_requires_the_flag_and_emits_no_removal() {
         let mut app = test_app();
         spawn_at(&mut app, ID, 10, false);
-        assert_eq!(anchor_col(&app, ID), 4, "anchored at x=10 (col = x - 6)");
+        assert_eq!(
+            anchor_col(&mut app, ID),
+            4,
+            "anchored at x=10 (col = x - 6)"
+        );
         // A non-replace spawn on the live id is rejected — the object does
         // not move to the new position.
         spawn_at(&mut app, ID, 50, false);
         assert_eq!(
-            anchor_col(&app, ID),
+            anchor_col(&mut app, ID),
             4,
             "collision without replace is a no-op"
         );
         // With replace=true it re-anchors to the new position.
         spawn_at(&mut app, ID, 50, true);
-        assert_eq!(anchor_col(&app, ID), 44, "replace re-anchors to x=50");
-        assert!(contains(&app, ID));
+        assert_eq!(anchor_col(&mut app, ID), 44, "replace re-anchors to x=50");
+        assert!(contains(&mut app, ID));
         assert!(
             app.world().resource::<RemovedLog>().0.is_empty(),
             "replace keeps the id live; no removal event"
@@ -816,7 +877,7 @@ mod tests {
             },
         );
         assert!(
-            !contains(&app, ID),
+            !contains(&mut app, ID),
             "wire spawns resolve embedded names only"
         );
     }
@@ -826,36 +887,44 @@ mod tests {
         let mut app = test_app();
         spawn(&mut app, ID, false);
         {
-            let mut inline = app.world_mut().resource_mut::<TerminalInlineObjects>();
+            let world = app.world_mut();
+            let mut inline_query = world.query::<&mut TerminalInlineObjects>();
+            let mut inline = inline_query
+                .single_mut(world)
+                .expect("exactly one terminal seat");
             // Another agent's object and a transmission-owned one.
             inline.ai_insert_object(0x8100_0001, gltf_object(), 0, 0, InlineStyle::default());
             inline.objects.insert(7, gltf_object());
         }
         send(&mut app, RattyAiCommand::ClearObjects);
-        assert!(!contains(&app, ID));
+        assert!(!contains(&mut app, ID));
         assert!(
-            contains(&app, 0x8100_0001),
+            contains(&mut app, 0x8100_0001),
             "clear never crosses namespaces"
         );
         assert!(
-            contains(&app, 7),
+            contains(&mut app, 7),
             "clear never touches transmission objects"
         );
         assert_eq!(app.world().resource::<RemovedLog>().0, vec![ID]);
 
         send(&mut app, RattyAiCommand::Reset);
         assert!(
-            !contains(&app, 0x8100_0001),
+            !contains(&mut app, 0x8100_0001),
             "reset destroys all AI objects"
         );
-        assert!(contains(&app, 7), "reset spares transmission objects");
+        assert!(contains(&mut app, 7), "reset spares transmission objects");
     }
 
     #[test]
     fn namespace_cap_rejects_spawns() {
         let mut app = test_app();
         {
-            let mut inline = app.world_mut().resource_mut::<TerminalInlineObjects>();
+            let world = app.world_mut();
+            let mut inline_query = world.query::<&mut TerminalInlineObjects>();
+            let mut inline = inline_query
+                .single_mut(world)
+                .expect("exactly one terminal seat");
             for i in 0..MAX_AI_OBJECTS_PER_NAMESPACE as u32 {
                 inline.ai_insert_object(
                     0x8000_0100 + i,
@@ -868,7 +937,7 @@ mod tests {
         }
         spawn(&mut app, ID, false);
         assert!(
-            !contains(&app, ID),
+            !contains(&mut app, ID),
             "the per-namespace object cap is enforced"
         );
     }

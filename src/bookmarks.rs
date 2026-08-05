@@ -142,11 +142,23 @@ pub fn apply_bookmark_commands(
     mut commands: MessageReader<AiCommand>,
     mut registry: ResMut<BookmarkRegistry>,
     presentation: Res<TerminalPresentation>,
-    plane_warp: Res<TerminalPlaneWarp>,
+    plane_warp: Query<&TerminalPlaneWarp>,
     mut pending: ResMut<PendingBookmarkJumps>,
     mut acks: MessageWriter<AckOutcome>,
     mut diagnostics: ResMut<AiDiagnostics>,
 ) {
+    let plane_warp = match plane_warp.single() {
+        Ok(plane_warp) => plane_warp,
+        Err(err) => {
+            // Latched once per process: the warp lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!(
+                "apply_bookmark_commands: the plane warp needs exactly one terminal seat: {err}"
+            );
+            return;
+        }
+    };
     for AiCommand {
         source,
         ack_token,
@@ -308,7 +320,7 @@ mod tests {
         app.insert_resource(TerminalPresentation {
             mode: TerminalPresentationMode::Flat2d,
         });
-        app.init_resource::<TerminalPlaneWarp>();
+        app.world_mut().spawn(TerminalPlaneWarp::default());
         app.add_message::<AiCommand>();
         app.add_message::<AckOutcome>();
         app.add_systems(

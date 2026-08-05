@@ -20,9 +20,13 @@ use bevy::camera::visibility::NoFrustumCulling;
 
 use crate::config::AppConfig;
 use crate::direct_render::{new_terminal_image, new_terminal_render_image};
+use crate::inline::TerminalInlineObjects;
 use crate::present::{TerminalPresentMaterial, fullscreen_quad};
 use crate::runtime::TerminalRuntime;
-use crate::terminal::{TerminalLayout, TerminalSurface, render_scale_for_window};
+use crate::systems::TerminalFrameDirty;
+use crate::terminal::{
+    TerminalLayout, TerminalRedrawState, TerminalSurface, render_scale_for_window,
+};
 
 /// Marker for the 2D terminal sprite.
 #[derive(Component)]
@@ -41,7 +45,7 @@ pub struct TerminalPlaneBack;
 pub struct TerminalPlaneCamera;
 
 /// Handles for terminal plane meshes.
-#[derive(Resource)]
+#[derive(Component)]
 pub struct TerminalPlaneMeshes {
     /// Front plane mesh.
     pub front: Handle<Mesh>,
@@ -50,7 +54,7 @@ pub struct TerminalPlaneMeshes {
 }
 
 /// Plane warp state.
-#[derive(Resource, Default)]
+#[derive(Component, Default)]
 pub struct TerminalPlaneWarp {
     /// Warp amount.
     pub amount: f32,
@@ -64,7 +68,7 @@ impl TerminalPlaneWarp {
 }
 
 /// Terminal viewport geometry.
-#[derive(Resource, Clone, Copy)]
+#[derive(Component, Clone, Copy)]
 pub struct TerminalViewport {
     /// Viewport size in logical pixels.
     pub size: Vec2,
@@ -272,8 +276,8 @@ pub(crate) struct SetupSceneParams<'w, 's> {
     images: ResMut<'w, Assets<Image>>,
     present_materials: ResMut<'w, Assets<TerminalPresentMaterial>>,
     primary_window: Query<'w, 's, &'static Window, With<PrimaryWindow>>,
-    runtime: ResMut<'w, TerminalRuntime>,
-    terminal: ResMut<'w, TerminalSurface>,
+    runtime: Query<'w, 's, &'static mut TerminalRuntime>,
+    terminal: Query<'w, 's, (Entity, &'static mut TerminalSurface)>,
 }
 
 /// Sets up the terminal presentation scene.
@@ -292,6 +296,11 @@ pub(crate) fn setup_scene(mut params: SetupSceneParams) {
         runtime,
         terminal,
     } = &mut params;
+    // Fatal, like the primary-window expect below: setup_scene is a
+    // constructor, and a world without exactly one terminal seat (spawned by
+    // main()/start() with the surface and runtime aboard) is a broken world.
+    let (host, mut terminal) = terminal.single_mut().expect("exactly one terminal seat");
+    let mut runtime = runtime.single_mut().expect("exactly one terminal seat");
     let terminal_opacity = app_config.window.opacity.clamp(0.0, 1.0);
     let window = primary_window.single().expect("primary window");
     let window_size = window.resolution.size().max(Vec2::ONE);
@@ -360,10 +369,6 @@ pub(crate) fn setup_scene(mut params: SetupSceneParams) {
     terminal.back_image_handle = Some(back_image_handle.clone());
 
     let viewport_center = Vec2::ZERO;
-    commands.insert_resource(TerminalViewport {
-        size: layout.logical_size,
-        center: viewport_center,
-    });
 
     // Present the terminal texture 1:1 with physical pixels via a fullscreen quad
     // whose shader fetches each texel by pixel coordinate (no resampling), rather
@@ -382,11 +387,26 @@ pub(crate) fn setup_scene(mut params: SetupSceneParams) {
 
     let front_mesh = meshes.add(terminal_plane_mesh(32, 20));
     let back_mesh = meshes.add(terminal_plane_mesh(32, 20));
-    commands.insert_resource(TerminalPlaneMeshes {
-        front: front_mesh.clone(),
-        back: back_mesh.clone(),
-    });
-    commands.insert_resource(TerminalPlaneWarp::default());
+    // The terminal seat: main()/start() spawn the one entity with the
+    // externally-constructed surface aboard, and this constructor dresses
+    // THAT entity with the world-derived per-terminal components. Exactly
+    // one seat ever exists; the seat-count tests assert that explicitly
+    // (#54: nothing strips a second seat once the types stop being
+    // Resources).
+    commands.entity(host).insert((
+        TerminalPlaneMeshes {
+            front: front_mesh.clone(),
+            back: back_mesh.clone(),
+        },
+        TerminalFrameDirty::default(),
+        TerminalRedrawState::default(),
+        TerminalViewport {
+            size: layout.logical_size,
+            center: viewport_center,
+        },
+        TerminalPlaneWarp::default(),
+        TerminalInlineObjects::default(),
+    ));
 
     commands.spawn((
         TerminalPlane,
@@ -672,6 +692,106 @@ fn terminal_plane_mesh(x_segments: u32, y_segments: u32) -> Mesh {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The M4.2 seat test: runs the REAL spawner (`setup_scene`) in a scaffold
+    /// world and asserts exactly one entity carries each swapped component —
+    /// the #54 rider (once a type stops being a Resource, nothing strips a
+    /// second seat; the count is asserted, never assumed). Each swap commit
+    /// extends the tuple query below with its type.
+    #[test]
+    fn setup_scene_spawns_exactly_one_terminal_seat() {
+        use bevy::ecs::system::RunSystemOnce;
+
+        let mut world = World::new();
+        world.insert_resource(AppConfig::default());
+        world.init_resource::<Assets<Mesh>>();
+        world.init_resource::<Assets<StandardMaterial>>();
+        world.init_resource::<Assets<Image>>();
+        world.init_resource::<Assets<TerminalPresentMaterial>>();
+        let (runtime, _host) = TerminalRuntime::virtual_channel(&AppConfig::default());
+        // Mirror main()/start(): the seat is born pre-run with the surface
+        // and runtime aboard; setup_scene must dress THIS entity, not spawn
+        // another.
+        let seat = world
+            .spawn((
+                TerminalSurface::new(&AppConfig::default())
+                    .expect("surface construction is CPU-only"),
+                runtime,
+            ))
+            .id();
+        world.spawn((Window::default(), bevy::window::PrimaryWindow));
+
+        world
+            .run_system_once(setup_scene)
+            .expect("setup_scene should run");
+
+        assert_eq!(
+            world.query::<&TerminalSurface>().iter(&world).count(),
+            1,
+            "exactly one seat carries the surface"
+        );
+        assert_eq!(
+            world.query::<&TerminalPlaneMeshes>().iter(&world).count(),
+            1,
+            "setup_scene dresses exactly one terminal seat"
+        );
+        assert_eq!(
+            world
+                .query::<(Entity, &TerminalPlaneMeshes)>()
+                .single(&world)
+                .expect("exactly one dressed seat")
+                .0,
+            seat,
+            "setup_scene dressed the pre-spawned seat, not a new entity"
+        );
+        assert_eq!(
+            world.query::<&TerminalFrameDirty>().iter(&world).count(),
+            1,
+            "exactly one seat carries the frame-dirty flag"
+        );
+        assert_eq!(
+            world.query::<&TerminalViewport>().iter(&world).count(),
+            1,
+            "exactly one seat carries the viewport"
+        );
+        assert_eq!(
+            world.query::<&TerminalPlaneWarp>().iter(&world).count(),
+            1,
+            "exactly one seat carries the plane warp"
+        );
+        assert_eq!(
+            world.query::<&TerminalInlineObjects>().iter(&world).count(),
+            1,
+            "exactly one seat carries the inline objects"
+        );
+        assert_eq!(
+            world.query::<&TerminalRuntime>().iter(&world).count(),
+            1,
+            "exactly one seat carries the runtime"
+        );
+        assert_eq!(
+            world.query::<&TerminalRedrawState>().iter(&world).count(),
+            1,
+            "exactly one seat carries the redraw flag"
+        );
+        assert_eq!(
+            world
+                .query::<(
+                    &TerminalSurface,
+                    &TerminalPlaneMeshes,
+                    &TerminalFrameDirty,
+                    &TerminalViewport,
+                    &TerminalPlaneWarp,
+                    &TerminalInlineObjects,
+                    &TerminalRuntime,
+                    &TerminalRedrawState,
+                )>()
+                .iter(&world)
+                .count(),
+            1,
+            "the swapped components co-locate on the one seat"
+        );
+    }
 
     fn fixtures() -> (TerminalPresentation, TerminalPlaneView, MobiusTransition) {
         (
