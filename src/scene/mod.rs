@@ -20,6 +20,7 @@ use bevy::camera::visibility::NoFrustumCulling;
 
 use crate::config::AppConfig;
 use crate::direct_render::{new_terminal_image, new_terminal_render_image};
+use crate::inline::TerminalInlineObjects;
 use crate::present::{TerminalPresentMaterial, fullscreen_quad};
 use crate::runtime::TerminalRuntime;
 use crate::systems::TerminalFrameDirty;
@@ -394,6 +395,7 @@ pub(crate) fn setup_scene(mut params: SetupSceneParams) {
             center: viewport_center,
         },
         TerminalPlaneWarp::default(),
+        TerminalInlineObjects::default(),
     ));
 
     commands.spawn((
@@ -728,12 +730,18 @@ mod tests {
             "exactly one seat carries the plane warp"
         );
         assert_eq!(
+            world.query::<&TerminalInlineObjects>().iter(&world).count(),
+            1,
+            "exactly one seat carries the inline objects"
+        );
+        assert_eq!(
             world
                 .query::<(
                     &TerminalPlaneMeshes,
                     &TerminalFrameDirty,
                     &TerminalViewport,
                     &TerminalPlaneWarp,
+                    &TerminalInlineObjects,
                 )>()
                 .iter(&world)
                 .count(),

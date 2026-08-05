@@ -44,7 +44,6 @@ impl Plugin for TerminalPlugin {
         crate::model::seed_embedded_scene_assets(app.world_mut());
         app.init_resource::<TerminalSelection>()
             .init_resource::<crate::model::CursorSettings>()
-            .init_resource::<TerminalInlineObjects>()
             .init_resource::<TerminalRedrawState>()
             .init_resource::<TerminalKeyBindings>()
             .init_resource::<StageTween>()
@@ -61,7 +60,17 @@ impl Plugin for TerminalPlugin {
                     .after(pump_pty_output)
                     .after(handle_keyboard_input)
                     .after(handle_mouse_input)
-                    .run_if(|objects: Res<TerminalInlineObjects>| objects.has_pending_stage()),
+                    .run_if(|objects: Query<&TerminalInlineObjects>| match objects.single() {
+                        Ok(objects) => objects.has_pending_stage(),
+                        Err(err) => {
+                            // Latched once per process: a missing seat must
+                            // be loud, not a silent never-runs (#54).
+                            warn_once!(
+                                "apply_rgp_stage run condition: inline objects need exactly one terminal seat: {err}"
+                            );
+                            false
+                        }
+                    }),
             )
             .add_systems(
                 Update,
@@ -130,7 +139,17 @@ impl Plugin for TerminalPlugin {
                 Update,
                 apply_rgp_restyle
                     .after(sync_inline_objects)
-                    .run_if(|objects: Res<TerminalInlineObjects>| objects.has_restyle_objects()),
+                    .run_if(|objects: Query<&TerminalInlineObjects>| match objects.single() {
+                        Ok(objects) => objects.has_restyle_objects(),
+                        Err(err) => {
+                            // Latched once per process: a missing seat must
+                            // be loud, not a silent never-runs (#54).
+                            warn_once!(
+                                "apply_rgp_restyle run condition: inline objects need exactly one terminal seat: {err}"
+                            );
+                            false
+                        }
+                    }),
             )
             .add_systems(
                 Update,

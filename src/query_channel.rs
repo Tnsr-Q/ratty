@@ -332,7 +332,7 @@ pub fn answer_queries(
     mut acks: MessageReader<AckOutcome>,
     runtime: Res<TerminalRuntime>,
     session: Res<QuerySession>,
-    inline_objects: Res<TerminalInlineObjects>,
+    inline_objects: Query<&TerminalInlineObjects>,
     diagnostics: Res<AiDiagnostics>,
     presentation: Res<TerminalPresentation>,
     plane_warp: Query<&TerminalPlaneWarp>,
@@ -376,6 +376,16 @@ pub fn answer_queries(
             return;
         }
     };
+    let inline_objects = match inline_objects.single() {
+        Ok(inline_objects) => inline_objects,
+        Err(err) => {
+            // Latched once per process: the inline registry lives on THE
+            // terminal seat, and the miss must name its system (#54's
+            // silent-.single() finding).
+            warn_once!("answer_queries: inline objects need exactly one terminal seat: {err}");
+            return;
+        }
+    };
 
     for QueryRequest { source, item } in queries.read() {
         match item {
@@ -393,7 +403,7 @@ pub fn answer_queries(
             QueryItem::Query(envelope) => {
                 let ctx = QueryCtx {
                     session: &session,
-                    inline_objects: &inline_objects,
+                    inline_objects,
                     diagnostics: &diagnostics,
                     presentation: &presentation,
                     plane_warp,
@@ -1145,7 +1155,12 @@ mod tests {
         let mut app = App::new();
         app.insert_resource(config);
         app.insert_resource(runtime);
-        app.init_resource::<TerminalInlineObjects>();
+        // The terminal seat, mirroring setup_scene's spawn for the
+        // components this harness needs.
+        app.world_mut().spawn((
+            TerminalInlineObjects::default(),
+            TerminalPlaneWarp::default(),
+        ));
         app.init_resource::<AiObjectRegistry>();
         app.init_resource::<CursorSettings>();
         app.init_resource::<TerminalRedrawState>();
@@ -1162,7 +1177,6 @@ mod tests {
         app.insert_resource(TerminalPresentation {
             mode: TerminalPresentationMode::Flat2d,
         });
-        app.world_mut().spawn(TerminalPlaneWarp::default());
         app.init_resource::<TerminalPlaneView>();
         app.init_resource::<StageTween>();
         app.add_message::<AppExit>();
@@ -1397,7 +1411,11 @@ mod tests {
     /// registry resource (bypassing the wire — this seeds state, the
     /// queries under test still run the full loop).
     fn seed_objects(app: &mut App, count: u32) {
-        let mut inline = app.world_mut().resource_mut::<TerminalInlineObjects>();
+        let world = app.world_mut();
+        let mut inline_query = world.query::<&mut TerminalInlineObjects>();
+        let mut inline = inline_query
+            .single_mut(world)
+            .expect("exactly one terminal seat");
         for index in 0..count {
             inline.ai_insert_object(
                 ID + index,
@@ -1462,7 +1480,11 @@ mod tests {
     fn neighbors_filters_by_radius_and_reports_distance() {
         let (mut app, host) = test_app();
         {
-            let mut inline = app.world_mut().resource_mut::<TerminalInlineObjects>();
+            let world = app.world_mut();
+            let mut inline_query = world.query::<&mut TerminalInlineObjects>();
+            let mut inline = inline_query
+                .single_mut(world)
+                .expect("exactly one terminal seat");
             let object = || {
                 InlineObject::RgpObject(RgpInlineObject::Gltf {
                     asset_path: "objects/x.glb".into(),
@@ -1509,7 +1531,11 @@ mod tests {
     fn off_screen_objects_are_invisible_and_excluded_from_visible_set() {
         let (mut app, host) = test_app();
         {
-            let mut inline = app.world_mut().resource_mut::<TerminalInlineObjects>();
+            let world = app.world_mut();
+            let mut inline_query = world.query::<&mut TerminalInlineObjects>();
+            let mut inline = inline_query
+                .single_mut(world)
+                .expect("exactly one terminal seat");
             let object = || {
                 InlineObject::RgpObject(RgpInlineObject::Gltf {
                     asset_path: "objects/x.glb".into(),
@@ -1540,7 +1566,11 @@ mod tests {
         let (mut app, host) = test_app();
         seed_objects(&mut app, 2);
         {
-            let mut inline = app.world_mut().resource_mut::<TerminalInlineObjects>();
+            let world = app.world_mut();
+            let mut inline_query = world.query::<&mut TerminalInlineObjects>();
+            let mut inline = inline_query
+                .single_mut(world)
+                .expect("exactly one terminal seat");
             // A transmission-owned object (below the AI range).
             inline.objects.insert(
                 7,
@@ -1596,7 +1626,11 @@ mod tests {
         let (mut app, host) = test_app();
         let foreign_id = 0x8100_0001; // namespace 1; the caller is namespace 0.
         {
-            let mut inline = app.world_mut().resource_mut::<TerminalInlineObjects>();
+            let world = app.world_mut();
+            let mut inline_query = world.query::<&mut TerminalInlineObjects>();
+            let mut inline = inline_query
+                .single_mut(world)
+                .expect("exactly one terminal seat");
             let object = || {
                 InlineObject::RgpObject(RgpInlineObject::Gltf {
                     asset_path: "objects/x.glb".into(),

@@ -169,12 +169,22 @@ pub(crate) fn shutdown_terminal_runtime_on_exit(
 /// [`request_exit_on_primary_window_close`].
 pub fn pump_pty_output(
     mut runtime: ResMut<TerminalRuntime>,
-    mut inline_objects: ResMut<TerminalInlineObjects>,
+    mut inline_objects: Query<&mut TerminalInlineObjects>,
     mut viz_registry: ResMut<crate::viz::VizRegistry>,
     mut ai_commands: MessageWriter<crate::ai::AiCommand>,
     mut queries: MessageWriter<crate::query_channel::QueryRequest>,
     mut redraw: ResMut<TerminalRedrawState>,
 ) {
+    let mut inline_objects = match inline_objects.single_mut() {
+        Ok(inline_objects) => inline_objects,
+        Err(err) => {
+            // Latched once per process: the inline registry lives on THE
+            // terminal seat, and the miss must name its system (#54's
+            // silent-.single() finding).
+            warn_once!("pump_pty_output: inline objects need exactly one terminal seat: {err}");
+            return;
+        }
+    };
     // A reaped transport has nothing more to say; leave the retained final
     // screen untouched.
     if runtime.pty_disconnected {
@@ -283,8 +293,8 @@ mod pump_disconnect_tests {
 
     fn pump_app(runtime: TerminalRuntime) -> App {
         let mut app = App::new();
+        app.world_mut().spawn(TerminalInlineObjects::default());
         app.insert_resource(runtime)
-            .init_resource::<TerminalInlineObjects>()
             .init_resource::<VizRegistry>()
             .init_resource::<TerminalRedrawState>()
             .add_message::<AppExit>()
@@ -801,7 +811,7 @@ pub(crate) fn respawn_cursor_model(mut params: RespawnCursorParams) {
 #[derive(SystemParam)]
 pub(crate) struct SyncInlineParams<'w, 's> {
     commands: Commands<'w, 's>,
-    inline_objects: ResMut<'w, TerminalInlineObjects>,
+    inline_objects: Query<'w, 's, &'static mut TerminalInlineObjects>,
     terminal: Res<'w, TerminalSurface>,
     viewport: Query<'w, 's, &'static TerminalViewport>,
     presentation: Res<'w, TerminalPresentation>,
@@ -863,6 +873,16 @@ pub(crate) fn sync_inline_objects(mut params: SyncInlineParams) {
             warn_once!(
                 "sync_inline_objects: the plane warp needs exactly one terminal seat: {err}"
             );
+            return;
+        }
+    };
+    let mut inline_objects = match inline_objects.single_mut() {
+        Ok(inline_objects) => inline_objects,
+        Err(err) => {
+            // Latched once per process: the inline registry lives on THE
+            // terminal seat, and the miss must name its system (#54's
+            // silent-.single() finding).
+            warn_once!("sync_inline_objects: inline objects need exactly one terminal seat: {err}");
             return;
         }
     };
@@ -1418,7 +1438,7 @@ pub(crate) struct RgpSyncParams<'w, 's> {
     plane_warp: Query<'w, 's, &'static TerminalPlaneWarp>,
     time: Res<'w, Time>,
     plane_query: PlaneTransformQuery<'w, 's>,
-    inline_objects: Res<'w, TerminalInlineObjects>,
+    inline_objects: Query<'w, 's, &'static TerminalInlineObjects>,
     query: Query<
         'w,
         's,
@@ -1469,6 +1489,16 @@ pub(crate) fn sync_rgp_objects(mut params: RgpSyncParams) {
             // seat, and the miss must name its system (#54's silent-.single()
             // finding).
             warn_once!("sync_rgp_objects: the plane warp needs exactly one terminal seat: {err}");
+            return;
+        }
+    };
+    let inline_objects = match inline_objects.single() {
+        Ok(inline_objects) => inline_objects,
+        Err(err) => {
+            // Latched once per process: the inline registry lives on THE
+            // terminal seat, and the miss must name its system (#54's
+            // silent-.single() finding).
+            warn_once!("sync_rgp_objects: inline objects need exactly one terminal seat: {err}");
             return;
         }
     };
@@ -1704,7 +1734,7 @@ mod rgp_animation_tests {
 /// Restyle application parameters.
 #[derive(SystemParam)]
 pub(crate) struct RgpRestyleParams<'w, 's> {
-    inline_objects: ResMut<'w, TerminalInlineObjects>,
+    inline_objects: Query<'w, 's, &'static mut TerminalInlineObjects>,
     rgp_roots: Query<'w, 's, (Entity, &'static TerminalRgpObject)>,
     parent_query: Query<'w, 's, &'static ChildOf>,
     material_query: Query<
@@ -1740,6 +1770,16 @@ pub(crate) fn apply_rgp_restyle(mut params: RgpRestyleParams) {
         materials,
         commands,
     } = &mut params;
+    let mut inline_objects = match inline_objects.single_mut() {
+        Ok(inline_objects) => inline_objects,
+        Err(err) => {
+            // Latched once per process: the inline registry lives on THE
+            // terminal seat, and the miss must name its system (#54's
+            // silent-.single() finding).
+            warn_once!("apply_rgp_restyle: inline objects need exactly one terminal seat: {err}");
+            return;
+        }
+    };
     let restyle = inline_objects.take_restyle_objects();
     if restyle.is_empty() {
         return;
@@ -1788,7 +1828,7 @@ pub(crate) fn apply_rgp_restyle(mut params: RgpRestyleParams) {
 #[derive(SystemParam)]
 pub(crate) struct BrightnessParams<'w, 's> {
     cursor_settings: Res<'w, CursorSettings>,
-    inline_objects: Res<'w, TerminalInlineObjects>,
+    inline_objects: Query<'w, 's, &'static TerminalInlineObjects>,
     rgp_roots: Query<'w, 's, (Entity, &'static TerminalRgpObject)>,
     cursor_roots: Query<'w, 's, Entity, With<CursorModel>>,
     parent_query: Query<'w, 's, &'static ChildOf>,
@@ -1826,6 +1866,18 @@ pub(crate) fn apply_instance_brightness(mut params: BrightnessParams) {
         materials,
         commands,
     } = &mut params;
+    let inline_objects = match inline_objects.single() {
+        Ok(inline_objects) => inline_objects,
+        Err(err) => {
+            // Latched once per process: the inline registry lives on THE
+            // terminal seat, and the miss must name its system (#54's
+            // silent-.single() finding).
+            warn_once!(
+                "apply_instance_brightness: inline objects need exactly one terminal seat: {err}"
+            );
+            return;
+        }
+    };
     if material_query.is_empty() {
         return;
     }
@@ -2774,7 +2826,7 @@ pub fn animate_mobius_transition(
 /// dispatch instantly (the Möbius transition owns its own clock); the other
 /// fields apply instantly or start a [`StageTween`] when `dur` is set.
 pub fn apply_rgp_stage(
-    mut inline_objects: ResMut<TerminalInlineObjects>,
+    mut inline_objects: Query<&mut TerminalInlineObjects>,
     mut presentation: ResMut<TerminalPresentation>,
     mut plane_warp: Query<&mut TerminalPlaneWarp>,
     mut plane_view: ResMut<TerminalPlaneView>,
@@ -2789,6 +2841,16 @@ pub fn apply_rgp_stage(
             // seat, and the miss must name its system (#54's silent-.single()
             // finding).
             warn_once!("apply_rgp_stage: the plane warp needs exactly one terminal seat: {err}");
+            return;
+        }
+    };
+    let mut inline_objects = match inline_objects.single_mut() {
+        Ok(inline_objects) => inline_objects,
+        Err(err) => {
+            // Latched once per process: the inline registry lives on THE
+            // terminal seat, and the miss must name its system (#54's
+            // silent-.single() finding).
+            warn_once!("apply_rgp_stage: inline objects need exactly one terminal seat: {err}");
             return;
         }
     };
@@ -3876,7 +3938,7 @@ mod single_plane_degrade_tests {
         let world = app.world_mut();
         // The default last_viewport_size differs from the viewport below, so
         // needs_sync reports a full sync and the plane resolution is reached.
-        world.init_resource::<TerminalInlineObjects>();
+        world.spawn(TerminalInlineObjects::default());
         base_resources(world, TerminalPresentationMode::Flat2d);
         world.init_resource::<Assets<StandardMaterial>>();
         world.init_resource::<Assets<Image>>();
@@ -3917,7 +3979,7 @@ mod single_plane_degrade_tests {
                 style: InlineStyle::default(),
             },
         );
-        world.insert_resource(inline_objects);
+        world.spawn(inline_objects);
         let object = world
             .spawn((
                 TerminalRgpObject { object_id: 1 },
