@@ -20,6 +20,7 @@ use bevy::camera::visibility::NoFrustumCulling;
 
 use crate::config::AppConfig;
 use crate::direct_render::{new_terminal_image, new_terminal_render_image};
+use crate::identity::{TerminalIdentity, TerminalRegistry};
 use crate::inline::TerminalInlineObjects;
 use crate::present::{TerminalPresentMaterial, fullscreen_quad};
 use crate::runtime::TerminalRuntime;
@@ -267,53 +268,95 @@ pub(crate) struct PresentationParams<'w, 's> {
     camera_3d: Query<'w, 's, &'static mut Camera, (With<TerminalPlaneCamera>, Without<Camera2d>)>,
 }
 
+/// The seat entity owning a per-terminal scene entity (the front and
+/// back planes). Pure data at M4.3: its only consumer is the despawn
+/// sweep; M4.4's organ routing joins on it. Deliberately NOT `ChildOf`
+/// parenting — the seat has no `Transform`, and
+/// [`apply_terminal_presentation`] writes plane transforms in world
+/// space, which parenting would silently make local-space.
+#[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TerminalOwner(pub Entity);
+
+/// Everything [`dress_terminal_seat`] needs, bundled so any system (the
+/// Startup constructor today, M4.5's wire loop tomorrow) can embed it.
+/// Systems register at `Plugin::build`, so per-terminal construction is a
+/// FUNCTION over this bundle, never N system instances (#58 rider).
 #[derive(SystemParam)]
-pub(crate) struct SetupSceneParams<'w, 's> {
-    commands: Commands<'w, 's>,
+pub(crate) struct TerminalSpawnParams<'w, 's> {
+    pub(crate) commands: Commands<'w, 's>,
+    terminals: ResMut<'w, TerminalRegistry>,
     app_config: Res<'w, AppConfig>,
-    meshes: ResMut<'w, Assets<Mesh>>,
+    pub(crate) meshes: ResMut<'w, Assets<Mesh>>,
     materials: ResMut<'w, Assets<StandardMaterial>>,
     images: ResMut<'w, Assets<Image>>,
-    present_materials: ResMut<'w, Assets<TerminalPresentMaterial>>,
     primary_window: Query<'w, 's, &'static Window, With<PrimaryWindow>>,
-    runtime: Query<'w, 's, &'static mut TerminalRuntime>,
-    terminal: Query<'w, 's, (Entity, &'static mut TerminalSurface)>,
 }
 
-/// Sets up the terminal presentation scene.
-///
-/// This startup system creates the 2D and 3D cameras, terminal sprite, terminal plane meshes,
-/// backing images, lighting and presentation resources used by later update systems.
+#[derive(SystemParam)]
+pub(crate) struct SetupSceneParams<'w, 's> {
+    spawn: TerminalSpawnParams<'w, 's>,
+    present_materials: ResMut<'w, Assets<TerminalPresentMaterial>>,
+    runtime: Query<'w, 's, &'static mut TerminalRuntime>,
+    terminal: Query<
+        'w,
+        's,
+        (
+            Entity,
+            &'static TerminalIdentity,
+            &'static mut TerminalSurface,
+        ),
+    >,
+}
+
+/// Sets up the terminal presentation scene: the scene-global stage once,
+/// then the boot terminal seat through the same [`dress_terminal_seat`]
+/// every spawned terminal goes through.
 pub(crate) fn setup_scene(mut params: SetupSceneParams) {
     let SetupSceneParams {
-        commands,
-        app_config,
-        meshes,
-        materials,
-        images,
+        spawn,
         present_materials,
-        primary_window,
         runtime,
         terminal,
     } = &mut params;
     // Fatal, like the primary-window expect below: setup_scene is a
     // constructor, and a world without exactly one terminal seat (spawned by
-    // main()/start() with the surface and runtime aboard) is a broken world.
-    let (host, mut terminal) = terminal.single_mut().expect("exactly one terminal seat");
+    // main()/start() with the surface, runtime and identity aboard) is a
+    // broken world.
+    let (host, identity, mut terminal) = terminal.single_mut().expect("exactly one terminal seat");
+    let identity = *identity;
     let mut runtime = runtime.single_mut().expect("exactly one terminal seat");
-    let terminal_opacity = app_config.window.opacity.clamp(0.0, 1.0);
-    let window = primary_window.single().expect("primary window");
-    let window_size = window.resolution.size().max(Vec2::ONE);
-    let render_scale = render_scale_for_window(window);
-    let layout = terminal.resize_to_fit(window_size, render_scale);
-    let pty_pixels = layout.pty_pixels();
-    runtime.resize(
-        layout.cols,
-        layout.rows,
-        pty_pixels.x as u16,
-        pty_pixels.y as u16,
-    );
 
+    setup_scene_stage(&mut spawn.commands);
+    let present_handle = dress_terminal_seat(spawn, host, identity, &mut terminal, &mut runtime);
+
+    // Present the terminal texture 1:1 with physical pixels via a fullscreen quad
+    // whose shader fetches each texel by pixel coordinate (no resampling), rather
+    // than a world-positioned sprite whose interpolated UVs resample it. The
+    // `TerminalSprite` marker is kept so the flat/3D visibility toggle applies.
+    //
+    // Exactly one quad exists (decision 12's focused-1:1 scene view), so it
+    // spawns in neither split half — bound explicitly to the BOOT seat's
+    // present texture by the handle dress returned, never "first seat a
+    // query finds". Focused rebinding is M4.4's work
+    // (`sync_terminal_materials` already rebinds the handle every dirty
+    // frame).
+    let quad = spawn.meshes.add(fullscreen_quad());
+    spawn.commands.spawn((
+        TerminalSprite,
+        Mesh2d(quad),
+        MeshMaterial2d(present_materials.add(TerminalPresentMaterial {
+            texture: present_handle,
+        })),
+        Transform::default(),
+        Visibility::Visible,
+        NoFrustumCulling,
+    ));
+}
+
+/// The scene-global half of the old `setup_scene` (#56 decision 12's
+/// screen side): the two cameras, the lights and the scene-view
+/// resources. Runs exactly once; nothing in it references any terminal.
+fn setup_scene_stage(commands: &mut Commands) {
     commands.spawn((
         Camera2d,
         Camera {
@@ -337,107 +380,6 @@ pub(crate) fn setup_scene(mut params: SetupSceneParams) {
         }),
         Transform::from_xyz(0.0, 0.0, 800.0).looking_at(Vec3::ZERO, Vec3::Y),
         Msaa::Off,
-    ));
-
-    let terminal_alpha = (terminal_opacity * 255.0).round() as u8;
-    let render_image_handle = images.add(new_terminal_render_image(
-        layout.texture_size.x,
-        layout.texture_size.y,
-        crate::config::TERMINAL_RENDER_TEXTURE_LABEL,
-    ));
-    terminal.render_image_handle = Some(render_image_handle);
-
-    let image_handle = images.add(new_terminal_image(
-        layout.texture_size.x,
-        layout.texture_size.y,
-        crate::config::TERMINAL_TEXTURE_LABEL,
-    ));
-    terminal.image_handle = Some(image_handle.clone());
-
-    let [r, g, b] = app_config.theme.background;
-    let back_image = create_terminal_image(
-        layout.texture_size.x,
-        layout.texture_size.y,
-        [
-            r.saturating_sub(13),
-            g.saturating_sub(11),
-            b.saturating_sub(3),
-            terminal_alpha,
-        ],
-    );
-    let back_image_handle = images.add(back_image);
-    terminal.back_image_handle = Some(back_image_handle.clone());
-
-    let viewport_center = Vec2::ZERO;
-
-    // Present the terminal texture 1:1 with physical pixels via a fullscreen quad
-    // whose shader fetches each texel by pixel coordinate (no resampling), rather
-    // than a world-positioned sprite whose interpolated UVs resample it. The
-    // `TerminalSprite` marker is kept so the flat/3D visibility toggle applies.
-    commands.spawn((
-        TerminalSprite,
-        Mesh2d(meshes.add(fullscreen_quad())),
-        MeshMaterial2d(present_materials.add(TerminalPresentMaterial {
-            texture: image_handle,
-        })),
-        Transform::default(),
-        Visibility::Visible,
-        NoFrustumCulling,
-    ));
-
-    let front_mesh = meshes.add(terminal_plane_mesh(32, 20));
-    let back_mesh = meshes.add(terminal_plane_mesh(32, 20));
-    // The terminal seat: main()/start() spawn the one entity with the
-    // externally-constructed surface aboard, and this constructor dresses
-    // THAT entity with the world-derived per-terminal components. Exactly
-    // one seat ever exists; the seat-count tests assert that explicitly
-    // (#54: nothing strips a second seat once the types stop being
-    // Resources).
-    commands.entity(host).insert((
-        TerminalPlaneMeshes {
-            front: front_mesh.clone(),
-            back: back_mesh.clone(),
-        },
-        TerminalFrameDirty::default(),
-        TerminalRedrawState::default(),
-        TerminalViewport {
-            size: layout.logical_size,
-            center: viewport_center,
-        },
-        TerminalPlaneWarp::default(),
-        TerminalInlineObjects::default(),
-    ));
-
-    commands.spawn((
-        TerminalPlane,
-        Mesh3d(front_mesh),
-        MeshMaterial3d(materials.add(StandardMaterial {
-            base_color: Color::srgba(1.0, 1.0, 1.0, terminal_opacity),
-            base_color_texture: terminal.image_handle.clone(),
-            alpha_mode: AlphaMode::Blend,
-            unlit: true,
-            ..default()
-        })),
-        Transform::from_scale(layout.logical_size.extend(1.0)),
-        Visibility::Hidden,
-    ));
-
-    commands.spawn((
-        TerminalPlaneBack,
-        Mesh3d(back_mesh),
-        MeshMaterial3d(materials.add(StandardMaterial {
-            base_color: Color::srgba(1.0, 1.0, 1.0, terminal_opacity),
-            base_color_texture: terminal.back_image_handle.clone(),
-            alpha_mode: AlphaMode::Blend,
-            unlit: true,
-            ..default()
-        })),
-        Transform {
-            translation: Vec3::new(0.0, 0.0, -2.0),
-            rotation: Quat::from_rotation_y(std::f32::consts::PI),
-            scale: layout.logical_size.extend(1.0),
-        },
-        Visibility::Hidden,
     ));
 
     commands.spawn((
@@ -466,6 +408,7 @@ pub(crate) fn setup_scene(mut params: SetupSceneParams) {
         },
         Transform::from_xyz(-280.0, -120.0, 700.0),
     ));
+
     commands.insert_resource(TerminalPresentation {
         mode: TerminalPresentationMode::Flat2d,
     });
@@ -475,6 +418,139 @@ pub(crate) fn setup_scene(mut params: SetupSceneParams) {
         loaded: false,
         first_frame_uploaded: false,
     });
+}
+
+/// The per-terminal half of the old `setup_scene`, callable N times: binds
+/// the seat in the registry, sizes the surface and transport to the
+/// window, creates the seat's render/present/back textures, inserts the
+/// world-derived per-terminal components, and spawns the seat's front and
+/// back plane entities stamped with [`TerminalOwner`].
+///
+/// Returns the seat's present-texture handle so callers bind scene-view
+/// materials (the 2D present quad at boot) explicitly by handle, never by
+/// "first seat the query yields" — query iteration order is unstable the
+/// moment an N=2 world exists.
+pub(crate) fn dress_terminal_seat(
+    params: &mut TerminalSpawnParams,
+    seat: Entity,
+    identity: TerminalIdentity,
+    surface: &mut TerminalSurface,
+    runtime: &mut TerminalRuntime,
+) -> Handle<Image> {
+    let TerminalSpawnParams {
+        commands,
+        terminals,
+        app_config,
+        meshes,
+        materials,
+        images,
+        primary_window,
+    } = params;
+    terminals
+        .bind(identity.id(), seat)
+        .expect("the dressed seat's identity was minted by this registry");
+
+    let terminal_opacity = app_config.window.opacity.clamp(0.0, 1.0);
+    let window = primary_window.single().expect("primary window");
+    let window_size = window.resolution.size().max(Vec2::ONE);
+    let render_scale = render_scale_for_window(window);
+    let layout = surface.resize_to_fit(window_size, render_scale);
+    let pty_pixels = layout.pty_pixels();
+    runtime.resize(
+        layout.cols,
+        layout.rows,
+        pty_pixels.x as u16,
+        pty_pixels.y as u16,
+    );
+
+    let terminal_alpha = (terminal_opacity * 255.0).round() as u8;
+    let render_image_handle = images.add(new_terminal_render_image(
+        layout.texture_size.x,
+        layout.texture_size.y,
+        crate::config::TERMINAL_RENDER_TEXTURE_LABEL,
+    ));
+    surface.render_image_handle = Some(render_image_handle);
+
+    let image_handle = images.add(new_terminal_image(
+        layout.texture_size.x,
+        layout.texture_size.y,
+        crate::config::TERMINAL_TEXTURE_LABEL,
+    ));
+    surface.image_handle = Some(image_handle.clone());
+
+    let [r, g, b] = app_config.theme.background;
+    let back_image = create_terminal_image(
+        layout.texture_size.x,
+        layout.texture_size.y,
+        [
+            r.saturating_sub(13),
+            g.saturating_sub(11),
+            b.saturating_sub(3),
+            terminal_alpha,
+        ],
+    );
+    let back_image_handle = images.add(back_image);
+    surface.back_image_handle = Some(back_image_handle.clone());
+
+    let viewport_center = Vec2::ZERO;
+
+    let front_mesh = meshes.add(terminal_plane_mesh(32, 20));
+    let back_mesh = meshes.add(terminal_plane_mesh(32, 20));
+    // The terminal seat: the caller spawns the entity with the
+    // externally-constructed surface, runtime and identity aboard, and
+    // this dresses THAT entity with the world-derived per-terminal
+    // components. The seat-count tests assert the count explicitly (#54:
+    // nothing strips a second seat once the types stop being Resources).
+    commands.entity(seat).insert((
+        TerminalPlaneMeshes {
+            front: front_mesh.clone(),
+            back: back_mesh.clone(),
+        },
+        TerminalFrameDirty::default(),
+        TerminalRedrawState::default(),
+        TerminalViewport {
+            size: layout.logical_size,
+            center: viewport_center,
+        },
+        TerminalPlaneWarp::default(),
+        TerminalInlineObjects::default(),
+    ));
+
+    commands.spawn((
+        TerminalPlane,
+        TerminalOwner(seat),
+        Mesh3d(front_mesh),
+        MeshMaterial3d(materials.add(StandardMaterial {
+            base_color: Color::srgba(1.0, 1.0, 1.0, terminal_opacity),
+            base_color_texture: surface.image_handle.clone(),
+            alpha_mode: AlphaMode::Blend,
+            unlit: true,
+            ..default()
+        })),
+        Transform::from_scale(layout.logical_size.extend(1.0)),
+        Visibility::Hidden,
+    ));
+
+    commands.spawn((
+        TerminalPlaneBack,
+        TerminalOwner(seat),
+        Mesh3d(back_mesh),
+        MeshMaterial3d(materials.add(StandardMaterial {
+            base_color: Color::srgba(1.0, 1.0, 1.0, terminal_opacity),
+            base_color_texture: surface.back_image_handle.clone(),
+            alpha_mode: AlphaMode::Blend,
+            unlit: true,
+            ..default()
+        })),
+        Transform {
+            translation: Vec3::new(0.0, 0.0, -2.0),
+            rotation: Quat::from_rotation_y(std::f32::consts::PI),
+            scale: layout.logical_size.extend(1.0),
+        },
+        Visibility::Hidden,
+    ));
+
+    image_handle
 }
 
 /// Synchronizes Bevy presentation entities to the terminal texture layout.
@@ -708,20 +784,23 @@ mod tests {
         world.init_resource::<Assets<StandardMaterial>>();
         world.init_resource::<Assets<Image>>();
         world.init_resource::<Assets<TerminalPresentMaterial>>();
-        let (runtime, _host) = TerminalRuntime::virtual_channel(
-            &AppConfig::default(),
-            crate::runtime::IngressSource::test_boot(),
-        );
-        // Mirror main()/start(): the seat is born pre-run with the surface
-        // and runtime aboard; setup_scene must dress THIS entity, not spawn
-        // another.
+        // Mirror main()/start(): the boot identity is the registry's FIRST
+        // allocation, and the seat is born pre-run with the surface,
+        // runtime and identity aboard; setup_scene must dress THIS entity,
+        // not spawn another.
+        let mut registry = TerminalRegistry::default();
+        let identity = registry.allocate().expect("a fresh registry has slots");
+        let (runtime, _host) =
+            TerminalRuntime::virtual_channel(&AppConfig::default(), identity.ingress());
         let seat = world
             .spawn((
                 TerminalSurface::new(&AppConfig::default())
                     .expect("surface construction is CPU-only"),
                 runtime,
+                identity,
             ))
             .id();
+        world.insert_resource(registry);
         world.spawn((Window::default(), bevy::window::PrimaryWindow));
 
         world
@@ -778,6 +857,48 @@ mod tests {
             "exactly one seat carries the redraw flag"
         );
         assert_eq!(
+            world.query::<&TerminalIdentity>().iter(&world).count(),
+            1,
+            "exactly one seat carries the identity"
+        );
+        let identity = *world
+            .query::<&TerminalIdentity>()
+            .single(&world)
+            .expect("exactly one identity");
+        assert_eq!(
+            identity.id(),
+            crate::identity::TerminalId::from_raw(1),
+            "the boot terminal is the registry's FIRST allocation — any \
+             earlier pre-world allocation shifts this and changes wire bytes"
+        );
+        assert_eq!(
+            identity.namespace(),
+            0,
+            "boot leases namespace 0, keeping every wire byte identical to \
+             the single-terminal era"
+        );
+        assert_eq!(
+            world
+                .resource::<TerminalRegistry>()
+                .entity_of(identity.id()),
+            Some(seat),
+            "dress binds the boot identity to the seat entity"
+        );
+        let owners: Vec<_> = world
+            .query::<&TerminalOwner>()
+            .iter(&world)
+            .copied()
+            .collect();
+        assert_eq!(
+            owners.len(),
+            2,
+            "exactly the seat's front and back planes carry TerminalOwner"
+        );
+        assert!(
+            owners.iter().all(|owner| owner.0 == seat),
+            "both planes are owned by the one boot seat"
+        );
+        assert_eq!(
             world
                 .query::<(
                     &TerminalSurface,
@@ -788,6 +909,7 @@ mod tests {
                     &TerminalInlineObjects,
                     &TerminalRuntime,
                     &TerminalRedrawState,
+                    &TerminalIdentity,
                 )>()
                 .iter(&world)
                 .count(),
