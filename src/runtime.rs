@@ -632,6 +632,10 @@ impl TerminalRuntime {
         {
             if let Some(child) = self.child.as_mut() {
                 let _ = child.kill();
+                // Non-blocking reap: an already-exited child (the disconnect
+                // path) is collected here; a still-live one is collected at
+                // process exit as before.
+                let _ = child.try_wait();
             }
             self.child.take();
             self.master.get().take();

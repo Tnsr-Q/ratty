@@ -973,7 +973,18 @@ pub(crate) fn sync_presence_cursor_markers(mut params: PresenceMarkerParams) {
         cell_width * MARKER_WIDTH_FRACTION,
     );
     let mobius_progress = active_mobius_progress(presentation.mode, mobius_transition);
-    let plane_transform = plane_query.single().ok();
+    let plane_transform = match plane_query.single() {
+        Ok(plane_transform) => Some(plane_transform),
+        Err(err) => {
+            // Latched once per process: the 3D projections need THE plane;
+            // markers hide there until it is back (Flat2d poses never
+            // consult it).
+            warn_once!(
+                "sync_presence_cursor_markers: presence markers need exactly one terminal plane: {err}"
+            );
+            None
+        }
+    };
 
     // The desired marker set: fresh participants with a reported cursor.
     // A Vec + linear claim keeps this allocation-light — the roster is
@@ -2165,6 +2176,103 @@ mod tests {
         assert!(
             !app.world_mut().resource_mut::<TerminalRedrawState>().take(),
             "expiry redraws once, not every frame"
+        );
+    }
+
+    /// Runs `f` with a thread-local WARN-capturing subscriber installed and
+    /// returns the captured messages. Sound only because the system under
+    /// test runs inline on this thread via `run_system_once` — an
+    /// `app.update()` could run systems on task-pool threads this
+    /// subscriber cannot see.
+    fn capture_warns(f: impl FnOnce()) -> Vec<String> {
+        use bevy::log::tracing::field::{Field, Visit};
+        use bevy::log::tracing::{Event, Level, Metadata, Subscriber, span};
+        use std::sync::{Arc, Mutex};
+
+        struct WarnCollector(Arc<Mutex<Vec<String>>>);
+
+        impl Subscriber for WarnCollector {
+            fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+                *metadata.level() == Level::WARN
+            }
+            fn new_span(&self, _span: &span::Attributes<'_>) -> span::Id {
+                span::Id::from_u64(1)
+            }
+            fn record(&self, _span: &span::Id, _values: &span::Record<'_>) {}
+            fn record_follows_from(&self, _span: &span::Id, _follows: &span::Id) {}
+            fn event(&self, event: &Event<'_>) {
+                struct MessageVisitor<'a>(&'a mut String);
+                impl Visit for MessageVisitor<'_> {
+                    fn record_debug(&mut self, field: &Field, value: &dyn core::fmt::Debug) {
+                        if field.name() == "message" {
+                            *self.0 = format!("{value:?}");
+                        }
+                    }
+                }
+                let mut message = String::new();
+                event.record(&mut MessageVisitor(&mut message));
+                if let Ok(mut messages) = self.0.lock() {
+                    messages.push(message);
+                }
+            }
+            fn enter(&self, _span: &span::Id) {}
+            fn exit(&self, _span: &span::Id) {}
+        }
+
+        let messages = Arc::new(Mutex::new(Vec::new()));
+        let collector = WarnCollector(Arc::clone(&messages));
+        bevy::log::tracing::subscriber::with_default(collector, f);
+        messages
+            .lock()
+            .expect("the warn collector lock should not be poisoned")
+            .clone()
+    }
+
+    #[test]
+    fn marker_sync_warns_once_when_the_plane_anchor_is_not_unique() {
+        use crate::config::AppConfig;
+        use bevy::ecs::system::RunSystemOnce;
+
+        // Only this test may assert this site's warn: the warn_once latch
+        // is process-global, so a second test driving this system into the
+        // wrong-plane-count state would race it.
+        let mut world = World::new();
+        world.init_resource::<Time>();
+        // The plane resolution runs before the roster loop, so an empty
+        // registry reaches it (run_system_once also bypasses the run_if).
+        world.init_resource::<PresenceRegistry>();
+        world.insert_resource(
+            TerminalSurface::new(&AppConfig::default()).expect("surface construction is CPU-only"),
+        );
+        world.insert_resource(TerminalViewport {
+            size: Vec2::new(800.0, 480.0),
+            center: Vec2::ZERO,
+        });
+        world.insert_resource(TerminalPresentation {
+            mode: TerminalPresentationMode::Plane3d,
+        });
+        world.init_resource::<MobiusTransition>();
+        world.insert_resource(TerminalPlaneWarp::default());
+        world.init_resource::<Assets<Mesh>>();
+        world.init_resource::<Assets<StandardMaterial>>();
+        world.spawn((TerminalPlane, Transform::default()));
+        world.spawn((TerminalPlane, Transform::default()));
+
+        let warns = capture_warns(|| {
+            world
+                .run_system_once(sync_presence_cursor_markers)
+                .expect("the system should run");
+            world
+                .run_system_once(sync_presence_cursor_markers)
+                .expect("the system should run");
+        });
+        assert_eq!(
+            warns
+                .iter()
+                .filter(|warn| warn.contains("sync_presence_cursor_markers"))
+                .count(),
+            1,
+            "two wrong-plane frames must produce exactly one latched warn: {warns:?}"
         );
     }
 }
