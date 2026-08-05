@@ -51,7 +51,7 @@ pub struct TerminalPlaneMeshes {
 }
 
 /// Plane warp state.
-#[derive(Resource, Default)]
+#[derive(Component, Default)]
 pub struct TerminalPlaneWarp {
     /// Warp amount.
     pub amount: f32,
@@ -393,8 +393,8 @@ pub(crate) fn setup_scene(mut params: SetupSceneParams) {
             size: layout.logical_size,
             center: viewport_center,
         },
+        TerminalPlaneWarp::default(),
     ));
-    commands.insert_resource(TerminalPlaneWarp::default());
 
     commands.spawn((
         TerminalPlane,
@@ -723,8 +723,18 @@ mod tests {
             "exactly one seat carries the viewport"
         );
         assert_eq!(
+            world.query::<&TerminalPlaneWarp>().iter(&world).count(),
+            1,
+            "exactly one seat carries the plane warp"
+        );
+        assert_eq!(
             world
-                .query::<(&TerminalPlaneMeshes, &TerminalFrameDirty, &TerminalViewport)>()
+                .query::<(
+                    &TerminalPlaneMeshes,
+                    &TerminalFrameDirty,
+                    &TerminalViewport,
+                    &TerminalPlaneWarp,
+                )>()
                 .iter(&world)
                 .count(),
             1,

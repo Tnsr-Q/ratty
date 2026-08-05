@@ -329,7 +329,7 @@ impl TerminalKeyboard {
 pub struct KeyboardSystemParams<'w, 's> {
     keys: Res<'w, ButtonInput<KeyCode>>,
     selection: ResMut<'w, TerminalSelection>,
-    plane_warp: ResMut<'w, TerminalPlaneWarp>,
+    plane_warp: Query<'w, 's, &'static mut TerminalPlaneWarp>,
     plane_view: ResMut<'w, TerminalPlaneView>,
     presentation: ResMut<'w, TerminalPresentation>,
     mobius_transition: ResMut<'w, MobiusTransition>,
@@ -465,7 +465,19 @@ pub fn handle_keyboard_input(
                     if params.stage_tween.active {
                         params.stage_tween.stop();
                     }
-                    params.plane_warp.adjust(delta);
+                    let mut plane_warp = match params.plane_warp.single_mut() {
+                        Ok(plane_warp) => plane_warp,
+                        Err(err) => {
+                            // Latched once per process: the warp lives on THE
+                            // terminal seat, and the miss must name its system
+                            // (#54's silent-.single() finding).
+                            warn_once!(
+                                "handle_keyboard_input: the plane warp needs exactly one terminal seat: {err}"
+                            );
+                            continue;
+                        }
+                    };
+                    plane_warp.adjust(delta);
                     params.redraw.request();
                     continue;
                 }

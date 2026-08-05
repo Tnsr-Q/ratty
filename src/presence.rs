@@ -928,7 +928,7 @@ pub(crate) struct PresenceMarkerParams<'w, 's> {
     viewport: Query<'w, 's, &'static TerminalViewport>,
     presentation: Res<'w, TerminalPresentation>,
     mobius_transition: Res<'w, MobiusTransition>,
-    plane_warp: Res<'w, TerminalPlaneWarp>,
+    plane_warp: Query<'w, 's, &'static TerminalPlaneWarp>,
     plane_query: Query<'w, 's, &'static Transform, With<TerminalPlane>>,
     markers: PresenceMarkerQuery<'w, 's>,
     meshes: ResMut<'w, Assets<Mesh>>,
@@ -969,6 +969,18 @@ pub(crate) fn sync_presence_cursor_markers(mut params: PresenceMarkerParams) {
             // finding).
             warn_once!(
                 "sync_presence_cursor_markers: the viewport needs exactly one terminal seat: {err}"
+            );
+            return;
+        }
+    };
+    let plane_warp = match plane_warp.single() {
+        Ok(plane_warp) => plane_warp,
+        Err(err) => {
+            // Latched once per process: the warp lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!(
+                "sync_presence_cursor_markers: the plane warp needs exactly one terminal seat: {err}"
             );
             return;
         }
@@ -2256,15 +2268,17 @@ mod tests {
         world.insert_resource(
             TerminalSurface::new(&AppConfig::default()).expect("surface construction is CPU-only"),
         );
-        world.spawn(TerminalViewport {
-            size: Vec2::new(800.0, 480.0),
-            center: Vec2::ZERO,
-        });
+        world.spawn((
+            TerminalViewport {
+                size: Vec2::new(800.0, 480.0),
+                center: Vec2::ZERO,
+            },
+            TerminalPlaneWarp::default(),
+        ));
         world.insert_resource(TerminalPresentation {
             mode: TerminalPresentationMode::Plane3d,
         });
         world.init_resource::<MobiusTransition>();
-        world.insert_resource(TerminalPlaneWarp::default());
         world.init_resource::<Assets<Mesh>>();
         world.init_resource::<Assets<StandardMaterial>>();
         world.spawn((TerminalPlane, Transform::default()));

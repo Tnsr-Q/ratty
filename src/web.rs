@@ -407,13 +407,23 @@ pub fn start(canvas_selector: &str, config_toml: Option<String>) -> Result<Ratty
 fn drain_web_controls(
     queue: Res<WebControlQueue>,
     mut presentation: ResMut<TerminalPresentation>,
-    mut warp: ResMut<TerminalPlaneWarp>,
+    mut warp: Query<&mut TerminalPlaneWarp>,
     mut view: ResMut<TerminalPlaneView>,
     mut mobius: ResMut<MobiusTransition>,
     mut stage_tween: ResMut<StageTween>,
     mut redraw: ResMut<TerminalRedrawState>,
     mut sound: ResMut<crate::sound::SoundState>,
 ) {
+    let mut warp = match warp.single_mut() {
+        Ok(warp) => warp,
+        Err(err) => {
+            // Latched once per process: the warp lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!("drain_web_controls: the plane warp needs exactly one terminal seat: {err}");
+            return;
+        }
+    };
     let pending = match queue.0.lock() {
         Ok(mut controls) => std::mem::take(&mut *controls),
         Err(_) => return,

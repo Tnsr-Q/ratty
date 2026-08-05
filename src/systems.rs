@@ -805,7 +805,7 @@ pub(crate) struct SyncInlineParams<'w, 's> {
     terminal: Res<'w, TerminalSurface>,
     viewport: Query<'w, 's, &'static TerminalViewport>,
     presentation: Res<'w, TerminalPresentation>,
-    plane_warp: Res<'w, TerminalPlaneWarp>,
+    plane_warp: Query<'w, 's, &'static TerminalPlaneWarp>,
     time: Res<'w, Time>,
     plane_query: Query<'w, 's, (Entity, &'static Transform), With<TerminalPlane>>,
     sprite_query: Query<'w, 's, Entity, With<TerminalInlineObjectSprite>>,
@@ -851,6 +851,18 @@ pub(crate) fn sync_inline_objects(mut params: SyncInlineParams) {
             // seat, and the miss must name its system (#54's silent-.single()
             // finding).
             warn_once!("sync_inline_objects: the viewport needs exactly one terminal seat: {err}");
+            return;
+        }
+    };
+    let plane_warp = match plane_warp.single() {
+        Ok(plane_warp) => plane_warp,
+        Err(err) => {
+            // Latched once per process: the warp lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!(
+                "sync_inline_objects: the plane warp needs exactly one terminal seat: {err}"
+            );
             return;
         }
     };
@@ -1200,11 +1212,23 @@ fn write_kitty_plane_positions(
 /// warp is active, instead of rebuilding inline entities every frame.
 pub(crate) fn animate_inline_kitty_planes(
     presentation: Res<TerminalPresentation>,
-    warp: Res<TerminalPlaneWarp>,
+    warp: Query<&TerminalPlaneWarp>,
     time: Res<Time>,
     query: Query<(&InlineKittyPlaneLayout, &Mesh3d), With<TerminalInlineObjectPlane>>,
     mut meshes: ResMut<Assets<Mesh>>,
 ) {
+    let warp = match warp.single() {
+        Ok(warp) => warp,
+        Err(err) => {
+            // Latched once per process: the warp lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!(
+                "animate_inline_kitty_planes: the plane warp needs exactly one terminal seat: {err}"
+            );
+            return;
+        }
+    };
     if !matches!(
         presentation.mode,
         TerminalPresentationMode::Plane3d | TerminalPresentationMode::Mobius3d
@@ -1391,7 +1415,7 @@ pub(crate) struct RgpSyncParams<'w, 's> {
     viewport: Query<'w, 's, &'static TerminalViewport>,
     presentation: Res<'w, TerminalPresentation>,
     mobius_transition: Res<'w, MobiusTransition>,
-    plane_warp: Res<'w, TerminalPlaneWarp>,
+    plane_warp: Query<'w, 's, &'static TerminalPlaneWarp>,
     time: Res<'w, Time>,
     plane_query: PlaneTransformQuery<'w, 's>,
     inline_objects: Res<'w, TerminalInlineObjects>,
@@ -1435,6 +1459,16 @@ pub(crate) fn sync_rgp_objects(mut params: RgpSyncParams) {
             // seat, and the miss must name its system (#54's silent-.single()
             // finding).
             warn_once!("sync_rgp_objects: the viewport needs exactly one terminal seat: {err}");
+            return;
+        }
+    };
+    let plane_warp = match plane_warp.single() {
+        Ok(plane_warp) => plane_warp,
+        Err(err) => {
+            // Latched once per process: the warp lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!("sync_rgp_objects: the plane warp needs exactly one terminal seat: {err}");
             return;
         }
     };
@@ -2360,7 +2394,7 @@ pub(crate) struct VizSyncParams<'w, 's> {
     viewport: Query<'w, 's, &'static TerminalViewport>,
     presentation: Res<'w, TerminalPresentation>,
     mobius_transition: Res<'w, MobiusTransition>,
-    plane_warp: Res<'w, TerminalPlaneWarp>,
+    plane_warp: Query<'w, 's, &'static TerminalPlaneWarp>,
     time: Res<'w, Time>,
     plane_query: VizPlaneQuery<'w, 's>,
     roots: Query<
@@ -2403,6 +2437,16 @@ pub(crate) fn sync_viz_objects(mut params: VizSyncParams) {
             // seat, and the miss must name its system (#54's silent-.single()
             // finding).
             warn_once!("sync_viz_objects: the viewport needs exactly one terminal seat: {err}");
+            return;
+        }
+    };
+    let plane_warp = match plane_warp.single() {
+        Ok(plane_warp) => plane_warp,
+        Err(err) => {
+            // Latched once per process: the warp lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!("sync_viz_objects: the plane warp needs exactly one terminal seat: {err}");
             return;
         }
     };
@@ -2626,7 +2670,7 @@ pub fn animate_terminal_plane_warp(
     time: Res<Time>,
     presentation: Res<TerminalPresentation>,
     mobius_transition: Res<MobiusTransition>,
-    warp: Res<TerminalPlaneWarp>,
+    warp: Query<Ref<TerminalPlaneWarp>>,
     plane_meshes: Query<&TerminalPlaneMeshes>,
     mut meshes: ResMut<Assets<Mesh>>,
 ) {
@@ -2638,6 +2682,20 @@ pub fn animate_terminal_plane_warp(
             // finding).
             warn_once!(
                 "animate_terminal_plane_warp: plane meshes need exactly one terminal seat: {err}"
+            );
+            return;
+        }
+    };
+    // `Ref` carries the same last-run change ticks as `Res` did, so the
+    // `warp.is_changed()` gate below keeps its exact cadence.
+    let warp = match warp.single() {
+        Ok(warp) => warp,
+        Err(err) => {
+            // Latched once per process: the warp lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!(
+                "animate_terminal_plane_warp: the plane warp needs exactly one terminal seat: {err}"
             );
             return;
         }
@@ -2718,12 +2776,22 @@ pub fn animate_mobius_transition(
 pub fn apply_rgp_stage(
     mut inline_objects: ResMut<TerminalInlineObjects>,
     mut presentation: ResMut<TerminalPresentation>,
-    mut plane_warp: ResMut<TerminalPlaneWarp>,
+    mut plane_warp: Query<&mut TerminalPlaneWarp>,
     mut plane_view: ResMut<TerminalPlaneView>,
     mut mobius_transition: ResMut<MobiusTransition>,
     mut stage_tween: ResMut<StageTween>,
     mut redraw: ResMut<TerminalRedrawState>,
 ) {
+    let mut plane_warp = match plane_warp.single_mut() {
+        Ok(plane_warp) => plane_warp,
+        Err(err) => {
+            // Latched once per process: the warp lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!("apply_rgp_stage: the plane warp needs exactly one terminal seat: {err}");
+            return;
+        }
+    };
     for update in inline_objects.take_stage_updates() {
         let mut applied = false;
 
@@ -2815,10 +2883,22 @@ pub fn apply_rgp_stage(
 pub fn animate_stage_tween(
     time: Res<Time>,
     mut stage_tween: ResMut<StageTween>,
-    mut plane_warp: ResMut<TerminalPlaneWarp>,
+    mut plane_warp: Query<&mut TerminalPlaneWarp>,
     mut plane_view: ResMut<TerminalPlaneView>,
     mut redraw: ResMut<TerminalRedrawState>,
 ) {
+    let mut plane_warp = match plane_warp.single_mut() {
+        Ok(plane_warp) => plane_warp,
+        Err(err) => {
+            // Latched once per process: the warp lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!(
+                "animate_stage_tween: the plane warp needs exactly one terminal seat: {err}"
+            );
+            return;
+        }
+    };
     if !stage_tween.active {
         return;
     }
@@ -2910,7 +2990,7 @@ pub(crate) struct CursorSyncParams<'w, 's> {
     viewport: Query<'w, 's, &'static TerminalViewport>,
     presentation: Res<'w, TerminalPresentation>,
     mobius_transition: Res<'w, MobiusTransition>,
-    plane_warp: Res<'w, TerminalPlaneWarp>,
+    plane_warp: Query<'w, 's, &'static TerminalPlaneWarp>,
     time: Res<'w, Time>,
     plane_query: Query<'w, 's, &'static Transform, (With<TerminalPlane>, Without<CursorModel>)>,
     query: CursorTransformQuery<'w, 's>,
@@ -2946,6 +3026,18 @@ pub(crate) fn sync_asset_to_terminal_cursor(mut params: CursorSyncParams) {
             // finding).
             warn_once!(
                 "sync_asset_to_terminal_cursor: the viewport needs exactly one terminal seat: {err}"
+            );
+            return;
+        }
+    };
+    let plane_warp = match plane_warp.single() {
+        Ok(plane_warp) => plane_warp,
+        Err(err) => {
+            // Latched once per process: the warp lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!(
+                "sync_asset_to_terminal_cursor: the plane warp needs exactly one terminal seat: {err}"
             );
             return;
         }
@@ -3763,12 +3855,14 @@ mod single_plane_degrade_tests {
         world.insert_resource(
             TerminalSurface::new(&AppConfig::default()).expect("surface construction is CPU-only"),
         );
-        world.spawn(TerminalViewport {
-            size: Vec2::new(800.0, 480.0),
-            center: Vec2::ZERO,
-        });
+        world.spawn((
+            TerminalViewport {
+                size: Vec2::new(800.0, 480.0),
+                center: Vec2::ZERO,
+            },
+            TerminalPlaneWarp::default(),
+        ));
         world.insert_resource(TerminalPresentation { mode });
-        world.insert_resource(TerminalPlaneWarp::default());
         world.init_resource::<Time>();
     }
 

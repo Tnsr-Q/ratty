@@ -335,7 +335,7 @@ pub fn answer_queries(
     inline_objects: Res<TerminalInlineObjects>,
     diagnostics: Res<AiDiagnostics>,
     presentation: Res<TerminalPresentation>,
-    plane_warp: Res<TerminalPlaneWarp>,
+    plane_warp: Query<&TerminalPlaneWarp>,
     plane_view: Res<TerminalPlaneView>,
     stage_tween: Res<StageTween>,
     cursor: Res<CursorSettings>,
@@ -364,6 +364,19 @@ pub fn answer_queries(
         );
     }
 
+    // Resolved after the ack relay: acks never read the seat, so they keep
+    // flowing even in a seatless (broken) world.
+    let plane_warp = match plane_warp.single() {
+        Ok(plane_warp) => plane_warp,
+        Err(err) => {
+            // Latched once per process: the warp lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!("answer_queries: the plane warp needs exactly one terminal seat: {err}");
+            return;
+        }
+    };
+
     for QueryRequest { source, item } in queries.read() {
         match item {
             QueryItem::Error(error) => {
@@ -383,7 +396,7 @@ pub fn answer_queries(
                     inline_objects: &inline_objects,
                     diagnostics: &diagnostics,
                     presentation: &presentation,
-                    plane_warp: &plane_warp,
+                    plane_warp,
                     plane_view: &plane_view,
                     stage_tween: &stage_tween,
                     cursor: &cursor,
@@ -1149,7 +1162,7 @@ mod tests {
         app.insert_resource(TerminalPresentation {
             mode: TerminalPresentationMode::Flat2d,
         });
-        app.init_resource::<TerminalPlaneWarp>();
+        app.world_mut().spawn(TerminalPlaneWarp::default());
         app.init_resource::<TerminalPlaneView>();
         app.init_resource::<StageTween>();
         app.add_message::<AppExit>();
@@ -1902,7 +1915,12 @@ mod tests {
     fn closed_loop_bookmark_store_read_jump_over_777_and_778() {
         let (mut app, host) = test_app();
         // Warp the view so the stored snapshot has something to remember.
-        app.world_mut().resource_mut::<TerminalPlaneWarp>().amount = 0.5;
+        let world = app.world_mut();
+        let mut warp_query = world.query::<&mut TerminalPlaneWarp>();
+        warp_query
+            .single_mut(world)
+            .expect("exactly one terminal seat")
+            .amount = 0.5;
         host.feed_tx
             .send(b"\x1b]777;ratty:bookmark;name=dock&tok=b1\x07".to_vec())
             .expect("virtual feed accepts bytes");
@@ -1931,7 +1949,12 @@ mod tests {
         // Change the live view, then jump back: the relowered commands
         // land on the normal AiCommand stream (the mode/warp appliers are
         // exercised by their own tests; here the loop pins the plumbing).
-        app.world_mut().resource_mut::<TerminalPlaneWarp>().amount = 0.75;
+        let world = app.world_mut();
+        let mut warp_query = world.query::<&mut TerminalPlaneWarp>();
+        warp_query
+            .single_mut(world)
+            .expect("exactly one terminal seat")
+            .amount = 0.75;
         app.world_mut()
             .resource_mut::<Messages<AiCommand>>()
             .clear();

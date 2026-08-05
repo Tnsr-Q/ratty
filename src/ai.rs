@@ -179,7 +179,7 @@ impl Plugin for RattyAiPlugin {
 pub fn apply_ai_commands(
     mut commands: MessageReader<AiCommand>,
     mut presentation: ResMut<TerminalPresentation>,
-    mut plane_warp: ResMut<TerminalPlaneWarp>,
+    mut plane_warp: Query<&mut TerminalPlaneWarp>,
     mut plane_view: ResMut<TerminalPlaneView>,
     mut mobius: ResMut<MobiusTransition>,
     mut stage_tween: ResMut<StageTween>,
@@ -189,6 +189,17 @@ pub fn apply_ai_commands(
 ) {
     use crate::query::codes;
     use crate::query_channel::{ack_commit, reject};
+
+    let mut plane_warp = match plane_warp.single_mut() {
+        Ok(plane_warp) => plane_warp,
+        Err(err) => {
+            // Latched once per process: the warp lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!("apply_ai_commands: the plane warp needs exactly one terminal seat: {err}");
+            return;
+        }
+    };
 
     for AiCommand {
         source,
