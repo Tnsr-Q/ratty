@@ -2551,9 +2551,21 @@ pub fn animate_terminal_plane_warp(
     presentation: Res<TerminalPresentation>,
     mobius_transition: Res<MobiusTransition>,
     warp: Res<TerminalPlaneWarp>,
-    plane_meshes: Res<TerminalPlaneMeshes>,
+    plane_meshes: Query<&TerminalPlaneMeshes>,
     mut meshes: ResMut<Assets<Mesh>>,
 ) {
+    let plane_meshes = match plane_meshes.single() {
+        Ok(plane_meshes) => plane_meshes,
+        Err(err) => {
+            // Latched once per process: the warp writes THE seat's meshes,
+            // and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!(
+                "animate_terminal_plane_warp: plane meshes need exactly one terminal seat: {err}"
+            );
+            return;
+        }
+    };
     if presentation.mode == TerminalPresentationMode::Flat2d {
         return;
     }

@@ -41,7 +41,7 @@ pub struct TerminalPlaneBack;
 pub struct TerminalPlaneCamera;
 
 /// Handles for terminal plane meshes.
-#[derive(Resource)]
+#[derive(Component)]
 pub struct TerminalPlaneMeshes {
     /// Front plane mesh.
     pub front: Handle<Mesh>,
@@ -382,7 +382,11 @@ pub(crate) fn setup_scene(mut params: SetupSceneParams) {
 
     let front_mesh = meshes.add(terminal_plane_mesh(32, 20));
     let back_mesh = meshes.add(terminal_plane_mesh(32, 20));
-    commands.insert_resource(TerminalPlaneMeshes {
+    // The terminal seat: the one entity that accretes the per-terminal
+    // components as the M4.2 swaps land. Exactly one is ever spawned; the
+    // seat-count tests assert that explicitly (#54: nothing strips a second
+    // seat once the types stop being Resources).
+    commands.spawn(TerminalPlaneMeshes {
         front: front_mesh.clone(),
         back: back_mesh.clone(),
     });
@@ -672,6 +676,39 @@ fn terminal_plane_mesh(x_segments: u32, y_segments: u32) -> Mesh {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The M4.2 seat test: runs the REAL spawner (`setup_scene`) in a scaffold
+    /// world and asserts exactly one entity carries each swapped component —
+    /// the #54 rider (once a type stops being a Resource, nothing strips a
+    /// second seat; the count is asserted, never assumed). Each swap commit
+    /// extends the tuple query below with its type.
+    #[test]
+    fn setup_scene_spawns_exactly_one_terminal_seat() {
+        use bevy::ecs::system::RunSystemOnce;
+
+        let mut world = World::new();
+        world.insert_resource(AppConfig::default());
+        world.init_resource::<Assets<Mesh>>();
+        world.init_resource::<Assets<StandardMaterial>>();
+        world.init_resource::<Assets<Image>>();
+        world.init_resource::<Assets<TerminalPresentMaterial>>();
+        let (runtime, _host) = TerminalRuntime::virtual_channel(&AppConfig::default());
+        world.insert_resource(runtime);
+        world.insert_resource(
+            TerminalSurface::new(&AppConfig::default()).expect("surface construction is CPU-only"),
+        );
+        world.spawn((Window::default(), bevy::window::PrimaryWindow));
+
+        world
+            .run_system_once(setup_scene)
+            .expect("setup_scene should run");
+
+        assert_eq!(
+            world.query::<&TerminalPlaneMeshes>().iter(&world).count(),
+            1,
+            "setup_scene spawns exactly one terminal seat"
+        );
+    }
 
     fn fixtures() -> (TerminalPresentation, TerminalPlaneView, MobiusTransition) {
         (
