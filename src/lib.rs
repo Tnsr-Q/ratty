@@ -19,6 +19,7 @@ pub mod config;
 mod direct_render;
 pub mod effects;
 mod fonts;
+pub mod identity;
 pub mod inline;
 pub mod keyboard;
 pub mod kitty;
