@@ -25,7 +25,7 @@ use crate::direct_render::{
 use crate::identity::{TerminalIdentity, TerminalRegistry};
 use crate::inline::TerminalInlineObjects;
 use crate::present::{TerminalPresentMaterial, fullscreen_quad};
-use crate::runtime::TerminalRuntime;
+use crate::runtime::{IngressSource, TerminalRuntime};
 use crate::systems::TerminalFrameDirty;
 use crate::terminal::{
     TerminalLayout, TerminalRedrawState, TerminalSurface, render_scale_for_window,
@@ -284,7 +284,7 @@ pub struct TerminalOwner(pub Entity);
 /// Systems register at `Plugin::build`, so per-terminal construction is a
 /// FUNCTION over this bundle, never N system instances (#58 rider).
 #[derive(SystemParam)]
-pub(crate) struct TerminalSpawnParams<'w, 's> {
+pub struct TerminalSpawnParams<'w, 's> {
     pub(crate) commands: Commands<'w, 's>,
     terminals: ResMut<'w, TerminalRegistry>,
     app_config: Res<'w, AppConfig>,
@@ -557,6 +557,65 @@ pub(crate) fn dress_terminal_seat(
     ));
 
     image_handle
+}
+
+/// Failure modes of [`spawn_terminal`].
+#[derive(Debug)]
+pub enum SpawnTerminalError<E> {
+    /// The 128-slot namespace pool is exhausted — reported explicitly,
+    /// never masked by minting past the wire's `& 0x7F` width.
+    Alloc(crate::identity::TerminalAllocError),
+    /// Transport construction failed. The allocated lease was released
+    /// before this was returned, so a failed spawn can never leak a
+    /// namespace slot.
+    Build(E),
+}
+
+/// Spawns and dresses a fresh terminal seat: allocates its identity,
+/// builds its transport through `build`, spawns the seat with the
+/// identity aboard, and runs the same [`dress_terminal_seat`] the boot
+/// seat goes through. Returns the seat and its minted identity.
+///
+/// `build` receives ONLY the ingress stamp — #12's no-runtime-arguments
+/// is structural: `RuntimeOptions` never enters this signature, and the
+/// wire path uses config defaults. On build failure the lease is
+/// released before the error propagates, so a leaked namespace on
+/// transport failure is impossible by construction.
+///
+/// This is the dynamic entry (M4.5's wire loop, and the N=2 tests). It
+/// is a function, not a system: systems register at `Plugin::build`, so
+/// dynamic multiplicity must live in data reached from one system
+/// (#58 rider).
+///
+/// # Errors
+///
+/// [`SpawnTerminalError::Alloc`] on pool exhaustion;
+/// [`SpawnTerminalError::Build`] when `build` fails (lease restored).
+pub fn spawn_terminal<E>(
+    params: &mut TerminalSpawnParams,
+    build: impl FnOnce(IngressSource) -> Result<(TerminalSurface, TerminalRuntime), E>,
+) -> Result<(Entity, TerminalIdentity), SpawnTerminalError<E>> {
+    let identity = params
+        .terminals
+        .allocate()
+        .map_err(SpawnTerminalError::Alloc)?;
+    let (mut surface, mut runtime) = match build(identity.ingress()) {
+        Ok(parts) => parts,
+        Err(error) => {
+            params
+                .terminals
+                .release(identity.id())
+                .expect("the just-allocated lease is live");
+            return Err(SpawnTerminalError::Build(error));
+        }
+    };
+    // The seat is born carrying its identity, then dressed in the same
+    // command batch — the publisher can never observe a seat without its
+    // mailbox (commands apply atomically).
+    let seat = params.commands.spawn(identity).id();
+    dress_terminal_seat(params, seat, identity, &mut surface, &mut runtime);
+    params.commands.entity(seat).insert((surface, runtime));
+    Ok((seat, identity))
 }
 
 /// Synchronizes Bevy presentation entities to the terminal texture layout.
@@ -931,6 +990,189 @@ mod tests {
                 .count(),
             1,
             "the swapped components co-locate on the one seat"
+        );
+    }
+
+    /// Scaffold world for the spawner-path tests. Deliberately NOT
+    /// `TerminalPlugin`: the M4.1-era `.single()` systems
+    /// (`pump_pty_output`, `sync_terminal_materials`) stay single-seat
+    /// until M4.4's loop conversion and would latch "exactly one terminal
+    /// seat" warns in an N=2 world.
+    fn spawner_world() -> World {
+        let mut world = World::new();
+        world.insert_resource(AppConfig::default());
+        world.init_resource::<Assets<Mesh>>();
+        world.init_resource::<Assets<StandardMaterial>>();
+        world.init_resource::<Assets<Image>>();
+        world.insert_resource(TerminalRegistry::default());
+        world.spawn((Window::default(), bevy::window::PrimaryWindow));
+        world
+    }
+
+    /// One real spawner call over the virtual transport, as a system so
+    /// the `TerminalSpawnParams` bundle is exercised exactly as M4.5's
+    /// wire loop will exercise it.
+    fn spawn_virtual_terminal(mut params: TerminalSpawnParams) -> (Entity, TerminalIdentity) {
+        spawn_terminal(&mut params, |source| {
+            let (runtime, _host) = TerminalRuntime::virtual_channel(&AppConfig::default(), source);
+            Ok::<_, std::convert::Infallible>((
+                TerminalSurface::new(&AppConfig::default())
+                    .expect("surface construction is CPU-only"),
+                runtime,
+            ))
+        })
+        .expect("the scaffold spawn succeeds")
+    }
+
+    /// The M4.3 exit-criteria test: two DirectTerminalSceneExchange
+    /// instances coexist — two seats through the REAL spawner, seat count
+    /// asserted explicitly (#58 rider), distinct slots (the Arc::ptr_eq
+    /// assertion alone kills the clone-shaped false PASS — do not drop it
+    /// as redundant), per-seat publish/take with no cross-talk, and each
+    /// parser stamping its own identity.
+    #[test]
+    fn two_seats_two_exchanges_no_cross_talk() {
+        use bevy::ecs::system::RunSystemOnce;
+
+        let mut world = spawner_world();
+        let (seat_a, id_a) = world
+            .run_system_once(spawn_virtual_terminal)
+            .expect("spawner system runs");
+        let (seat_b, id_b) = world
+            .run_system_once(spawn_virtual_terminal)
+            .expect("spawner system runs");
+
+        // (1) Two seats, count asserted explicitly — never assumed.
+        assert_eq!(
+            world
+                .query::<(
+                    &TerminalIdentity,
+                    &TerminalSurface,
+                    &DirectTerminalSceneExchange
+                )>()
+                .iter(&world)
+                .count(),
+            2,
+            "exactly two dressed seats coexist"
+        );
+
+        // (2) Identities: monotonic ids, never reused; lowest-free slots.
+        assert_ne!(id_a.id(), id_b.id(), "TerminalIds never repeat");
+        assert_eq!(
+            (id_a.id(), id_a.namespace(), id_b.id(), id_b.namespace()),
+            (
+                crate::identity::TerminalId::from_raw(1),
+                0,
+                crate::identity::TerminalId::from_raw(2),
+                1
+            ),
+            "the two allocations are (1, ns 0) and (2, ns 1)"
+        );
+
+        // (3) Two mailboxes, two slots: the clone-shaped false PASS —
+        // inserting a cloned exchange compiles and passes every count
+        // test while sharing ONE inner slot (#54) — dies here.
+        let exchange_a = world
+            .entity(seat_a)
+            .get::<DirectTerminalSceneExchange>()
+            .expect("seat A carries its mailbox")
+            .clone();
+        let exchange_b = world
+            .entity(seat_b)
+            .get::<DirectTerminalSceneExchange>()
+            .expect("seat B carries its mailbox")
+            .clone();
+        assert!(
+            !DirectTerminalSceneExchange::same_slot(&exchange_a, &exchange_b),
+            "each seat's exchange is a fresh slot, never a clone of another's"
+        );
+
+        // (4) Publish distinguishable frames; each take yields its OWN.
+        exchange_a.publish_test_frame(101);
+        exchange_b.publish_test_frame(202);
+        assert_eq!(
+            exchange_a.take_pending_width(),
+            Some(101),
+            "A's mailbox yields A's frame"
+        );
+        assert_eq!(
+            exchange_b.take_pending_width(),
+            Some(202),
+            "B's mailbox yields B's frame"
+        );
+
+        // (5) Single-slot semantics preserved per terminal.
+        assert_eq!(exchange_a.take_pending_width(), None);
+        assert_eq!(exchange_b.take_pending_width(), None);
+
+        // (6) Each parser stamps its own identity: real OSC 777 bytes in,
+        // stamped commands out.
+        for (seat, identity) in [(seat_a, id_a), (seat_b, id_b)] {
+            let mut runtime = world
+                .get_mut::<TerminalRuntime>(seat)
+                .expect("the seat carries its runtime");
+            runtime.parser.process(b"\x1b]777;ratty:mode;3d\x07");
+            let commands = runtime.parser.callbacks_mut().take_ai_commands();
+            assert_eq!(commands.len(), 1, "one command parsed");
+            assert_eq!(
+                commands[0].0,
+                identity.ingress(),
+                "the parser stamps the seat's OWN identity"
+            );
+        }
+
+        // Each seat also owns its pair of plane entities.
+        let owners: Vec<_> = world
+            .query::<&TerminalOwner>()
+            .iter(&world)
+            .copied()
+            .collect();
+        assert_eq!(owners.len(), 4, "two planes per seat, four total");
+        for seat in [seat_a, seat_b] {
+            assert_eq!(
+                owners.iter().filter(|owner| owner.0 == seat).count(),
+                2,
+                "front and back planes are stamped with their seat"
+            );
+        }
+    }
+
+    /// A failed transport build must release the lease (the pool is
+    /// restored) while the consumed TerminalId is skipped forever —
+    /// recycling is namespace-only.
+    #[test]
+    fn a_failed_transport_build_releases_the_namespace_lease() {
+        use bevy::ecs::system::RunSystemOnce;
+
+        let mut world = spawner_world();
+        let result = world
+            .run_system_once(|mut params: TerminalSpawnParams| {
+                spawn_terminal(&mut params, |_source| {
+                    Err::<(TerminalSurface, TerminalRuntime), &str>("transport refused")
+                })
+            })
+            .expect("spawner system runs");
+        assert!(
+            matches!(result, Err(SpawnTerminalError::Build("transport refused"))),
+            "the build error propagates untouched"
+        );
+        assert_eq!(
+            world.query::<&TerminalIdentity>().iter(&world).count(),
+            0,
+            "no seat was born from the failed spawn"
+        );
+
+        let mut registry = world.resource_mut::<TerminalRegistry>();
+        let next = registry.allocate().expect("the released slot is back");
+        assert_eq!(
+            next.namespace(),
+            0,
+            "the failed spawn's namespace lease came back to the pool"
+        );
+        assert_eq!(
+            next.id(),
+            crate::identity::TerminalId::from_raw(2),
+            "the TerminalId consumed by the failed spawn is skipped, never reissued"
         );
     }
 
