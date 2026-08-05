@@ -336,7 +336,7 @@ pub struct KeyboardSystemParams<'w, 's> {
     stage_tween: ResMut<'w, StageTween>,
     clipboard: NonSendMut<'w, TerminalClipboard>,
     runtime: ResMut<'w, TerminalRuntime>,
-    terminal: ResMut<'w, TerminalSurface>,
+    terminal: Query<'w, 's, &'static mut TerminalSurface>,
     primary_window: Query<'w, 's, &'static Window, With<PrimaryWindow>>,
     viewport: Query<'w, 's, &'static mut TerminalViewport>,
     plane_query: TerminalPlaneLayoutQuery<'w, 's>,
@@ -352,6 +352,16 @@ pub fn handle_keyboard_input(
     mut keyboard: Local<TerminalKeyboard>,
     mut params: KeyboardSystemParams,
 ) {
+    let mut terminal = match params.terminal.single_mut() {
+        Ok(terminal) => terminal,
+        Err(err) => {
+            // Latched once per process: the surface lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!("handle_keyboard_input: the surface needs exactly one terminal seat: {err}");
+            return;
+        }
+    };
     for event in keyboard_events.read() {
         let binding_key_code = navigation_key_code(&event.logical_key).unwrap_or(event.key_code);
         let modifiers = current_modifiers(&params.keys).union(keyboard.modifiers());
@@ -417,7 +427,7 @@ pub fn handle_keyboard_input(
                 | BindingAction::ScrollDown => {
                     let amount = match action {
                         BindingAction::ScrollPageUp | BindingAction::ScrollPageDown => {
-                            usize::from(params.terminal.rows.saturating_sub(1).max(1))
+                            usize::from(terminal.rows.saturating_sub(1).max(1))
                         }
                         BindingAction::ScrollUp | BindingAction::ScrollDown => 1,
                         _ => unreachable!(),
@@ -509,12 +519,12 @@ pub fn handle_keyboard_input(
                 | BindingAction::DecreaseFontSize
                 | BindingAction::ResetFontSize => {
                     let resized = match action {
-                        BindingAction::IncreaseFontSize => params.terminal.adjust_font_size(1),
-                        BindingAction::DecreaseFontSize => params.terminal.adjust_font_size(-1),
+                        BindingAction::IncreaseFontSize => terminal.adjust_font_size(1),
+                        BindingAction::DecreaseFontSize => terminal.adjust_font_size(-1),
                         BindingAction::ResetFontSize => {
                             let target = FontConfig::default().size;
-                            let delta = target - params.terminal.font_size();
-                            delta != 0 && params.terminal.adjust_font_size(delta)
+                            let delta = target - terminal.font_size();
+                            delta != 0 && terminal.adjust_font_size(delta)
                         }
                         _ => false,
                     };
@@ -522,7 +532,7 @@ pub fn handle_keyboard_input(
                         let Ok(window) = params.primary_window.single() else {
                             continue;
                         };
-                        let layout = params.terminal.resize_to_fit(
+                        let layout = terminal.resize_to_fit(
                             window.resolution.size().max(Vec2::ONE),
                             render_scale_for_window(window),
                         );

@@ -924,7 +924,7 @@ pub(crate) struct PresenceMarkerParams<'w, 's> {
     commands: Commands<'w, 's>,
     time: Res<'w, Time>,
     registry: Res<'w, PresenceRegistry>,
-    terminal: Res<'w, TerminalSurface>,
+    terminal: Query<'w, 's, &'static TerminalSurface>,
     viewport: Query<'w, 's, &'static TerminalViewport>,
     presentation: Res<'w, TerminalPresentation>,
     mobius_transition: Res<'w, MobiusTransition>,
@@ -961,6 +961,18 @@ pub(crate) fn sync_presence_cursor_markers(mut params: PresenceMarkerParams) {
         materials,
         marker_mesh,
     } = &mut params;
+    let terminal = match terminal.single() {
+        Ok(terminal) => terminal,
+        Err(err) => {
+            // Latched once per process: the surface lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!(
+                "sync_presence_cursor_markers: the surface needs exactly one terminal seat: {err}"
+            );
+            return;
+        }
+    };
     let viewport = match viewport.single() {
         Ok(viewport) => viewport,
         Err(err) => {
@@ -2265,10 +2277,8 @@ mod tests {
         // The plane resolution runs before the roster loop, so an empty
         // registry reaches it (run_system_once also bypasses the run_if).
         world.init_resource::<PresenceRegistry>();
-        world.insert_resource(
-            TerminalSurface::new(&AppConfig::default()).expect("surface construction is CPU-only"),
-        );
         world.spawn((
+            TerminalSurface::new(&AppConfig::default()).expect("surface construction is CPU-only"),
             TerminalViewport {
                 size: Vec2::new(800.0, 480.0),
                 center: Vec2::ZERO,

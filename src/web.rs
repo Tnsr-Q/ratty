@@ -340,7 +340,6 @@ pub fn start(canvas_selector: &str, config_toml: Option<String>) -> Result<Ratty
     )))
     .insert_resource(app_config.clone())
     .insert_resource(runtime)
-    .insert_resource(terminal)
     .insert_resource(controls)
     // Continuous updates: transmissions animate even without input focus.
     .insert_resource(WinitSettings::continuous())
@@ -392,6 +391,11 @@ pub fn start(canvas_selector: &str, config_toml: Option<String>) -> Result<Ratty
         Update,
         expire_query_promises.after(crate::query_channel::answer_queries),
     );
+
+    // The terminal seat is born here, where the surface value is born;
+    // setup_scene finds it at Startup and dresses it with the world-derived
+    // per-terminal components. Nothing runs between this spawn and run().
+    app.world_mut().spawn(terminal);
 
     // Bevy's winit runner on wasm spawns onto the browser event loop and
     // returns, so the session handle is live after this call.

@@ -74,7 +74,13 @@ impl TerminalRedrawState {
 }
 
 /// Terminal surface and render state.
-#[derive(Resource)]
+///
+/// `derive(Resource)` pinned SparseSet storage; a plain `derive(Component)`
+/// silently defaults to Table, which memcpys the owned [`TerminalRenderer`]
+/// on every archetype move (#54). The attribute keeps the storage explicit
+/// and the storage test below proves it.
+#[derive(Component)]
+#[component(storage = "SparseSet")]
 pub struct TerminalSurface {
     /// Ratatui terminal backend.
     pub tui: Terminal<ParleyBackend>,
@@ -560,6 +566,28 @@ fn ansi_index_to_tui(index: u8, theme_palette: &[TuiColor; 16]) -> TuiColor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The M4.2 storage rider (#54): `derive(Resource)` pinned SparseSet and
+    /// a plain `derive(Component)` silently flips to Table — memcpy of the
+    /// owned `TerminalRenderer` on every archetype move. Prove the attribute
+    /// holds, at compile time and against a live world's component registry.
+    #[test]
+    fn terminal_surface_storage_is_sparse_set() {
+        use bevy::ecs::component::{Component as EcsComponent, StorageType};
+
+        const _: () = assert!(matches!(
+            <TerminalSurface as EcsComponent>::STORAGE_TYPE,
+            StorageType::SparseSet
+        ));
+
+        let mut world = World::new();
+        let component_id = world.register_component::<TerminalSurface>();
+        let info = world
+            .components()
+            .get_info(component_id)
+            .expect("the component was just registered");
+        assert_eq!(info.storage_type(), StorageType::SparseSet);
+    }
 
     /// Regression test for vertical-only zoom steps (#97): with fractional
     /// cell quantization, every font-size step must grow both axes.

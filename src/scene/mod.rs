@@ -275,7 +275,7 @@ pub(crate) struct SetupSceneParams<'w, 's> {
     present_materials: ResMut<'w, Assets<TerminalPresentMaterial>>,
     primary_window: Query<'w, 's, &'static Window, With<PrimaryWindow>>,
     runtime: ResMut<'w, TerminalRuntime>,
-    terminal: ResMut<'w, TerminalSurface>,
+    terminal: Query<'w, 's, (Entity, &'static mut TerminalSurface)>,
 }
 
 /// Sets up the terminal presentation scene.
@@ -294,6 +294,10 @@ pub(crate) fn setup_scene(mut params: SetupSceneParams) {
         runtime,
         terminal,
     } = &mut params;
+    // Fatal, like the primary-window expect below: setup_scene is a
+    // constructor, and a world without exactly one terminal seat (spawned by
+    // main()/start() with the surface aboard) is a broken world.
+    let (host, mut terminal) = terminal.single_mut().expect("exactly one terminal seat");
     let terminal_opacity = app_config.window.opacity.clamp(0.0, 1.0);
     let window = primary_window.single().expect("primary window");
     let window_size = window.resolution.size().max(Vec2::ONE);
@@ -380,11 +384,13 @@ pub(crate) fn setup_scene(mut params: SetupSceneParams) {
 
     let front_mesh = meshes.add(terminal_plane_mesh(32, 20));
     let back_mesh = meshes.add(terminal_plane_mesh(32, 20));
-    // The terminal seat: the one entity that accretes the per-terminal
-    // components as the M4.2 swaps land. Exactly one is ever spawned; the
-    // seat-count tests assert that explicitly (#54: nothing strips a second
-    // seat once the types stop being Resources).
-    commands.spawn((
+    // The terminal seat: main()/start() spawn the one entity with the
+    // externally-constructed surface aboard, and this constructor dresses
+    // THAT entity with the world-derived per-terminal components. Exactly
+    // one seat ever exists; the seat-count tests assert that explicitly
+    // (#54: nothing strips a second seat once the types stop being
+    // Resources).
+    commands.entity(host).insert((
         TerminalPlaneMeshes {
             front: front_mesh.clone(),
             back: back_mesh.clone(),
@@ -700,9 +706,14 @@ mod tests {
         world.init_resource::<Assets<TerminalPresentMaterial>>();
         let (runtime, _host) = TerminalRuntime::virtual_channel(&AppConfig::default());
         world.insert_resource(runtime);
-        world.insert_resource(
-            TerminalSurface::new(&AppConfig::default()).expect("surface construction is CPU-only"),
-        );
+        // Mirror main()/start(): the seat is born pre-run with the surface
+        // aboard; setup_scene must dress THIS entity, not spawn another.
+        let seat = world
+            .spawn(
+                TerminalSurface::new(&AppConfig::default())
+                    .expect("surface construction is CPU-only"),
+            )
+            .id();
         world.spawn((Window::default(), bevy::window::PrimaryWindow));
 
         world
@@ -710,9 +721,23 @@ mod tests {
             .expect("setup_scene should run");
 
         assert_eq!(
+            world.query::<&TerminalSurface>().iter(&world).count(),
+            1,
+            "exactly one seat carries the surface"
+        );
+        assert_eq!(
             world.query::<&TerminalPlaneMeshes>().iter(&world).count(),
             1,
-            "setup_scene spawns exactly one terminal seat"
+            "setup_scene dresses exactly one terminal seat"
+        );
+        assert_eq!(
+            world
+                .query::<(Entity, &TerminalPlaneMeshes)>()
+                .single(&world)
+                .expect("exactly one dressed seat")
+                .0,
+            seat,
+            "setup_scene dressed the pre-spawned seat, not a new entity"
         );
         assert_eq!(
             world.query::<&TerminalFrameDirty>().iter(&world).count(),
@@ -737,6 +762,7 @@ mod tests {
         assert_eq!(
             world
                 .query::<(
+                    &TerminalSurface,
                     &TerminalPlaneMeshes,
                     &TerminalFrameDirty,
                     &TerminalViewport,

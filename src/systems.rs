@@ -383,7 +383,7 @@ mod pump_disconnect_tests {
 pub(crate) struct ResizeParams<'w, 's> {
     primary_window: Query<'w, 's, (Entity, &'static Window), With<PrimaryWindow>>,
     runtime: ResMut<'w, TerminalRuntime>,
-    terminal: ResMut<'w, TerminalSurface>,
+    terminal: Query<'w, 's, &'static mut TerminalSurface>,
     redraw: ResMut<'w, TerminalRedrawState>,
     viewport: Query<'w, 's, &'static mut TerminalViewport>,
     plane_query: TerminalPlaneLayoutQuery<'w, 's>,
@@ -418,6 +418,16 @@ pub(crate) fn handle_window_resize(
             // seat, and the miss must name its system (#54's silent-.single()
             // finding).
             warn_once!("handle_window_resize: the viewport needs exactly one terminal seat: {err}");
+            return;
+        }
+    };
+    let mut terminal = match terminal.single_mut() {
+        Ok(terminal) => terminal,
+        Err(err) => {
+            // Latched once per process: the surface lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!("handle_window_resize: the surface needs exactly one terminal seat: {err}");
             return;
         }
     };
@@ -513,7 +523,7 @@ pub(crate) struct RenderWidgetParams<'w, 's> {
     app_config: Res<'w, AppConfig>,
     cursor_settings: Res<'w, CursorSettings>,
     runtime: Res<'w, TerminalRuntime>,
-    terminal: ResMut<'w, TerminalSurface>,
+    terminal: Query<'w, 's, &'static mut TerminalSurface>,
     selection: Res<'w, TerminalSelection>,
     time: Res<'w, Time>,
     redraw: ResMut<'w, TerminalRedrawState>,
@@ -548,6 +558,18 @@ pub(crate) fn render_terminal_widget(mut params: RenderWidgetParams) {
         presence,
         blink_phase,
     } = &mut params;
+    let mut terminal = match terminal.single_mut() {
+        Ok(terminal) => terminal,
+        Err(err) => {
+            // Latched once per process: the surface lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!(
+                "render_terminal_widget: the surface needs exactly one terminal seat: {err}"
+            );
+            return;
+        }
+    };
     let mut frame_dirty = match frame_dirty.single_mut() {
         Ok(frame_dirty) => frame_dirty,
         Err(err) => {
@@ -606,7 +628,7 @@ pub(crate) fn render_terminal_widget(mut params: RenderWidgetParams) {
 #[derive(SystemParam)]
 pub(crate) struct SyncMaterialsParams<'w, 's> {
     runtime: Res<'w, TerminalRuntime>,
-    terminal: Res<'w, TerminalSurface>,
+    terminal: Query<'w, 's, &'static TerminalSurface>,
     presentation: Res<'w, TerminalPresentation>,
     images: ResMut<'w, Assets<Image>>,
     materials: ResMut<'w, Assets<StandardMaterial>>,
@@ -640,6 +662,18 @@ pub(crate) fn sync_terminal_materials(mut params: SyncMaterialsParams) {
         present_query,
         frame_dirty,
     } = &mut params;
+    let terminal = match terminal.single() {
+        Ok(terminal) => terminal,
+        Err(err) => {
+            // Latched once per process: the surface lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!(
+                "sync_terminal_materials: the surface needs exactly one terminal seat: {err}"
+            );
+            return;
+        }
+    };
     let frame_dirty = match frame_dirty.single() {
         Ok(frame_dirty) => frame_dirty,
         Err(err) => {
@@ -812,7 +846,7 @@ pub(crate) fn respawn_cursor_model(mut params: RespawnCursorParams) {
 pub(crate) struct SyncInlineParams<'w, 's> {
     commands: Commands<'w, 's>,
     inline_objects: Query<'w, 's, &'static mut TerminalInlineObjects>,
-    terminal: Res<'w, TerminalSurface>,
+    terminal: Query<'w, 's, &'static TerminalSurface>,
     viewport: Query<'w, 's, &'static TerminalViewport>,
     presentation: Res<'w, TerminalPresentation>,
     plane_warp: Query<'w, 's, &'static TerminalPlaneWarp>,
@@ -854,6 +888,16 @@ pub(crate) fn sync_inline_objects(mut params: SyncInlineParams) {
         images,
         meshes,
     } = &mut params;
+    let terminal = match terminal.single() {
+        Ok(terminal) => terminal,
+        Err(err) => {
+            // Latched once per process: the surface lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!("sync_inline_objects: the surface needs exactly one terminal seat: {err}");
+            return;
+        }
+    };
     let viewport = match viewport.single() {
         Ok(viewport) => viewport,
         Err(err) => {
@@ -1431,7 +1475,7 @@ fn apply_brightness(material: &mut StandardMaterial, brightness: f32) {
 #[derive(SystemParam)]
 pub(crate) struct RgpSyncParams<'w, 's> {
     app_config: Res<'w, AppConfig>,
-    terminal: Res<'w, TerminalSurface>,
+    terminal: Query<'w, 's, &'static TerminalSurface>,
     viewport: Query<'w, 's, &'static TerminalViewport>,
     presentation: Res<'w, TerminalPresentation>,
     mobius_transition: Res<'w, MobiusTransition>,
@@ -1472,6 +1516,16 @@ pub(crate) fn sync_rgp_objects(mut params: RgpSyncParams) {
         inline_objects,
         query,
     } = &mut params;
+    let terminal = match terminal.single() {
+        Ok(terminal) => terminal,
+        Err(err) => {
+            // Latched once per process: the surface lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!("sync_rgp_objects: the surface needs exactly one terminal seat: {err}");
+            return;
+        }
+    };
     let viewport = match viewport.single() {
         Ok(viewport) => viewport,
         Err(err) => {
@@ -2442,7 +2496,7 @@ type VizAnimatedQuery<'w, 's> = Query<
 #[derive(SystemParam)]
 pub(crate) struct VizSyncParams<'w, 's> {
     registry: Res<'w, VizRegistry>,
-    terminal: Res<'w, TerminalSurface>,
+    terminal: Query<'w, 's, &'static TerminalSurface>,
     viewport: Query<'w, 's, &'static TerminalViewport>,
     presentation: Res<'w, TerminalPresentation>,
     mobius_transition: Res<'w, MobiusTransition>,
@@ -2482,6 +2536,16 @@ pub(crate) fn sync_viz_objects(mut params: VizSyncParams) {
         plane_query,
         roots,
     } = &mut params;
+    let terminal = match terminal.single() {
+        Ok(terminal) => terminal,
+        Err(err) => {
+            // Latched once per process: the surface lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!("sync_viz_objects: the surface needs exactly one terminal seat: {err}");
+            return;
+        }
+    };
     let viewport = match viewport.single() {
         Ok(viewport) => viewport,
         Err(err) => {
@@ -3048,7 +3112,7 @@ pub(crate) struct CursorSyncParams<'w, 's> {
     app_config: Res<'w, AppConfig>,
     cursor_settings: Res<'w, CursorSettings>,
     runtime: Res<'w, TerminalRuntime>,
-    terminal: Res<'w, TerminalSurface>,
+    terminal: Query<'w, 's, &'static TerminalSurface>,
     viewport: Query<'w, 's, &'static TerminalViewport>,
     presentation: Res<'w, TerminalPresentation>,
     mobius_transition: Res<'w, MobiusTransition>,
@@ -3080,6 +3144,18 @@ pub(crate) fn sync_asset_to_terminal_cursor(mut params: CursorSyncParams) {
         plane_query,
         query,
     } = &mut params;
+    let terminal = match terminal.single() {
+        Ok(terminal) => terminal,
+        Err(err) => {
+            // Latched once per process: the surface lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!(
+                "sync_asset_to_terminal_cursor: the surface needs exactly one terminal seat: {err}"
+            );
+            return;
+        }
+    };
     let viewport = match viewport.single() {
         Ok(viewport) => viewport,
         Err(err) => {
@@ -3914,10 +3990,8 @@ mod single_plane_degrade_tests {
     }
 
     fn base_resources(world: &mut World, mode: TerminalPresentationMode) {
-        world.insert_resource(
-            TerminalSurface::new(&AppConfig::default()).expect("surface construction is CPU-only"),
-        );
         world.spawn((
+            TerminalSurface::new(&AppConfig::default()).expect("surface construction is CPU-only"),
             TerminalViewport {
                 size: Vec2::new(800.0, 480.0),
                 center: Vec2::ZERO,
