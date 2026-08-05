@@ -708,7 +708,10 @@ mod tests {
         world.init_resource::<Assets<StandardMaterial>>();
         world.init_resource::<Assets<Image>>();
         world.init_resource::<Assets<TerminalPresentMaterial>>();
-        let (runtime, _host) = TerminalRuntime::virtual_channel(&AppConfig::default());
+        let (runtime, _host) = TerminalRuntime::virtual_channel(
+            &AppConfig::default(),
+            crate::runtime::IngressSource::test_boot(),
+        );
         // Mirror main()/start(): the seat is born pre-run with the surface
         // and runtime aboard; setup_scene must dress THIS entity, not spawn
         // another.

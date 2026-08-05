@@ -49,8 +49,12 @@ impl SceneCapability {
     /// checks. [`AppConfig`] is loaded once at startup and is
     /// wire-immutable, so within a process the answer never changes.
     pub fn granted_to(self, source: IngressSource, config: &AppConfig) -> bool {
+        // Grants are per transport CLASS: `Local` remains ONE principal
+        // class (see the module doc), so the terminal identity inside the
+        // stamp is deliberately ignored here. The designed compile-break
+        // still fires on new *variants*.
         match source {
-            IngressSource::Local => match self {
+            IngressSource::Local(_) => match self {
                 SceneCapability::AvatarScene => config.trust.local.avatar_scene,
                 SceneCapability::SceneAmbient => config.audio.allow_scene_ambient,
             },
@@ -68,18 +72,18 @@ mod tests {
 
         config.trust.local.avatar_scene = true;
         config.audio.allow_scene_ambient = true;
-        assert!(SceneCapability::AvatarScene.granted_to(IngressSource::Local, &config));
-        assert!(SceneCapability::SceneAmbient.granted_to(IngressSource::Local, &config));
+        assert!(SceneCapability::AvatarScene.granted_to(IngressSource::test_boot(), &config));
+        assert!(SceneCapability::SceneAmbient.granted_to(IngressSource::test_boot(), &config));
 
         config.trust.local.avatar_scene = false;
         config.audio.allow_scene_ambient = false;
-        assert!(!SceneCapability::AvatarScene.granted_to(IngressSource::Local, &config));
-        assert!(!SceneCapability::SceneAmbient.granted_to(IngressSource::Local, &config));
+        assert!(!SceneCapability::AvatarScene.granted_to(IngressSource::test_boot(), &config));
+        assert!(!SceneCapability::SceneAmbient.granted_to(IngressSource::test_boot(), &config));
 
         // The two grants are independent bits.
         config.trust.local.avatar_scene = true;
-        assert!(SceneCapability::AvatarScene.granted_to(IngressSource::Local, &config));
-        assert!(!SceneCapability::SceneAmbient.granted_to(IngressSource::Local, &config));
+        assert!(SceneCapability::AvatarScene.granted_to(IngressSource::test_boot(), &config));
+        assert!(!SceneCapability::SceneAmbient.granted_to(IngressSource::test_boot(), &config));
     }
 
     #[test]
@@ -87,21 +91,21 @@ mod tests {
         // A single-tenant session directs its own scene — the
         // `allow_scene_ambient` posture.
         let config = AppConfig::default();
-        assert!(SceneCapability::AvatarScene.granted_to(IngressSource::Local, &config));
+        assert!(SceneCapability::AvatarScene.granted_to(IngressSource::test_boot(), &config));
     }
 
     #[test]
     fn trust_section_parses_and_revokes() {
         let config = AppConfig::from_toml_str("[trust.local]\navatar_scene = false\n")
             .expect("trust section parses");
-        assert!(!SceneCapability::AvatarScene.granted_to(IngressSource::Local, &config));
+        assert!(!SceneCapability::AvatarScene.granted_to(IngressSource::test_boot(), &config));
         // Unrelated grants are untouched by the [trust] section.
-        assert!(SceneCapability::SceneAmbient.granted_to(IngressSource::Local, &config));
+        assert!(SceneCapability::SceneAmbient.granted_to(IngressSource::test_boot(), &config));
     }
 
     #[test]
     fn absent_trust_section_defaults_cleanly() {
         let config = AppConfig::from_toml_str("").expect("empty config parses");
-        assert!(SceneCapability::AvatarScene.granted_to(IngressSource::Local, &config));
+        assert!(SceneCapability::AvatarScene.granted_to(IngressSource::test_boot(), &config));
     }
 }

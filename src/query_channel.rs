@@ -500,7 +500,7 @@ fn send_reply(
     // One transport per runtime today; the match keeps routing keyed to
     // the stamped ingress source so future transports cannot broadcast.
     match source {
-        IngressSource::Local => runtime.write_input(&bytes),
+        IngressSource::Local(_) => runtime.write_input(&bytes),
     }
 }
 
@@ -1165,7 +1165,7 @@ mod tests {
     /// chained so one `update()` is one closed loop.
     fn test_app() -> (App, VirtualTerminalHost) {
         let config = AppConfig::default();
-        let (runtime, host) = TerminalRuntime::virtual_channel(&config);
+        let (runtime, host) = TerminalRuntime::virtual_channel(&config, IngressSource::test_boot());
         let mut app = App::new();
         app.insert_resource(config);
         // The terminal seat, mirroring main()/setup_scene's spawns for the

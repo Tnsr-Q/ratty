@@ -1511,7 +1511,7 @@ mod tests {
         app.world_mut()
             .resource_mut::<Messages<AiCommand>>()
             .write(AiCommand {
-                source: IngressSource::Local,
+                source: IngressSource::test_boot(),
                 ack_token: Some("t".to_string()),
                 origin: crate::ai::CommandOrigin::Wire,
                 command,
@@ -1789,7 +1789,7 @@ mod tests {
         app.world_mut()
             .resource_mut::<Messages<AiCommand>>()
             .write(AiCommand {
-                source: IngressSource::Local,
+                source: IngressSource::test_boot(),
                 ack_token: Some("reset-tok".to_string()),
                 origin: crate::ai::CommandOrigin::Wire,
                 command: RattyAiCommand::Reset,

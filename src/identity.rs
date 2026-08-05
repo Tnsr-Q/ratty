@@ -66,6 +66,23 @@ impl TerminalIdentity {
     pub fn namespace(self) -> u8 {
         self.namespace
     }
+
+    /// The ingress context bytes arriving through this terminal's
+    /// transport are stamped with.
+    pub fn ingress(self) -> crate::runtime::IngressSource {
+        crate::runtime::IngressSource::Local(self)
+    }
+
+    /// Test-only boot identity: what the first
+    /// [`TerminalRegistry::allocate`] on a fresh registry mints
+    /// (`TerminalId` 1, namespace 0).
+    #[cfg(test)]
+    pub(crate) const fn test_boot() -> Self {
+        Self {
+            id: TerminalId(1),
+            namespace: 0,
+        }
+    }
 }
 
 /// A live terminal's registry row: the leased namespace plus the seat

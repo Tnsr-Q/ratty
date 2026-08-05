@@ -2007,8 +2007,12 @@ mod tests {
     fn oversized_osc_stays_bounded_across_chunks_and_keeps_vte_in_sync() {
         use crate::runtime::TerminalParserCallbacks;
 
-        let mut parser =
-            vt100::Parser::new_with_callbacks(4, 40, 0, TerminalParserCallbacks::default());
+        let mut parser = vt100::Parser::new_with_callbacks(
+            4,
+            40,
+            0,
+            TerminalParserCallbacks::new(crate::runtime::IngressSource::test_boot()),
+        );
         let mut inline = TerminalInlineObjects::default();
 
         // A multi-megabyte unterminated OSC arriving in realistic 16 KiB
@@ -2038,7 +2042,7 @@ mod tests {
             4,
             40,
             0,
-            crate::runtime::TerminalParserCallbacks::default(),
+            crate::runtime::TerminalParserCallbacks::new(crate::runtime::IngressSource::test_boot()),
         )
     }
 
@@ -2209,7 +2213,7 @@ mod tests {
             6,
             60,
             0,
-            crate::runtime::TerminalParserCallbacks::default(),
+            crate::runtime::TerminalParserCallbacks::new(crate::runtime::IngressSource::test_boot()),
         )
     }
 

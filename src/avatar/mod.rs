@@ -1023,7 +1023,7 @@ mod tests {
     use crate::runtime::IngressSource;
     use bevy::ecs::message::Messages;
 
-    const NS0: IngressSource = IngressSource::Local;
+    const NS0: IngressSource = IngressSource::test_boot();
 
     fn t(secs: f32) -> Duration {
         Duration::from_secs_f32(secs)

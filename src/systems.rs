@@ -347,7 +347,10 @@ mod pump_disconnect_tests {
 
     #[test]
     fn disconnect_does_not_exit_the_app_and_retains_the_final_screen() {
-        let (runtime, host) = TerminalRuntime::virtual_channel(&AppConfig::default());
+        let (runtime, host) = TerminalRuntime::virtual_channel(
+            &AppConfig::default(),
+            crate::runtime::IngressSource::test_boot(),
+        );
         let mut app = pump_app(runtime);
         host.feed_tx
             .send(b"final words".to_vec())
@@ -399,7 +402,10 @@ mod pump_disconnect_tests {
 
     #[test]
     fn disconnect_reaps_the_transport_through_the_shutdown_path() {
-        let (runtime, host) = TerminalRuntime::virtual_channel(&AppConfig::default());
+        let (runtime, host) = TerminalRuntime::virtual_channel(
+            &AppConfig::default(),
+            crate::runtime::IngressSource::test_boot(),
+        );
         let mut app = pump_app(runtime);
         drop(host);
 
@@ -4312,7 +4318,9 @@ mod single_plane_degrade_tests {
         let mut world = World::new();
         world.insert_resource(AppConfig::default());
         world.init_resource::<CursorSettings>();
-        world.spawn(TerminalRuntime::virtual_channel(&config).0);
+        world.spawn(
+            TerminalRuntime::virtual_channel(&config, crate::runtime::IngressSource::test_boot()).0,
+        );
         base_resources(&mut world, TerminalPresentationMode::Plane3d);
         world.init_resource::<MobiusTransition>();
         let cursor = world

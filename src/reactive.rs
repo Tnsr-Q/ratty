@@ -744,6 +744,7 @@ impl ReactiveRegistry {
         &mut self,
         config: &TrustedRuleConfig,
         macros: &MacroRegistry,
+        source: IngressSource,
     ) -> Result<(), ReactiveReject> {
         let name = config.name.clone();
         if name.is_empty() || name.len() > MAX_RULE_NAME_BYTES {
@@ -765,10 +766,10 @@ impl ReactiveRegistry {
             debounce: config.debounce,
             cooldown: config.cooldown,
         };
-        // Trusted rules run under the local ingress context (the only
-        // principal today); their sensor references face the same syntax
-        // validation as wire rules, scoped to that namespace.
-        let source = IngressSource::Local;
+        // Trusted rules run under the seeding terminal's ingress context
+        // (the boot terminal — the only principal today); their sensor
+        // references face the same syntax validation as wire rules,
+        // scoped to that namespace.
         let parsed_action = crate::osc::parse_rule_action(&config.action);
         let validated = parsed_action
             .ok_or_else(|| {
@@ -1001,7 +1002,13 @@ pub fn seed_reactive_from_config(
     config: Res<AppConfig>,
     macros: Res<MacroRegistry>,
     mut registry: ResMut<ReactiveRegistry>,
+    seats: Query<&crate::identity::TerminalIdentity>,
 ) {
+    // Trusted rules seed under the boot terminal's ingress context. This
+    // Startup system runs while exactly one seat exists (main()/start()
+    // spawn it pre-run); a world without it is broken, exactly like
+    // setup_scene's seat expect.
+    let identity = seats.single().expect("exactly one terminal seat at boot");
     // The cfg! term wins over config on wasm: an embedder can set the
     // flag, but no adapter exists to grant.
     registry.system_enabled = cfg!(not(target_arch = "wasm32")) && config.reactive.system_sensors;
@@ -1013,7 +1020,9 @@ pub fn seed_reactive_from_config(
             );
             break;
         }
-        if let Err((code, message)) = registry.insert_trusted_rule(rule, &macros) {
+        if let Err((code, message)) =
+            registry.insert_trusted_rule(rule, &macros, identity.ingress())
+        {
             error!(
                 "ratty-reactive: trusted rule '{}' is invalid ({code}): {message}; seeded \
                  disabled — see state.rules",
@@ -1445,7 +1454,7 @@ mod tests {
     use super::*;
     use bevy::ecs::message::Messages;
 
-    const NS0: IngressSource = IngressSource::Local;
+    const NS0: IngressSource = IngressSource::test_boot();
 
     fn t(secs: f32) -> Duration {
         Duration::from_secs_f32(secs)
@@ -1983,7 +1992,7 @@ mod tests {
             action: "flash;color=%23ff0000&duration=0.4".to_string(),
         };
         registry
-            .insert_trusted_rule(&config, &macros)
+            .insert_trusted_rule(&config, &macros, IngressSource::test_boot())
             .expect("registry op ok");
         // Wire mutation of a trusted name answers flat unknown-id.
         let (code, _) = registry
@@ -2026,7 +2035,7 @@ mod tests {
             action: "object.add;id=2147483648&path=rat.obj".to_string(),
         };
         let (code, _) = registry
-            .insert_trusted_rule(&bad, &macros)
+            .insert_trusted_rule(&bad, &macros, IngressSource::test_boot())
             .expect_err("invalid action");
         assert_eq!(code, codes::NOT_PERMITTED);
         let rule = registry.trusted.get("broken").expect("husk seeded");
@@ -2191,10 +2200,10 @@ mod tests {
             ..first.clone()
         };
         registry
-            .insert_trusted_rule(&first, &macros)
+            .insert_trusted_rule(&first, &macros, IngressSource::test_boot())
             .expect("registry op ok");
         let (code, _) = registry
-            .insert_trusted_rule(&second, &macros)
+            .insert_trusted_rule(&second, &macros, IngressSource::test_boot())
             .expect_err("duplicate names reject");
         assert_eq!(code, codes::ALREADY_EXISTS);
         assert_eq!(
@@ -2257,7 +2266,11 @@ action = "flash;color=%23ff0000&duration=0.4"
         let macros = MacroRegistry::default();
         let mut registry = ReactiveRegistry::default();
         registry
-            .insert_trusted_rule(&config.reactive.rules[0], &macros)
+            .insert_trusted_rule(
+                &config.reactive.rules[0],
+                &macros,
+                IngressSource::test_boot(),
+            )
             .expect("the example rule seeds");
         let rule = registry.trusted.get("cpu-alarm").expect("seeded");
         assert!(rule.enabled);
@@ -2289,7 +2302,7 @@ action = "flash;color=%23ff0000&duration=0.4"
         app.world_mut()
             .resource_mut::<Messages<AiCommand>>()
             .write(AiCommand {
-                source: IngressSource::Local,
+                source: IngressSource::test_boot(),
                 ack_token: ack.map(str::to_string),
                 origin,
                 command,

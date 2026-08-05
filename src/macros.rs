@@ -1012,7 +1012,7 @@ mod tests {
     use super::*;
     use bevy::ecs::message::Messages;
 
-    const NS0: IngressSource = IngressSource::Local;
+    const NS0: IngressSource = IngressSource::test_boot();
 
     fn t(secs: f32) -> Duration {
         Duration::from_secs_f32(secs)
@@ -1690,7 +1690,7 @@ mod tests {
         app.world_mut()
             .resource_mut::<Messages<AiCommand>>()
             .write(AiCommand {
-                source: IngressSource::Local,
+                source: IngressSource::test_boot(),
                 ack_token: ack.map(str::to_string),
                 origin: CommandOrigin::Wire,
                 command,
@@ -1820,7 +1820,7 @@ mod tests {
         app.world_mut()
             .resource_mut::<Messages<AiCommand>>()
             .write(AiCommand {
-                source: IngressSource::Local,
+                source: IngressSource::test_boot(),
                 ack_token: None,
                 origin: CommandOrigin::Rule,
                 command: spawn(0x8000_0002),
