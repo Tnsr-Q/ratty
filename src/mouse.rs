@@ -237,7 +237,7 @@ impl TerminalSelection {
 #[derive(SystemParam)]
 pub struct MouseSystemParams<'w, 's> {
     primary_window: Query<'w, 's, (Entity, &'static Window), With<PrimaryWindow>>,
-    runtime: ResMut<'w, TerminalRuntime>,
+    runtime: Query<'w, 's, &'static mut TerminalRuntime>,
     terminal: Query<'w, 's, &'static TerminalSurface>,
     viewport: Query<'w, 's, &'static TerminalViewport>,
     presentation: Res<'w, TerminalPresentation>,
@@ -286,6 +286,16 @@ pub(crate) fn handle_mouse_input(
             // seat, and the miss must name its system (#54's silent-.single()
             // finding).
             warn_once!("handle_mouse_input: the viewport needs exactly one terminal seat: {err}");
+            return;
+        }
+    };
+    let mut runtime = match runtime.single_mut() {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            // Latched once per process: the runtime lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!("handle_mouse_input: the runtime needs exactly one terminal seat: {err}");
             return;
         }
     };

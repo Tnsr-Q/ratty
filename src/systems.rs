@@ -141,9 +141,21 @@ pub(crate) fn request_exit_on_primary_window_close(
 /// Shuts down the PTY runtime when Bevy begins exiting.
 pub(crate) fn shutdown_terminal_runtime_on_exit(
     mut app_exit: MessageReader<AppExit>,
-    mut runtime: ResMut<TerminalRuntime>,
+    mut runtime: Query<&mut TerminalRuntime>,
     mut shutdown_started: Local<bool>,
 ) {
+    let mut runtime = match runtime.single_mut() {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            // Latched once per process: the runtime lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!(
+                "shutdown_terminal_runtime_on_exit: the runtime needs exactly one terminal seat: {err}"
+            );
+            return;
+        }
+    };
     if *shutdown_started {
         app_exit.clear();
         return;
@@ -168,7 +180,7 @@ pub(crate) fn shutdown_terminal_runtime_on_exit(
 /// (the `--hold` semantic); the app exits only through
 /// [`request_exit_on_primary_window_close`].
 pub fn pump_pty_output(
-    mut runtime: ResMut<TerminalRuntime>,
+    mut runtime: Query<&mut TerminalRuntime>,
     mut inline_objects: Query<&mut TerminalInlineObjects>,
     mut viz_registry: ResMut<crate::viz::VizRegistry>,
     mut ai_commands: MessageWriter<crate::ai::AiCommand>,
@@ -182,6 +194,16 @@ pub fn pump_pty_output(
             // terminal seat, and the miss must name its system (#54's
             // silent-.single() finding).
             warn_once!("pump_pty_output: inline objects need exactly one terminal seat: {err}");
+            return;
+        }
+    };
+    let mut runtime = match runtime.single_mut() {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            // Latched once per process: the runtime lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!("pump_pty_output: the runtime needs exactly one terminal seat: {err}");
             return;
         }
     };
@@ -293,9 +315,9 @@ mod pump_disconnect_tests {
 
     fn pump_app(runtime: TerminalRuntime) -> App {
         let mut app = App::new();
-        app.world_mut().spawn(TerminalInlineObjects::default());
-        app.insert_resource(runtime)
-            .init_resource::<VizRegistry>()
+        app.world_mut()
+            .spawn((TerminalInlineObjects::default(), runtime));
+        app.init_resource::<VizRegistry>()
             .init_resource::<TerminalRedrawState>()
             .add_message::<AppExit>()
             .add_message::<crate::ai::AiCommand>()
@@ -328,9 +350,11 @@ mod pump_disconnect_tests {
             drained_exits(&mut app).is_empty(),
             "disconnect must not write AppExit"
         );
-        let screen = app
-            .world()
-            .resource::<TerminalRuntime>()
+        let world = app.world_mut();
+        let mut runtime_query = world.query::<&TerminalRuntime>();
+        let screen = runtime_query
+            .single(world)
+            .expect("exactly one terminal seat")
             .parser
             .screen()
             .contents();
@@ -347,9 +371,11 @@ mod pump_disconnect_tests {
             drained_exits(&mut app).is_empty(),
             "disconnect must not write AppExit on later frames either"
         );
-        let screen = app
-            .world()
-            .resource::<TerminalRuntime>()
+        let world = app.world_mut();
+        let mut runtime_query = world.query::<&TerminalRuntime>();
+        let screen = runtime_query
+            .single(world)
+            .expect("exactly one terminal seat")
             .parser
             .screen()
             .contents();
@@ -366,7 +392,11 @@ mod pump_disconnect_tests {
         drop(host);
 
         app.update();
-        let runtime = app.world().resource::<TerminalRuntime>();
+        let world = app.world_mut();
+        let mut runtime_query = world.query::<&TerminalRuntime>();
+        let runtime = runtime_query
+            .single(world)
+            .expect("exactly one terminal seat");
         assert!(runtime.pty_disconnected, "the disconnect must be latched");
         assert!(
             runtime
@@ -382,7 +412,7 @@ mod pump_disconnect_tests {
 #[derive(SystemParam)]
 pub(crate) struct ResizeParams<'w, 's> {
     primary_window: Query<'w, 's, (Entity, &'static Window), With<PrimaryWindow>>,
-    runtime: ResMut<'w, TerminalRuntime>,
+    runtime: Query<'w, 's, &'static mut TerminalRuntime>,
     terminal: Query<'w, 's, &'static mut TerminalSurface>,
     redraw: ResMut<'w, TerminalRedrawState>,
     viewport: Query<'w, 's, &'static mut TerminalViewport>,
@@ -428,6 +458,16 @@ pub(crate) fn handle_window_resize(
             // seat, and the miss must name its system (#54's silent-.single()
             // finding).
             warn_once!("handle_window_resize: the surface needs exactly one terminal seat: {err}");
+            return;
+        }
+    };
+    let mut runtime = match runtime.single_mut() {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            // Latched once per process: the runtime lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!("handle_window_resize: the runtime needs exactly one terminal seat: {err}");
             return;
         }
     };
@@ -522,7 +562,7 @@ const BLINK_TICK_SECS: f32 = 0.25;
 pub(crate) struct RenderWidgetParams<'w, 's> {
     app_config: Res<'w, AppConfig>,
     cursor_settings: Res<'w, CursorSettings>,
-    runtime: Res<'w, TerminalRuntime>,
+    runtime: Query<'w, 's, &'static TerminalRuntime>,
     terminal: Query<'w, 's, &'static mut TerminalSurface>,
     selection: Res<'w, TerminalSelection>,
     time: Res<'w, Time>,
@@ -582,6 +622,18 @@ pub(crate) fn render_terminal_widget(mut params: RenderWidgetParams) {
             return;
         }
     };
+    let runtime = match runtime.single() {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            // Latched once per process: the runtime lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!(
+                "render_terminal_widget: the runtime needs exactly one terminal seat: {err}"
+            );
+            return;
+        }
+    };
     let needs_redraw = redraw.take();
     // The texture content only changes with terminal state or blink phase;
     // warp and camera animations are mesh- and camera-side. Rebuilding on
@@ -627,7 +679,7 @@ pub(crate) fn render_terminal_widget(mut params: RenderWidgetParams) {
 
 #[derive(SystemParam)]
 pub(crate) struct SyncMaterialsParams<'w, 's> {
-    runtime: Res<'w, TerminalRuntime>,
+    runtime: Query<'w, 's, &'static TerminalRuntime>,
     terminal: Query<'w, 's, &'static TerminalSurface>,
     presentation: Res<'w, TerminalPresentation>,
     images: ResMut<'w, Assets<Image>>,
@@ -682,6 +734,18 @@ pub(crate) fn sync_terminal_materials(mut params: SyncMaterialsParams) {
             // finding).
             warn_once!(
                 "sync_terminal_materials: the frame-dirty flag needs exactly one terminal seat: {err}"
+            );
+            return;
+        }
+    };
+    let runtime = match runtime.single() {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            // Latched once per process: the runtime lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!(
+                "sync_terminal_materials: the runtime needs exactly one terminal seat: {err}"
             );
             return;
         }
@@ -3111,7 +3175,7 @@ fn apply_plane_warp(
 pub(crate) struct CursorSyncParams<'w, 's> {
     app_config: Res<'w, AppConfig>,
     cursor_settings: Res<'w, CursorSettings>,
-    runtime: Res<'w, TerminalRuntime>,
+    runtime: Query<'w, 's, &'static TerminalRuntime>,
     terminal: Query<'w, 's, &'static TerminalSurface>,
     viewport: Query<'w, 's, &'static TerminalViewport>,
     presentation: Res<'w, TerminalPresentation>,
@@ -3176,6 +3240,18 @@ pub(crate) fn sync_asset_to_terminal_cursor(mut params: CursorSyncParams) {
             // finding).
             warn_once!(
                 "sync_asset_to_terminal_cursor: the plane warp needs exactly one terminal seat: {err}"
+            );
+            return;
+        }
+    };
+    let runtime = match runtime.single() {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            // Latched once per process: the runtime lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!(
+                "sync_asset_to_terminal_cursor: the runtime needs exactly one terminal seat: {err}"
             );
             return;
         }
@@ -4154,7 +4230,7 @@ mod single_plane_degrade_tests {
         let mut world = World::new();
         world.insert_resource(AppConfig::default());
         world.init_resource::<CursorSettings>();
-        world.insert_resource(TerminalRuntime::virtual_channel(&config).0);
+        world.spawn(TerminalRuntime::virtual_channel(&config).0);
         base_resources(&mut world, TerminalPresentationMode::Plane3d);
         world.init_resource::<MobiusTransition>();
         let cursor = world

@@ -63,7 +63,6 @@ fn main() -> anyhow::Result<()> {
         (app_config.window.opacity.clamp(0.0, 1.0) * 255.0).round() as u8,
     )))
     .insert_resource(app_config.clone())
-    .insert_resource(runtime)
     .insert_non_send(AppWindowIcon { icon: window_icon })
     // Always update continuously, focused or not. Bevy's default switches
     // unfocused windows to a reactive mode, which would delay background
@@ -103,10 +102,11 @@ fn main() -> anyhow::Result<()> {
     )
     .add_systems(Update, apply_window_icon)
     .add_plugins(TerminalPlugin);
-    // The terminal seat is born here, where the surface value is born;
-    // setup_scene finds it at Startup and dresses it with the world-derived
-    // per-terminal components. Nothing runs between this spawn and run().
-    app.world_mut().spawn(terminal);
+    // The terminal seat is born here, where the surface and runtime values
+    // are born; setup_scene finds it at Startup and dresses it with the
+    // world-derived per-terminal components. Nothing runs between this spawn
+    // and run().
+    app.world_mut().spawn((terminal, runtime));
     app.run();
 
     Ok(())

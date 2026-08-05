@@ -335,7 +335,7 @@ pub struct KeyboardSystemParams<'w, 's> {
     mobius_transition: ResMut<'w, MobiusTransition>,
     stage_tween: ResMut<'w, StageTween>,
     clipboard: NonSendMut<'w, TerminalClipboard>,
-    runtime: ResMut<'w, TerminalRuntime>,
+    runtime: Query<'w, 's, &'static mut TerminalRuntime>,
     terminal: Query<'w, 's, &'static mut TerminalSurface>,
     primary_window: Query<'w, 's, &'static Window, With<PrimaryWindow>>,
     viewport: Query<'w, 's, &'static mut TerminalViewport>,
@@ -359,6 +359,16 @@ pub fn handle_keyboard_input(
             // seat, and the miss must name its system (#54's silent-.single()
             // finding).
             warn_once!("handle_keyboard_input: the surface needs exactly one terminal seat: {err}");
+            return;
+        }
+    };
+    let mut runtime = match params.runtime.single_mut() {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            // Latched once per process: the runtime lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!("handle_keyboard_input: the runtime needs exactly one terminal seat: {err}");
             return;
         }
     };
@@ -438,22 +448,22 @@ pub fn handle_keyboard_input(
                         _ => unreachable!(),
                     };
 
-                    let mouse_mode = params.runtime.parser.screen().mouse_protocol_mode();
+                    let mouse_mode = runtime.parser.screen().mouse_protocol_mode();
                     if params.presentation.mode == TerminalPresentationMode::Flat2d
                         && mouse_mode != vt100::MouseProtocolMode::None
                     {
-                        let encoding = params.runtime.parser.screen().mouse_protocol_encoding();
-                        let (row, col) = params.runtime.parser.screen().cursor_position();
+                        let encoding = runtime.parser.screen().mouse_protocol_encoding();
+                        let (row, col) = runtime.parser.screen().cursor_position();
                         let cell = UVec2::new(col as u32, row as u32);
                         for _ in 0..amount {
-                            params.runtime.write_input(&encode_mouse_wheel(
+                            runtime.write_input(&encode_mouse_wheel(
                                 cell,
                                 direction.is_positive(),
                                 encoding,
                             ));
                         }
                     } else {
-                        let screen = params.runtime.parser.screen_mut();
+                        let screen = runtime.parser.screen_mut();
                         let current = screen.scrollback();
                         let next = if direction.is_positive() {
                             current.saturating_add(amount)
@@ -492,9 +502,7 @@ pub fn handle_keyboard_input(
                     continue;
                 }
                 BindingAction::Copy => {
-                    if let Some(text) = params
-                        .selection
-                        .selected_text(params.runtime.parser.screen())
+                    if let Some(text) = params.selection.selected_text(runtime.parser.screen())
                         && !text.is_empty()
                     {
                         params.clipboard.copy(&text);
@@ -506,7 +514,7 @@ pub fn handle_keyboard_input(
                 }
                 BindingAction::Paste => {
                     if let Some(text) = params.clipboard.paste() {
-                        write_paste(&params.runtime, &text);
+                        write_paste(&runtime, &text);
                     } else {
                         warn!("failed to read clipboard contents for paste");
                     }
@@ -537,7 +545,7 @@ pub fn handle_keyboard_input(
                             render_scale_for_window(window),
                         );
                         let pty_pixels = layout.pty_pixels();
-                        params.runtime.resize(
+                        runtime.resize(
                             layout.cols,
                             layout.rows,
                             pty_pixels.x as u16,
@@ -577,16 +585,16 @@ pub fn handle_keyboard_input(
 
         if let Some(input) = keyboard.handle_event_with_modes(
             event,
-            params.runtime.parser.screen().application_cursor(),
-            params.runtime.kitty_keyboard_flags(),
-            params.runtime.modify_other_keys(),
+            runtime.parser.screen().application_cursor(),
+            runtime.kitty_keyboard_flags(),
+            runtime.modify_other_keys(),
         ) {
-            let screen = params.runtime.parser.screen_mut();
+            let screen = runtime.parser.screen_mut();
             if screen.scrollback() != 0 {
                 screen.set_scrollback(0);
                 params.redraw.request();
             }
-            params.runtime.write_input(&input);
+            runtime.write_input(&input);
         }
     }
 }

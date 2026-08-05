@@ -274,7 +274,7 @@ pub(crate) struct SetupSceneParams<'w, 's> {
     images: ResMut<'w, Assets<Image>>,
     present_materials: ResMut<'w, Assets<TerminalPresentMaterial>>,
     primary_window: Query<'w, 's, &'static Window, With<PrimaryWindow>>,
-    runtime: ResMut<'w, TerminalRuntime>,
+    runtime: Query<'w, 's, &'static mut TerminalRuntime>,
     terminal: Query<'w, 's, (Entity, &'static mut TerminalSurface)>,
 }
 
@@ -296,8 +296,9 @@ pub(crate) fn setup_scene(mut params: SetupSceneParams) {
     } = &mut params;
     // Fatal, like the primary-window expect below: setup_scene is a
     // constructor, and a world without exactly one terminal seat (spawned by
-    // main()/start() with the surface aboard) is a broken world.
+    // main()/start() with the surface and runtime aboard) is a broken world.
     let (host, mut terminal) = terminal.single_mut().expect("exactly one terminal seat");
+    let mut runtime = runtime.single_mut().expect("exactly one terminal seat");
     let terminal_opacity = app_config.window.opacity.clamp(0.0, 1.0);
     let window = primary_window.single().expect("primary window");
     let window_size = window.resolution.size().max(Vec2::ONE);
@@ -705,14 +706,15 @@ mod tests {
         world.init_resource::<Assets<Image>>();
         world.init_resource::<Assets<TerminalPresentMaterial>>();
         let (runtime, _host) = TerminalRuntime::virtual_channel(&AppConfig::default());
-        world.insert_resource(runtime);
         // Mirror main()/start(): the seat is born pre-run with the surface
-        // aboard; setup_scene must dress THIS entity, not spawn another.
+        // and runtime aboard; setup_scene must dress THIS entity, not spawn
+        // another.
         let seat = world
-            .spawn(
+            .spawn((
                 TerminalSurface::new(&AppConfig::default())
                     .expect("surface construction is CPU-only"),
-            )
+                runtime,
+            ))
             .id();
         world.spawn((Window::default(), bevy::window::PrimaryWindow));
 
@@ -760,6 +762,11 @@ mod tests {
             "exactly one seat carries the inline objects"
         );
         assert_eq!(
+            world.query::<&TerminalRuntime>().iter(&world).count(),
+            1,
+            "exactly one seat carries the runtime"
+        );
+        assert_eq!(
             world
                 .query::<(
                     &TerminalSurface,
@@ -768,6 +775,7 @@ mod tests {
                     &TerminalViewport,
                     &TerminalPlaneWarp,
                     &TerminalInlineObjects,
+                    &TerminalRuntime,
                 )>()
                 .iter(&world)
                 .count(),

@@ -15,7 +15,7 @@ use std::thread::{self, JoinHandle};
 #[cfg(not(target_arch = "wasm32"))]
 use anyhow::Context;
 use bevy::platform::cell::SyncCell;
-use bevy::prelude::Resource;
+use bevy::prelude::Component;
 #[cfg(not(target_arch = "wasm32"))]
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 use vt100::{Callbacks, Parser, Screen};
@@ -295,9 +295,9 @@ impl Callbacks for TerminalParserCallbacks {
 /// and [`TerminalRuntime::parser`], so the two are interchangeable.
 ///
 /// The `!Sync` PTY handles (the output channel receiver and the master) live
-/// in [`SyncCell`]s so the runtime qualifies as a regular [`Resource`] and
-/// systems using it are not pinned to the main thread.
-#[derive(Resource)]
+/// in [`SyncCell`]s so the runtime qualifies as a regular [`Component`] on
+/// the terminal seat and systems using it are not pinned to the main thread.
+#[derive(Component)]
 pub struct TerminalRuntime {
     /// Terminal output channel (PTY reader or virtual feed).
     rx: SyncCell<Receiver<Vec<u8>>>,

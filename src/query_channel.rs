@@ -330,7 +330,7 @@ pub struct OrganRegistries<'w> {
 pub fn answer_queries(
     mut queries: MessageReader<QueryRequest>,
     mut acks: MessageReader<AckOutcome>,
-    runtime: Res<TerminalRuntime>,
+    runtime: Query<&TerminalRuntime>,
     session: Res<QuerySession>,
     inline_objects: Query<&TerminalInlineObjects>,
     diagnostics: Res<AiDiagnostics>,
@@ -342,6 +342,19 @@ pub fn answer_queries(
     effects: Res<AiEffects>,
     organs: OrganRegistries,
 ) {
+    // The reply transport itself: without the runtime no ack or reply can
+    // leave the terminal, so it resolves before everything else.
+    let runtime = match runtime.single() {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            // Latched once per process: the runtime lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!("answer_queries: the runtime needs exactly one terminal seat: {err}");
+            return;
+        }
+    };
+
     // Acks first: a same-chunk "command with tok= then query" reads its
     // ack before the query reply, in mutation order.
     for AckOutcome {
@@ -354,7 +367,7 @@ pub fn answer_queries(
     {
         let json = payload.as_ref().map(serde_json::Value::to_string);
         send_reply(
-            &runtime,
+            runtime,
             *source,
             token,
             true,
@@ -364,8 +377,9 @@ pub fn answer_queries(
         );
     }
 
-    // Resolved after the ack relay: acks never read the seat, so they keep
-    // flowing even in a seatless (broken) world.
+    // Resolved after the ack relay: the ack path needs only the runtime
+    // (resolved above), so acks drain before a warp/inline miss aborts the
+    // reply loop.
     let plane_warp = match plane_warp.single() {
         Ok(plane_warp) => plane_warp,
         Err(err) => {
@@ -391,7 +405,7 @@ pub fn answer_queries(
         match item {
             QueryItem::Error(error) => {
                 send_reply(
-                    &runtime,
+                    runtime,
                     *source,
                     &error.token,
                     error.ack,
@@ -426,7 +440,7 @@ pub fn answer_queries(
                     Ok(value) => {
                         let payload = value.to_string();
                         send_reply(
-                            &runtime,
+                            runtime,
                             *source,
                             &envelope.token,
                             false,
@@ -437,7 +451,7 @@ pub fn answer_queries(
                     }
                     Err(code) => {
                         send_reply(
-                            &runtime,
+                            runtime,
                             *source,
                             &envelope.token,
                             false,
@@ -1154,12 +1168,12 @@ mod tests {
         let (runtime, host) = TerminalRuntime::virtual_channel(&config);
         let mut app = App::new();
         app.insert_resource(config);
-        app.insert_resource(runtime);
-        // The terminal seat, mirroring setup_scene's spawn for the
+        // The terminal seat, mirroring main()/setup_scene's spawns for the
         // components this harness needs.
         app.world_mut().spawn((
             TerminalInlineObjects::default(),
             TerminalPlaneWarp::default(),
+            runtime,
         ));
         app.init_resource::<AiObjectRegistry>();
         app.init_resource::<CursorSettings>();
