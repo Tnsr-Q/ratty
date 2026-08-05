@@ -14,12 +14,12 @@ use crate::scene::{
     TerminalPresentationMode, apply_terminal_presentation, setup_scene,
 };
 use crate::systems::{
-    TerminalFrameDirty, TerminalRedrawSet, animate_inline_kitty_planes, animate_mobius_transition,
-    animate_stage_tween, animate_terminal_plane_warp, apply_inline_objects,
-    apply_instance_brightness, apply_rgp_restyle, apply_rgp_stage, finish_terminal_model_load,
-    handle_window_resize, pump_pty_output, render_terminal_widget,
-    request_exit_on_primary_window_close, shutdown_terminal_runtime_on_exit,
-    sync_asset_to_terminal_cursor, sync_inline_objects, sync_rgp_objects, sync_terminal_materials,
+    TerminalRedrawSet, animate_inline_kitty_planes, animate_mobius_transition, animate_stage_tween,
+    animate_terminal_plane_warp, apply_inline_objects, apply_instance_brightness,
+    apply_rgp_restyle, apply_rgp_stage, finish_terminal_model_load, handle_window_resize,
+    pump_pty_output, render_terminal_widget, request_exit_on_primary_window_close,
+    shutdown_terminal_runtime_on_exit, sync_asset_to_terminal_cursor, sync_inline_objects,
+    sync_rgp_objects, sync_terminal_materials,
 };
 use crate::terminal::TerminalRedrawState;
 
@@ -47,7 +47,6 @@ impl Plugin for TerminalPlugin {
             .init_resource::<TerminalInlineObjects>()
             .init_resource::<TerminalRedrawState>()
             .init_resource::<TerminalKeyBindings>()
-            .init_resource::<TerminalFrameDirty>()
             .init_resource::<StageTween>()
             .init_non_send::<TerminalClipboard>()
             .add_systems(Startup, setup_scene)

@@ -475,7 +475,7 @@ pub fn apply_inline_objects(
 
 /// Redraw system parameters.
 /// Tracks whether the terminal frame was redrawn during the current update.
-#[derive(Resource, Default)]
+#[derive(Component, Default)]
 pub(crate) struct TerminalFrameDirty(pub bool);
 
 /// Ordered terminal redraw pipeline:
@@ -500,7 +500,7 @@ pub(crate) struct RenderWidgetParams<'w, 's> {
     images: ResMut<'w, Assets<Image>>,
     direct_render: Res<'w, DirectTerminalSceneExchange>,
     model_load_state: Res<'w, ModelLoadState>,
-    frame_dirty: ResMut<'w, TerminalFrameDirty>,
+    frame_dirty: Query<'w, 's, &'static mut TerminalFrameDirty>,
     viz_registry: Res<'w, VizRegistry>,
     presence: Res<'w, crate::presence::PresenceRegistry>,
     blink_phase: Local<'s, u64>,
@@ -528,6 +528,18 @@ pub(crate) fn render_terminal_widget(mut params: RenderWidgetParams) {
         presence,
         blink_phase,
     } = &mut params;
+    let mut frame_dirty = match frame_dirty.single_mut() {
+        Ok(frame_dirty) => frame_dirty,
+        Err(err) => {
+            // Latched once per process: the dirty flag lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!(
+                "render_terminal_widget: the frame-dirty flag needs exactly one terminal seat: {err}"
+            );
+            return;
+        }
+    };
     let needs_redraw = redraw.take();
     // The texture content only changes with terminal state or blink phase;
     // warp and camera animations are mesh- and camera-side. Rebuilding on
@@ -591,7 +603,7 @@ pub(crate) struct SyncMaterialsParams<'w, 's> {
         &'static MeshMaterial2d<TerminalPresentMaterial>,
         With<crate::scene::TerminalSprite>,
     >,
-    frame_dirty: Res<'w, TerminalFrameDirty>,
+    frame_dirty: Query<'w, 's, &'static TerminalFrameDirty>,
 }
 
 /// Refreshes the debug back texture and plane materials after a redraw.
@@ -608,6 +620,18 @@ pub(crate) fn sync_terminal_materials(mut params: SyncMaterialsParams) {
         present_query,
         frame_dirty,
     } = &mut params;
+    let frame_dirty = match frame_dirty.single() {
+        Ok(frame_dirty) => frame_dirty,
+        Err(err) => {
+            // Latched once per process: the dirty flag lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!(
+                "sync_terminal_materials: the frame-dirty flag needs exactly one terminal seat: {err}"
+            );
+            return;
+        }
+    };
     if !frame_dirty.0 {
         return;
     }
@@ -655,7 +679,7 @@ pub(crate) struct ModelLoadParams<'w, 's> {
     materials: ResMut<'w, Assets<StandardMaterial>>,
     images: ResMut<'w, Assets<Image>>,
     asset_server: Res<'w, AssetServer>,
-    frame_dirty: Res<'w, TerminalFrameDirty>,
+    frame_dirty: Query<'w, 's, &'static TerminalFrameDirty>,
 }
 
 /// Completes deferred cursor-model loading once the first frame is uploaded.
@@ -675,6 +699,18 @@ pub(crate) fn finish_terminal_model_load(mut params: ModelLoadParams) {
         asset_server,
         frame_dirty,
     } = &mut params;
+    let frame_dirty = match frame_dirty.single() {
+        Ok(frame_dirty) => frame_dirty,
+        Err(err) => {
+            // Latched once per process: the dirty flag lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!(
+                "finish_terminal_model_load: the frame-dirty flag needs exactly one terminal seat: {err}"
+            );
+            return;
+        }
+    };
     if !frame_dirty.0 {
         return;
     }

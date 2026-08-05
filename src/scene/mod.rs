@@ -22,6 +22,7 @@ use crate::config::AppConfig;
 use crate::direct_render::{new_terminal_image, new_terminal_render_image};
 use crate::present::{TerminalPresentMaterial, fullscreen_quad};
 use crate::runtime::TerminalRuntime;
+use crate::systems::TerminalFrameDirty;
 use crate::terminal::{TerminalLayout, TerminalSurface, render_scale_for_window};
 
 /// Marker for the 2D terminal sprite.
@@ -386,10 +387,13 @@ pub(crate) fn setup_scene(mut params: SetupSceneParams) {
     // components as the M4.2 swaps land. Exactly one is ever spawned; the
     // seat-count tests assert that explicitly (#54: nothing strips a second
     // seat once the types stop being Resources).
-    commands.spawn(TerminalPlaneMeshes {
-        front: front_mesh.clone(),
-        back: back_mesh.clone(),
-    });
+    commands.spawn((
+        TerminalPlaneMeshes {
+            front: front_mesh.clone(),
+            back: back_mesh.clone(),
+        },
+        TerminalFrameDirty::default(),
+    ));
     commands.insert_resource(TerminalPlaneWarp::default());
 
     commands.spawn((
@@ -707,6 +711,19 @@ mod tests {
             world.query::<&TerminalPlaneMeshes>().iter(&world).count(),
             1,
             "setup_scene spawns exactly one terminal seat"
+        );
+        assert_eq!(
+            world.query::<&TerminalFrameDirty>().iter(&world).count(),
+            1,
+            "exactly one seat carries the frame-dirty flag"
+        );
+        assert_eq!(
+            world
+                .query::<(&TerminalPlaneMeshes, &TerminalFrameDirty)>()
+                .iter(&world)
+                .count(),
+            1,
+            "the swapped components co-locate on the one seat"
         );
     }
 
