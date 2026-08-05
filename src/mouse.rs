@@ -239,7 +239,7 @@ pub struct MouseSystemParams<'w, 's> {
     primary_window: Query<'w, 's, (Entity, &'static Window), With<PrimaryWindow>>,
     runtime: ResMut<'w, TerminalRuntime>,
     terminal: Res<'w, TerminalSurface>,
-    viewport: Res<'w, TerminalViewport>,
+    viewport: Query<'w, 's, &'static TerminalViewport>,
     presentation: Res<'w, TerminalPresentation>,
     mobius_transition: Res<'w, MobiusTransition>,
     plane_view: ResMut<'w, TerminalPlaneView>,
@@ -269,6 +269,16 @@ pub(crate) fn handle_mouse_input(
         selection,
         redraw,
     } = &mut params;
+    let viewport = match viewport.single() {
+        Ok(viewport) => viewport,
+        Err(err) => {
+            // Latched once per process: the viewport lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!("handle_mouse_input: the viewport needs exactly one terminal seat: {err}");
+            return;
+        }
+    };
     let Ok((primary_window, window)) = primary_window.single() else {
         return;
     };

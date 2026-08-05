@@ -375,7 +375,7 @@ pub(crate) struct ResizeParams<'w, 's> {
     runtime: ResMut<'w, TerminalRuntime>,
     terminal: ResMut<'w, TerminalSurface>,
     redraw: ResMut<'w, TerminalRedrawState>,
-    viewport: ResMut<'w, TerminalViewport>,
+    viewport: Query<'w, 's, &'static mut TerminalViewport>,
     plane_query: TerminalPlaneLayoutQuery<'w, 's>,
     plane_back_query: TerminalPlaneBackLayoutQuery<'w, 's>,
 }
@@ -401,6 +401,16 @@ pub(crate) fn handle_window_resize(
         plane_query,
         plane_back_query,
     } = &mut params;
+    let mut viewport = match viewport.single_mut() {
+        Ok(viewport) => viewport,
+        Err(err) => {
+            // Latched once per process: the viewport lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!("handle_window_resize: the viewport needs exactly one terminal seat: {err}");
+            return;
+        }
+    };
     let Ok((primary_window, window)) = primary_window.single() else {
         return;
     };
@@ -432,7 +442,7 @@ pub(crate) fn handle_window_resize(
         pty_pixels.x as u16,
         pty_pixels.y as u16,
     );
-    sync_terminal_layout(layout, viewport, plane_query, plane_back_query);
+    sync_terminal_layout(layout, &mut viewport, plane_query, plane_back_query);
     redraw.request();
 }
 
@@ -793,7 +803,7 @@ pub(crate) struct SyncInlineParams<'w, 's> {
     commands: Commands<'w, 's>,
     inline_objects: ResMut<'w, TerminalInlineObjects>,
     terminal: Res<'w, TerminalSurface>,
-    viewport: Res<'w, TerminalViewport>,
+    viewport: Query<'w, 's, &'static TerminalViewport>,
     presentation: Res<'w, TerminalPresentation>,
     plane_warp: Res<'w, TerminalPlaneWarp>,
     time: Res<'w, Time>,
@@ -834,6 +844,16 @@ pub(crate) fn sync_inline_objects(mut params: SyncInlineParams) {
         images,
         meshes,
     } = &mut params;
+    let viewport = match viewport.single() {
+        Ok(viewport) => viewport,
+        Err(err) => {
+            // Latched once per process: the viewport lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!("sync_inline_objects: the viewport needs exactly one terminal seat: {err}");
+            return;
+        }
+    };
     // Per-object rebuilds (queued by `depth` updates and glTF restyles) only
     // run when no full rebuild is due; a full rebuild subsumes them.
     let full_sync = inline_objects.needs_sync(viewport.size, terminal.cols, terminal.rows);
@@ -1368,7 +1388,7 @@ fn apply_brightness(material: &mut StandardMaterial, brightness: f32) {
 pub(crate) struct RgpSyncParams<'w, 's> {
     app_config: Res<'w, AppConfig>,
     terminal: Res<'w, TerminalSurface>,
-    viewport: Res<'w, TerminalViewport>,
+    viewport: Query<'w, 's, &'static TerminalViewport>,
     presentation: Res<'w, TerminalPresentation>,
     mobius_transition: Res<'w, MobiusTransition>,
     plane_warp: Res<'w, TerminalPlaneWarp>,
@@ -1408,6 +1428,16 @@ pub(crate) fn sync_rgp_objects(mut params: RgpSyncParams) {
         inline_objects,
         query,
     } = &mut params;
+    let viewport = match viewport.single() {
+        Ok(viewport) => viewport,
+        Err(err) => {
+            // Latched once per process: the viewport lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!("sync_rgp_objects: the viewport needs exactly one terminal seat: {err}");
+            return;
+        }
+    };
     let cell_width = viewport.size.x / terminal.cols.max(1) as f32;
     let cell_height = viewport.size.y / terminal.rows.max(1) as f32;
     let elapsed_secs = time.elapsed_secs();
@@ -2327,7 +2357,7 @@ type VizAnimatedQuery<'w, 's> = Query<
 pub(crate) struct VizSyncParams<'w, 's> {
     registry: Res<'w, VizRegistry>,
     terminal: Res<'w, TerminalSurface>,
-    viewport: Res<'w, TerminalViewport>,
+    viewport: Query<'w, 's, &'static TerminalViewport>,
     presentation: Res<'w, TerminalPresentation>,
     mobius_transition: Res<'w, MobiusTransition>,
     plane_warp: Res<'w, TerminalPlaneWarp>,
@@ -2366,6 +2396,16 @@ pub(crate) fn sync_viz_objects(mut params: VizSyncParams) {
         plane_query,
         roots,
     } = &mut params;
+    let viewport = match viewport.single() {
+        Ok(viewport) => viewport,
+        Err(err) => {
+            // Latched once per process: the viewport lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!("sync_viz_objects: the viewport needs exactly one terminal seat: {err}");
+            return;
+        }
+    };
     let cell_width = viewport.size.x / terminal.cols.max(1) as f32;
     let cell_height = viewport.size.y / terminal.rows.max(1) as f32;
     let elapsed_secs = time.elapsed_secs();
@@ -2867,7 +2907,7 @@ pub(crate) struct CursorSyncParams<'w, 's> {
     cursor_settings: Res<'w, CursorSettings>,
     runtime: Res<'w, TerminalRuntime>,
     terminal: Res<'w, TerminalSurface>,
-    viewport: Res<'w, TerminalViewport>,
+    viewport: Query<'w, 's, &'static TerminalViewport>,
     presentation: Res<'w, TerminalPresentation>,
     mobius_transition: Res<'w, MobiusTransition>,
     plane_warp: Res<'w, TerminalPlaneWarp>,
@@ -2898,6 +2938,18 @@ pub(crate) fn sync_asset_to_terminal_cursor(mut params: CursorSyncParams) {
         plane_query,
         query,
     } = &mut params;
+    let viewport = match viewport.single() {
+        Ok(viewport) => viewport,
+        Err(err) => {
+            // Latched once per process: the viewport lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!(
+                "sync_asset_to_terminal_cursor: the viewport needs exactly one terminal seat: {err}"
+            );
+            return;
+        }
+    };
     if query.is_empty() {
         return;
     }
@@ -3711,7 +3763,7 @@ mod single_plane_degrade_tests {
         world.insert_resource(
             TerminalSurface::new(&AppConfig::default()).expect("surface construction is CPU-only"),
         );
-        world.insert_resource(TerminalViewport {
+        world.spawn(TerminalViewport {
             size: Vec2::new(800.0, 480.0),
             center: Vec2::ZERO,
         });

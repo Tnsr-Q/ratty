@@ -338,7 +338,7 @@ pub struct KeyboardSystemParams<'w, 's> {
     runtime: ResMut<'w, TerminalRuntime>,
     terminal: ResMut<'w, TerminalSurface>,
     primary_window: Query<'w, 's, &'static Window, With<PrimaryWindow>>,
-    viewport: ResMut<'w, TerminalViewport>,
+    viewport: Query<'w, 's, &'static mut TerminalViewport>,
     plane_query: TerminalPlaneLayoutQuery<'w, 's>,
     plane_back_query: TerminalPlaneBackLayoutQuery<'w, 's>,
     bindings: Res<'w, TerminalKeyBindings>,
@@ -521,9 +521,21 @@ pub fn handle_keyboard_input(
                             pty_pixels.x as u16,
                             pty_pixels.y as u16,
                         );
+                        let mut viewport = match params.viewport.single_mut() {
+                            Ok(viewport) => viewport,
+                            Err(err) => {
+                                // Latched once per process: the viewport lives
+                                // on THE terminal seat, and the miss must name
+                                // its system (#54's silent-.single() finding).
+                                warn_once!(
+                                    "handle_keyboard_input: the viewport needs exactly one terminal seat: {err}"
+                                );
+                                continue;
+                            }
+                        };
                         sync_terminal_layout(
                             layout,
-                            &mut params.viewport,
+                            &mut viewport,
                             &mut params.plane_query,
                             &mut params.plane_back_query,
                         );

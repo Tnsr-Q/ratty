@@ -925,7 +925,7 @@ pub(crate) struct PresenceMarkerParams<'w, 's> {
     time: Res<'w, Time>,
     registry: Res<'w, PresenceRegistry>,
     terminal: Res<'w, TerminalSurface>,
-    viewport: Res<'w, TerminalViewport>,
+    viewport: Query<'w, 's, &'static TerminalViewport>,
     presentation: Res<'w, TerminalPresentation>,
     mobius_transition: Res<'w, MobiusTransition>,
     plane_warp: Res<'w, TerminalPlaneWarp>,
@@ -961,6 +961,18 @@ pub(crate) fn sync_presence_cursor_markers(mut params: PresenceMarkerParams) {
         materials,
         marker_mesh,
     } = &mut params;
+    let viewport = match viewport.single() {
+        Ok(viewport) => viewport,
+        Err(err) => {
+            // Latched once per process: the viewport lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!(
+                "sync_presence_cursor_markers: the viewport needs exactly one terminal seat: {err}"
+            );
+            return;
+        }
+    };
     let now = time.elapsed();
     let elapsed_secs = time.elapsed_secs();
     let cols = terminal.cols;
@@ -2244,7 +2256,7 @@ mod tests {
         world.insert_resource(
             TerminalSurface::new(&AppConfig::default()).expect("surface construction is CPU-only"),
         );
-        world.insert_resource(TerminalViewport {
+        world.spawn(TerminalViewport {
             size: Vec2::new(800.0, 480.0),
             center: Vec2::ZERO,
         });

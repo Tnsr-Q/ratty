@@ -65,7 +65,7 @@ impl TerminalPlaneWarp {
 }
 
 /// Terminal viewport geometry.
-#[derive(Resource, Clone, Copy)]
+#[derive(Component, Clone, Copy)]
 pub struct TerminalViewport {
     /// Viewport size in logical pixels.
     pub size: Vec2,
@@ -361,10 +361,6 @@ pub(crate) fn setup_scene(mut params: SetupSceneParams) {
     terminal.back_image_handle = Some(back_image_handle.clone());
 
     let viewport_center = Vec2::ZERO;
-    commands.insert_resource(TerminalViewport {
-        size: layout.logical_size,
-        center: viewport_center,
-    });
 
     // Present the terminal texture 1:1 with physical pixels via a fullscreen quad
     // whose shader fetches each texel by pixel coordinate (no resampling), rather
@@ -393,6 +389,10 @@ pub(crate) fn setup_scene(mut params: SetupSceneParams) {
             back: back_mesh.clone(),
         },
         TerminalFrameDirty::default(),
+        TerminalViewport {
+            size: layout.logical_size,
+            center: viewport_center,
+        },
     ));
     commands.insert_resource(TerminalPlaneWarp::default());
 
@@ -718,8 +718,13 @@ mod tests {
             "exactly one seat carries the frame-dirty flag"
         );
         assert_eq!(
+            world.query::<&TerminalViewport>().iter(&world).count(),
+            1,
+            "exactly one seat carries the viewport"
+        );
+        assert_eq!(
             world
-                .query::<(&TerminalPlaneMeshes, &TerminalFrameDirty)>()
+                .query::<(&TerminalPlaneMeshes, &TerminalFrameDirty, &TerminalViewport)>()
                 .iter(&world)
                 .count(),
             1,
