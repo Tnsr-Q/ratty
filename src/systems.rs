@@ -592,15 +592,25 @@ const BLINK_TICK_SECS: f32 = 0.25;
 pub(crate) struct RenderWidgetParams<'w, 's> {
     app_config: Res<'w, AppConfig>,
     cursor_settings: Res<'w, CursorSettings>,
-    runtime: Query<'w, 's, &'static TerminalRuntime>,
-    terminal: Query<'w, 's, &'static mut TerminalSurface>,
+    // One co-located seat query: the publisher reads each seat's own
+    // mailbox (the per-entity exchange), never a shared slot — the shared
+    // slot was #54's one-terminal-drawn trap.
+    #[allow(clippy::type_complexity)]
+    seats: Query<
+        'w,
+        's,
+        (
+            &'static mut TerminalSurface,
+            &'static mut TerminalRedrawState,
+            &'static mut TerminalFrameDirty,
+            &'static TerminalRuntime,
+            &'static DirectTerminalSceneExchange,
+        ),
+    >,
     selection: Res<'w, TerminalSelection>,
     time: Res<'w, Time>,
-    redraw: Query<'w, 's, &'static mut TerminalRedrawState>,
     images: ResMut<'w, Assets<Image>>,
-    direct_render: Res<'w, DirectTerminalSceneExchange>,
     model_load_state: Res<'w, ModelLoadState>,
-    frame_dirty: Query<'w, 's, &'static mut TerminalFrameDirty>,
     viz_registry: Res<'w, VizRegistry>,
     presence: Res<'w, crate::presence::PresenceRegistry>,
     blink_phase: Local<'s, u64>,
@@ -615,108 +625,64 @@ pub(crate) fn render_terminal_widget(mut params: RenderWidgetParams) {
     let RenderWidgetParams {
         app_config,
         cursor_settings,
-        runtime,
-        terminal,
+        seats,
         selection,
         time,
-        redraw,
         images,
-        direct_render,
         model_load_state,
-        frame_dirty,
         viz_registry,
         presence,
         blink_phase,
     } = &mut params;
-    let mut terminal = match terminal.single_mut() {
-        Ok(terminal) => terminal,
-        Err(err) => {
-            // Latched once per process: the surface lives on THE terminal
-            // seat, and the miss must name its system (#54's silent-.single()
-            // finding).
-            warn_once!(
-                "render_terminal_widget: the surface needs exactly one terminal seat: {err}"
-            );
-            return;
-        }
-    };
-    let mut frame_dirty = match frame_dirty.single_mut() {
-        Ok(frame_dirty) => frame_dirty,
-        Err(err) => {
-            // Latched once per process: the dirty flag lives on THE terminal
-            // seat, and the miss must name its system (#54's silent-.single()
-            // finding).
-            warn_once!(
-                "render_terminal_widget: the frame-dirty flag needs exactly one terminal seat: {err}"
-            );
-            return;
-        }
-    };
-    let runtime = match runtime.single() {
-        Ok(runtime) => runtime,
-        Err(err) => {
-            // Latched once per process: the runtime lives on THE terminal
-            // seat, and the miss must name its system (#54's silent-.single()
-            // finding).
-            warn_once!(
-                "render_terminal_widget: the runtime needs exactly one terminal seat: {err}"
-            );
-            return;
-        }
-    };
-    let mut redraw = match redraw.single_mut() {
-        Ok(redraw) => redraw,
-        Err(err) => {
-            // Latched once per process: the redraw flag lives on THE terminal
-            // seat, and the miss must name its system (#54's silent-.single()
-            // finding).
-            warn_once!(
-                "render_terminal_widget: the redraw flag needs exactly one terminal seat: {err}"
-            );
-            return;
-        }
-    };
-    let needs_redraw = redraw.take();
     // The texture content only changes with terminal state or blink phase;
     // warp and camera animations are mesh- and camera-side. Rebuilding on
     // blink ticks instead of every frame keeps idle scene builds at 4Hz.
+    // Blink phase is genuinely one (spine decision 3): a quantization of
+    // global time, identical for every seat, computed once before the loop.
     let phase = (time.elapsed_secs() / BLINK_TICK_SECS) as u64;
     let blink_ticked = **blink_phase != phase;
     **blink_phase = phase;
-    frame_dirty.0 = needs_redraw || blink_ticked || !model_load_state.loaded;
-    if !frame_dirty.0 {
-        return;
-    }
-
-    let screen = runtime.parser.screen();
-    let _ = terminal.tui.draw(|frame| {
-        frame.render_widget(
-            TerminalWidget {
-                screen,
-                selection,
-                theme: &app_config.theme,
-                font_style: app_config.font.style,
-            },
-            frame.area(),
-        );
-
-        // Draw the block cursor only when the 3D model is not showing it, so
-        // the two never both appear (or both vanish). This reads the live
-        // cursor state, which the `cursor` command can toggle at runtime.
-        if !cursor_settings.visible && !screen.hide_cursor() {
-            let (cursor_row, cursor_col) = screen.cursor_position();
-            frame.set_cursor_position((cursor_col, cursor_row));
+    // An empty query iterates zero times, which is a legal state — seat
+    // presence is asserted by the seat-count tests, not warned about here
+    // (a latched warn inside a loop would fire once for one seat and
+    // never again).
+    for (mut terminal, mut redraw, mut frame_dirty, runtime, exchange) in seats.iter_mut() {
+        let needs_redraw = redraw.take();
+        frame_dirty.0 = needs_redraw || blink_ticked || !model_load_state.loaded;
+        if !frame_dirty.0 {
+            continue;
         }
-    });
 
-    let _ = terminal.sync_image(
-        images,
-        direct_render,
-        time.elapsed_secs(),
-        viz_registry,
-        presence,
-        time.elapsed(),
-    );
+        let screen = runtime.parser.screen();
+        let _ = terminal.tui.draw(|frame| {
+            frame.render_widget(
+                TerminalWidget {
+                    screen,
+                    selection,
+                    theme: &app_config.theme,
+                    font_style: app_config.font.style,
+                },
+                frame.area(),
+            );
+
+            // Draw the block cursor only when the 3D model is not showing it, so
+            // the two never both appear (or both vanish). This reads the live
+            // cursor state, which the `cursor` command can toggle at runtime.
+            if !cursor_settings.visible && !screen.hide_cursor() {
+                let (cursor_row, cursor_col) = screen.cursor_position();
+                frame.set_cursor_position((cursor_col, cursor_row));
+            }
+        });
+
+        let _ = terminal.sync_image(
+            images,
+            exchange,
+            time.elapsed_secs(),
+            viz_registry,
+            presence,
+            time.elapsed(),
+        );
+    }
 }
 
 #[derive(SystemParam)]

@@ -1,5 +1,6 @@
-//! Direct Vello-to-Bevy texture rendering for the terminal surface.
+//! Direct Vello-to-Bevy texture rendering for the terminal surfaces.
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use bevy::asset::RenderAssetUsages;
@@ -20,38 +21,40 @@ use parley_ratatui::vello::Scene;
 use parley_ratatui::vello::peniko::Color as PenikoColor;
 use parley_ratatui::{GpuRenderer, TerminalRenderer};
 
+use crate::identity::{TerminalId, TerminalIdentity};
+
 /// Plugin that renders terminal Vello scenes directly into Bevy GPU textures.
 pub(crate) struct DirectTerminalRenderPlugin;
 
 impl Plugin for DirectTerminalRenderPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<DirectTerminalSceneExchange>();
+        // The terminal exchange is a per-seat Component since M4.3: no
+        // main-world resource, no render-world clone, no shared Arc — a
+        // cloned singleton here is exactly #54's one-mailbox trap. The
+        // avatar overlay deliberately stays a screen-global resource (one
+        // avatar, no wire, no N).
         app.init_resource::<AvatarOverlayExchange>();
-        let exchange = app
-            .world()
-            .resource::<DirectTerminalSceneExchange>()
-            .clone();
         let avatar_exchange = app.world().resource::<AvatarOverlayExchange>().clone();
 
         let render_app = app.sub_app_mut(RenderApp);
         render_app.init_resource::<DirectTerminalRenderState>();
-        render_app.world_mut().insert_resource(exchange);
         render_app.world_mut().insert_resource(avatar_exchange);
-        render_app.init_resource::<ExtractedDirectTerminalFrame>();
+        render_app.init_resource::<ExtractedDirectTerminalFrames>();
         render_app.init_resource::<ExtractedAvatarOverlayFrame>();
         render_app.add_systems(
             ExtractSchedule,
-            (extract_terminal_frame, extract_avatar_overlay_frame),
+            (extract_terminal_frames, extract_avatar_overlay_frame),
         );
-        // Render inside the render-graph schedule so Vello's submission is
+        // Render inside the render-graph schedule so Vello's submissions are
         // ordered with the frame's GPU work: `Begin` runs before the camera
-        // passes that sample the terminal texture. The avatar overlay
-        // shares the one GpuRenderer; two sequential submissions per frame.
+        // passes that sample the terminal textures. The avatar overlay
+        // shares the one GpuRenderer; N terminal submissions (ascending
+        // TerminalId) then the avatar, sequentially, per frame.
         render_app.add_systems(
             RenderGraph,
             (
-                render_terminal_frame,
-                render_avatar_overlay_frame.after(render_terminal_frame),
+                render_terminal_frames,
+                render_avatar_overlay_frame.after(render_terminal_frames),
             )
                 .in_set(RenderGraphSystems::Begin),
         );
@@ -78,8 +81,16 @@ struct DirectTerminalFrame {
     scene: Scene,
 }
 
-/// Shared bounded exchange between the main world and Bevy render world.
-#[derive(Resource, Clone, Default)]
+/// One terminal seat's bounded frame exchange with the render world.
+///
+/// A Component on the seat since M4.3, born with the seat's dress: one
+/// mailbox per terminal. The pre-M4.3 shape — a single Resource slot
+/// shared by every publisher — was #54's false-PASS mechanism (N
+/// publishers, one slot, one terminal drawn, looks fine). `Clone` clones
+/// the `Arc`, NOT the slot: cloning an existing exchange onto a second
+/// seat recreates that trap, which is why the seat tests assert slot
+/// identity, not just component presence.
+#[derive(Component, Clone, Default)]
 pub(crate) struct DirectTerminalSceneExchange {
     inner: Arc<DirectTerminalSceneExchangeInner>,
 }
@@ -109,8 +120,23 @@ impl Default for DirectTerminalRenderState {
     }
 }
 
+/// One terminal's retained render-world state: its exchange (the
+/// recycle-back channel to that seat's mailbox) and the frame retained
+/// across render frames until its GPU images are prepared.
+struct RetainedTerminalFrame {
+    exchange: DirectTerminalSceneExchange,
+    frame: Option<DirectTerminalFrame>,
+}
+
+/// The render world's keyed retention map, one entry per live terminal.
+///
+/// A `BTreeMap` so the N Vello submissions order by ascending
+/// [`TerminalId`], deterministic across runs — a `HashMap` would make
+/// submission order nondeterministic and quietly taint every future N
+/// measurement. Keyed on `TerminalId`, never the namespace (#56
+/// decision 17: persisted stamps key on `TerminalId`).
 #[derive(Resource, Default)]
-struct ExtractedDirectTerminalFrame(Option<DirectTerminalFrame>);
+struct ExtractedDirectTerminalFrames(BTreeMap<TerminalId, RetainedTerminalFrame>);
 
 impl DirectTerminalSceneExchange {
     fn take_recycled_scene(&self) -> Scene {
@@ -154,6 +180,38 @@ impl DirectTerminalSceneExchange {
             .lock()
             .expect("direct terminal pending frame lock")
             .take()
+    }
+
+    /// Whether two exchange values share one inner slot. Exists solely to
+    /// make the clone-shaped false PASS impossible in tests: inserting
+    /// `exchange.clone()` onto a second seat compiles, runs, and passes
+    /// every count test while reproducing #54's one-terminal-drawn trap
+    /// exactly.
+    #[cfg(test)]
+    pub(crate) fn same_slot(a: &Self, b: &Self) -> bool {
+        Arc::ptr_eq(&a.inner, &b.inner)
+    }
+
+    /// Test-only publish of a minimal frame distinguishable by `width`
+    /// (default image handles, empty scene) — the seat tests publish
+    /// through the real slot without a renderer.
+    #[cfg(test)]
+    pub(crate) fn publish_test_frame(&self, width: u32) {
+        self.publish_frame(DirectTerminalFrame {
+            render_image: Handle::default(),
+            present_image: Handle::default(),
+            width,
+            height: 1,
+            base_color: PenikoColor::TRANSPARENT,
+            scene: Scene::default(),
+        });
+    }
+
+    /// Test-only take reporting the pending frame's width, `None` when
+    /// the slot is empty.
+    #[cfg(test)]
+    pub(crate) fn take_pending_width(&self) -> Option<u32> {
+        self.take_pending_frame().map(|frame| frame.width)
     }
 }
 
@@ -275,97 +333,142 @@ pub(crate) fn update_direct_terminal_frame(
     });
 }
 
-fn extract_terminal_frame(
-    mut frame: ResMut<ExtractedDirectTerminalFrame>,
-    exchange: Extract<Res<DirectTerminalSceneExchange>>,
+/// Extract-phase body, factored out of the ECS so it is testable without
+/// a `RenderApp` (the root CI job runs with no display): for each live
+/// seat, drains the published frame into its keyed entry, recycling any
+/// displaced scene into THAT seat's exchange; then sweeps entries whose
+/// terminal no longer exists (decision 17's corollary: scene-global
+/// structures keyed by a terminal are swept on despawn).
+///
+/// The sweep is load-bearing for GPU memory, not hygiene — retained
+/// frames hold strong `Handle<Image>` clones, so an unswept entry keeps a
+/// despawned terminal's texture pair alive forever, and that leak renders
+/// fine (#54's lesson). A frame published after the last extract before a
+/// despawn is dropped with its seat, never rendered: correct, and not to
+/// be "fixed" with a global fallback slot — a fallback slot IS the
+/// singleton mailbox again.
+fn drain_published_frames<'a>(
+    live: impl Iterator<Item = (TerminalId, &'a DirectTerminalSceneExchange)>,
+    frames: &mut BTreeMap<TerminalId, RetainedTerminalFrame>,
 ) {
-    if let Some(next_frame) = exchange.take_pending_frame()
-        && let Some(previous_frame) = frame.0.replace(next_frame)
-    {
-        exchange.recycle_scene(previous_frame.scene);
+    let mut live_ids = Vec::new();
+    for (id, exchange) in live {
+        live_ids.push(id);
+        let entry = frames.entry(id).or_insert_with(|| RetainedTerminalFrame {
+            exchange: exchange.clone(),
+            frame: None,
+        });
+        if let Some(next_frame) = exchange.take_pending_frame()
+            && let Some(previous_frame) = entry.frame.replace(next_frame)
+        {
+            exchange.recycle_scene(previous_frame.scene);
+        }
     }
+    frames.retain(|id, _| live_ids.contains(id));
 }
 
-fn render_terminal_frame(
+/// Drains every live seat's mailbox into the keyed retention map. The ECS
+/// itself is the registry: a despawned seat simply stops matching the
+/// query, so the sweep inside [`drain_published_frames`] needs no
+/// parallel bookkeeping.
+fn extract_terminal_frames(
+    mut frames: ResMut<ExtractedDirectTerminalFrames>,
+    seats: Extract<Query<(&TerminalIdentity, &DirectTerminalSceneExchange)>>,
+) {
+    drain_published_frames(
+        seats
+            .iter()
+            .map(|(identity, exchange)| (identity.id(), exchange)),
+        &mut frames.0,
+    );
+}
+
+fn render_terminal_frames(
     mut state: ResMut<DirectTerminalRenderState>,
-    exchange: Res<DirectTerminalSceneExchange>,
-    mut frame: ResMut<ExtractedDirectTerminalFrame>,
+    mut frames: ResMut<ExtractedDirectTerminalFrames>,
     gpu_images: Res<RenderAssets<GpuImage>>,
     render_device: Res<RenderDevice>,
     render_queue: Res<RenderQueue>,
 ) {
-    let Some(current) = frame.0.take() else {
-        return;
-    };
-    // Retain undrawable frames and retry on the next render frame; a newer
-    // published frame supersedes a retained one during extraction.
-    let (Some(render_image), Some(present_image)) = (
-        gpu_images.get(&current.render_image),
-        gpu_images.get(&current.present_image),
-    ) else {
-        debug!("retaining terminal frame: GPU image not yet prepared");
-        frame.0 = Some(current);
-        return;
-    };
+    // BTreeMap iteration is ascending-TerminalId: deterministic submission
+    // order with no sort. Frames are self-describing (each carries its own
+    // texture pair), so no per-terminal lookup happens here.
+    for retained in frames.0.values_mut() {
+        let Some(current) = retained.frame.take() else {
+            continue;
+        };
+        // Retain undrawable frames and retry on the next render frame; a newer
+        // published frame supersedes a retained one during extraction.
+        let (Some(render_image), Some(present_image)) = (
+            gpu_images.get(&current.render_image),
+            gpu_images.get(&current.present_image),
+        ) else {
+            debug!("retaining terminal frame: GPU image not yet prepared");
+            retained.frame = Some(current);
+            continue;
+        };
 
-    let render_size = render_image.texture_descriptor.size;
-    let present_size = present_image.texture_descriptor.size;
-    if render_size.width != current.width
-        || render_size.height != current.height
-        || present_size.width != current.width
-        || present_size.height != current.height
-    {
-        debug!(
-            "retaining terminal frame: render {}x{}, present {}x{}, frame {}x{}",
-            render_size.width,
-            render_size.height,
-            present_size.width,
-            present_size.height,
-            current.width,
-            current.height
+        let render_size = render_image.texture_descriptor.size;
+        let present_size = present_image.texture_descriptor.size;
+        if render_size.width != current.width
+            || render_size.height != current.height
+            || present_size.width != current.width
+            || present_size.height != current.height
+        {
+            debug!(
+                "retaining terminal frame: render {}x{}, present {}x{}, frame {}x{}",
+                render_size.width,
+                render_size.height,
+                present_size.width,
+                present_size.height,
+                current.width,
+                current.height
+            );
+            retained.frame = Some(current);
+            continue;
+        }
+
+        let device = render_device.wgpu_device();
+        let renderer = state
+            .renderer
+            .get()
+            .get_or_insert_with(|| GpuRenderer::new(device).expect("vello renderer"));
+
+        // Vello rasterizes into the plain `Rgba8Unorm` storage texture; its default
+        // view is storage-compatible (no sRGB reinterpretation).
+        renderer
+            .render_scene_to_texture_view(
+                device,
+                &render_queue,
+                &render_image.texture_view,
+                current.width,
+                current.height,
+                current.base_color,
+                &current.scene,
+            )
+            .expect("render terminal scene into Bevy texture");
+
+        // Copy the rendered, sRGB-encoded bytes into the present texture, which the
+        // materials sample through an `Rgba8UnormSrgb` view to decode them. Both
+        // textures are `Rgba8Unorm`, so this is a plain same-format texel copy.
+        let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor {
+            label: Some("terminal present copy"),
+        });
+        encoder.copy_texture_to_texture(
+            render_image.texture.as_image_copy(),
+            present_image.texture.as_image_copy(),
+            Extent3d {
+                width: current.width,
+                height: current.height,
+                depth_or_array_layers: 1,
+            },
         );
-        frame.0 = Some(current);
-        return;
+        render_queue.submit([encoder.finish()]);
+
+        // Recycle into THIS seat's exchange — the retained entry is the
+        // recycle-back channel.
+        retained.exchange.recycle_scene(current.scene);
     }
-
-    let device = render_device.wgpu_device();
-    let renderer = state
-        .renderer
-        .get()
-        .get_or_insert_with(|| GpuRenderer::new(device).expect("vello renderer"));
-
-    // Vello rasterizes into the plain `Rgba8Unorm` storage texture; its default
-    // view is storage-compatible (no sRGB reinterpretation).
-    renderer
-        .render_scene_to_texture_view(
-            device,
-            &render_queue,
-            &render_image.texture_view,
-            current.width,
-            current.height,
-            current.base_color,
-            &current.scene,
-        )
-        .expect("render terminal scene into Bevy texture");
-
-    // Copy the rendered, sRGB-encoded bytes into the present texture, which the
-    // materials sample through an `Rgba8UnormSrgb` view to decode them. Both
-    // textures are `Rgba8Unorm`, so this is a plain same-format texel copy.
-    let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor {
-        label: Some("terminal present copy"),
-    });
-    encoder.copy_texture_to_texture(
-        render_image.texture.as_image_copy(),
-        present_image.texture.as_image_copy(),
-        Extent3d {
-            width: current.width,
-            height: current.height,
-            depth_or_array_layers: 1,
-        },
-    );
-    render_queue.submit([encoder.finish()]);
-
-    exchange.recycle_scene(current.scene);
 }
 
 // ── Avatar overlay (#23): a second vello scene, screen-space ──
@@ -533,4 +636,111 @@ fn render_avatar_overlay_frame(
     render_queue.submit([encoder.finish()]);
 
     exchange.recycle_scene(current.scene);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::identity::TerminalId;
+
+    #[test]
+    fn exchange_last_writer_wins_is_per_terminal() {
+        let a = DirectTerminalSceneExchange::default();
+        let b = DirectTerminalSceneExchange::default();
+        assert!(
+            !DirectTerminalSceneExchange::same_slot(&a, &b),
+            "two default exchanges are two slots"
+        );
+        a.publish_test_frame(101);
+        a.publish_test_frame(102);
+        assert_eq!(
+            a.take_pending_width(),
+            Some(102),
+            "last writer wins within one seat's slot"
+        );
+        assert!(
+            a.inner
+                .recycled
+                .lock()
+                .expect("recycled scene lock")
+                .is_some(),
+            "the displaced scene came home to A's recycle slot"
+        );
+        assert!(
+            b.inner
+                .recycled
+                .lock()
+                .expect("recycled scene lock")
+                .is_none(),
+            "recycling never crosses seats"
+        );
+        assert_eq!(
+            a.take_pending_width(),
+            None,
+            "single-slot semantics per terminal: a second take is empty"
+        );
+    }
+
+    #[test]
+    fn extract_keying_routes_by_terminal_id() {
+        let a = DirectTerminalSceneExchange::default();
+        let b = DirectTerminalSceneExchange::default();
+        let id_a = TerminalId::from_raw(1);
+        let id_b = TerminalId::from_raw(2);
+        let mut frames = BTreeMap::new();
+
+        a.publish_test_frame(101);
+        drain_published_frames([(id_a, &a), (id_b, &b)].into_iter(), &mut frames);
+        assert_eq!(frames.len(), 2, "two live seats, two entries — exactly");
+        assert_eq!(
+            frames[&id_a].frame.as_ref().map(|frame| frame.width),
+            Some(101),
+            "A's publish landed under A's key"
+        );
+        assert!(
+            frames[&id_b].frame.is_none(),
+            "B exists but has not published"
+        );
+
+        b.publish_test_frame(202);
+        drain_published_frames([(id_a, &a), (id_b, &b)].into_iter(), &mut frames);
+        assert_eq!(frames.len(), 2, "still exactly two entries");
+        assert_eq!(
+            frames[&id_a].frame.as_ref().map(|frame| frame.width),
+            Some(101),
+            "A's retained frame survives a drain with no new publish (retention)"
+        );
+        assert_eq!(
+            frames[&id_b].frame.as_ref().map(|frame| frame.width),
+            Some(202),
+            "B's publish landed under B's key"
+        );
+    }
+
+    #[test]
+    fn retained_frames_swept_on_despawn() {
+        let a = DirectTerminalSceneExchange::default();
+        let b = DirectTerminalSceneExchange::default();
+        let id_a = TerminalId::from_raw(1);
+        let id_b = TerminalId::from_raw(2);
+        let mut frames = BTreeMap::new();
+        a.publish_test_frame(101);
+        b.publish_test_frame(202);
+        drain_published_frames([(id_a, &a), (id_b, &b)].into_iter(), &mut frames);
+        assert_eq!(frames.len(), 2, "both seats retained while both live");
+
+        // B despawns: it stops matching the live query, and its entry —
+        // holding strong Handle<Image> clones — must go with it.
+        drain_published_frames([(id_a, &a)].into_iter(), &mut frames);
+        assert_eq!(
+            frames.keys().copied().collect::<Vec<_>>(),
+            vec![id_a],
+            "the dead terminal's entry is swept; exactly the live seat remains"
+        );
+        assert_eq!(
+            frames[&id_a].frame.as_ref().map(|frame| frame.width),
+            Some(101),
+            "the surviving seat's retained frame is intact"
+        );
+    }
 }

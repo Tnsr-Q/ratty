@@ -19,7 +19,9 @@ use bevy::window::PrimaryWindow;
 use bevy::camera::visibility::NoFrustumCulling;
 
 use crate::config::AppConfig;
-use crate::direct_render::{new_terminal_image, new_terminal_render_image};
+use crate::direct_render::{
+    DirectTerminalSceneExchange, new_terminal_image, new_terminal_render_image,
+};
 use crate::identity::{TerminalIdentity, TerminalRegistry};
 use crate::inline::TerminalInlineObjects;
 use crate::present::{TerminalPresentMaterial, fullscreen_quad};
@@ -514,6 +516,10 @@ pub(crate) fn dress_terminal_seat(
         },
         TerminalPlaneWarp::default(),
         TerminalInlineObjects::default(),
+        // A FRESH mailbox per seat, born with the dress — never a clone
+        // of another seat's exchange (an Arc clone shares the one slot:
+        // #54's false PASS, asserted against by the seat tests).
+        DirectTerminalSceneExchange::default(),
     ));
 
     commands.spawn((
@@ -861,6 +867,15 @@ mod tests {
             1,
             "exactly one seat carries the identity"
         );
+        assert_eq!(
+            world
+                .query::<&DirectTerminalSceneExchange>()
+                .iter(&world)
+                .count(),
+            1,
+            "exactly one seat carries its frame exchange (the mailbox is \
+             born with the dress)"
+        );
         let identity = *world
             .query::<&TerminalIdentity>()
             .single(&world)
@@ -910,6 +925,7 @@ mod tests {
                     &TerminalRuntime,
                     &TerminalRedrawState,
                     &TerminalIdentity,
+                    &DirectTerminalSceneExchange,
                 )>()
                 .iter(&world)
                 .count(),
