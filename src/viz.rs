@@ -898,7 +898,7 @@ pub fn apply_viz_commands(
     mut registry: ResMut<VizRegistry>,
     mut acks: MessageWriter<AckOutcome>,
     mut diagnostics: ResMut<AiDiagnostics>,
-    mut redraw: ResMut<crate::terminal::TerminalRedrawState>,
+    mut redraw: Query<&mut crate::terminal::TerminalRedrawState>,
 ) {
     // Chart-family kinds carry a vello underlay inside the terminal
     // texture, so any mutation that adds, replaces, or removes one must
@@ -912,6 +912,18 @@ pub fn apply_viz_commands(
                 | VizPayload::Timeline(_)
         )
     }
+    let mut redraw = match redraw.single_mut() {
+        Ok(redraw) => redraw,
+        Err(err) => {
+            // Latched once per process: the redraw flag lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!(
+                "apply_viz_commands: the redraw flag needs exactly one terminal seat: {err}"
+            );
+            return;
+        }
+    };
     for AiCommand {
         source,
         ack_token,
@@ -1484,9 +1496,10 @@ mod tests {
 
     fn test_app() -> App {
         let mut app = App::new();
+        app.world_mut()
+            .spawn(crate::terminal::TerminalRedrawState::default());
         app.init_resource::<VizRegistry>();
         app.init_resource::<AiDiagnostics>();
-        app.init_resource::<crate::terminal::TerminalRedrawState>();
         app.add_message::<AiCommand>();
         app.add_message::<AckOutcome>();
         app.add_systems(Update, apply_viz_commands);

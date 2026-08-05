@@ -374,8 +374,20 @@ pub(crate) fn apply_ai_effect_commands(
     mut commands: MessageReader<AiCommand>,
     mut effects: ResMut<AiEffects>,
     mut acks: MessageWriter<crate::query_channel::AckOutcome>,
-    mut redraw: ResMut<TerminalRedrawState>,
+    mut redraw: Query<&mut TerminalRedrawState>,
 ) {
+    let mut redraw = match redraw.single_mut() {
+        Ok(redraw) => redraw,
+        Err(err) => {
+            // Latched once per process: the redraw flag lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!(
+                "apply_ai_effect_commands: the redraw flag needs exactly one terminal seat: {err}"
+            );
+            return;
+        }
+    };
     let mut changed = false;
     for AiCommand {
         source,
@@ -436,8 +448,20 @@ fn animate_ai_effects(
     time: Res<Time>,
     mut effects: ResMut<AiEffects>,
     mut sprite: Query<&mut Sprite, With<AiEffectSprite>>,
-    mut redraw: ResMut<TerminalRedrawState>,
+    mut redraw: Query<&mut TerminalRedrawState>,
 ) {
+    let mut redraw = match redraw.single_mut() {
+        Ok(redraw) => redraw,
+        Err(err) => {
+            // Latched once per process: the redraw flag lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!(
+                "animate_ai_effects: the redraw flag needs exactly one terminal seat: {err}"
+            );
+            return;
+        }
+    };
     effects.advance(time.delta_secs());
     let (color, _) = effects.overlay();
     if let Ok(mut sprite) = sprite.single_mut() {

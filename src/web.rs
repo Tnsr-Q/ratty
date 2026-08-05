@@ -415,7 +415,7 @@ fn drain_web_controls(
     mut view: ResMut<TerminalPlaneView>,
     mut mobius: ResMut<MobiusTransition>,
     mut stage_tween: ResMut<StageTween>,
-    mut redraw: ResMut<TerminalRedrawState>,
+    mut redraw: Query<&mut TerminalRedrawState>,
     mut sound: ResMut<crate::sound::SoundState>,
 ) {
     let mut warp = match warp.single_mut() {
@@ -425,6 +425,18 @@ fn drain_web_controls(
             // seat, and the miss must name its system (#54's silent-.single()
             // finding).
             warn_once!("drain_web_controls: the plane warp needs exactly one terminal seat: {err}");
+            return;
+        }
+    };
+    let mut redraw = match redraw.single_mut() {
+        Ok(redraw) => redraw,
+        Err(err) => {
+            // Latched once per process: the redraw flag lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!(
+                "drain_web_controls: the redraw flag needs exactly one terminal seat: {err}"
+            );
             return;
         }
     };

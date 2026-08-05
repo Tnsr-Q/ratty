@@ -245,7 +245,7 @@ pub struct MouseSystemParams<'w, 's> {
     plane_view: ResMut<'w, TerminalPlaneView>,
     stage_tween: ResMut<'w, StageTween>,
     selection: ResMut<'w, TerminalSelection>,
-    redraw: ResMut<'w, crate::terminal::TerminalRedrawState>,
+    redraw: Query<'w, 's, &'static mut crate::terminal::TerminalRedrawState>,
 }
 
 /// Handles terminal mouse input.
@@ -296,6 +296,18 @@ pub(crate) fn handle_mouse_input(
             // seat, and the miss must name its system (#54's silent-.single()
             // finding).
             warn_once!("handle_mouse_input: the runtime needs exactly one terminal seat: {err}");
+            return;
+        }
+    };
+    let mut redraw = match redraw.single_mut() {
+        Ok(redraw) => redraw,
+        Err(err) => {
+            // Latched once per process: the redraw flag lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!(
+                "handle_mouse_input: the redraw flag needs exactly one terminal seat: {err}"
+            );
             return;
         }
     };

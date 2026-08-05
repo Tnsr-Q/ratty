@@ -183,7 +183,7 @@ pub fn apply_ai_commands(
     mut plane_view: ResMut<TerminalPlaneView>,
     mut mobius: ResMut<MobiusTransition>,
     mut stage_tween: ResMut<StageTween>,
-    mut redraw: ResMut<TerminalRedrawState>,
+    mut redraw: Query<&mut TerminalRedrawState>,
     mut acks: MessageWriter<crate::query_channel::AckOutcome>,
     mut diagnostics: ResMut<crate::query_channel::AiDiagnostics>,
 ) {
@@ -197,6 +197,16 @@ pub fn apply_ai_commands(
             // seat, and the miss must name its system (#54's silent-.single()
             // finding).
             warn_once!("apply_ai_commands: the plane warp needs exactly one terminal seat: {err}");
+            return;
+        }
+    };
+    let mut redraw = match redraw.single_mut() {
+        Ok(redraw) => redraw,
+        Err(err) => {
+            // Latched once per process: the redraw flag lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!("apply_ai_commands: the redraw flag needs exactly one terminal seat: {err}");
             return;
         }
     };
@@ -350,7 +360,7 @@ pub fn apply_ai_object_commands(
     mut removals: MessageWriter<AiObjectRemoved>,
     mut cursor: ResMut<CursorSettings>,
     app_config: Res<AppConfig>,
-    mut redraw: ResMut<TerminalRedrawState>,
+    mut redraw: Query<&mut TerminalRedrawState>,
     mut acks: MessageWriter<crate::query_channel::AckOutcome>,
     mut diagnostics: ResMut<crate::query_channel::AiDiagnostics>,
 ) {
@@ -365,6 +375,18 @@ pub fn apply_ai_object_commands(
             // silent-.single() finding).
             warn_once!(
                 "apply_ai_object_commands: inline objects need exactly one terminal seat: {err}"
+            );
+            return;
+        }
+    };
+    let mut redraw = match redraw.single_mut() {
+        Ok(redraw) => redraw,
+        Err(err) => {
+            // Latched once per process: the redraw flag lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!(
+                "apply_ai_object_commands: the redraw flag needs exactly one terminal seat: {err}"
             );
             return;
         }
@@ -710,10 +732,12 @@ mod tests {
     fn test_app() -> App {
         let mut app = App::new();
         app.insert_resource(AppConfig::default());
-        app.world_mut().spawn(TerminalInlineObjects::default());
+        app.world_mut().spawn((
+            TerminalInlineObjects::default(),
+            crate::terminal::TerminalRedrawState::default(),
+        ));
         app.init_resource::<AiObjectRegistry>();
         app.init_resource::<CursorSettings>();
-        app.init_resource::<crate::terminal::TerminalRedrawState>();
         app.init_resource::<crate::query_channel::AiDiagnostics>();
         app.init_resource::<crate::viz::VizRegistry>();
         app.init_resource::<RemovedLog>();

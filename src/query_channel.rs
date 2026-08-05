@@ -1173,11 +1173,11 @@ mod tests {
         app.world_mut().spawn((
             TerminalInlineObjects::default(),
             TerminalPlaneWarp::default(),
+            TerminalRedrawState::default(),
             runtime,
         ));
         app.init_resource::<AiObjectRegistry>();
         app.init_resource::<CursorSettings>();
-        app.init_resource::<TerminalRedrawState>();
         app.init_resource::<AiDiagnostics>();
         app.init_resource::<QuerySession>();
         app.init_resource::<AiEffects>();

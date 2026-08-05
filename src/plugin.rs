@@ -21,7 +21,6 @@ use crate::systems::{
     shutdown_terminal_runtime_on_exit, sync_asset_to_terminal_cursor, sync_inline_objects,
     sync_rgp_objects, sync_terminal_materials,
 };
-use crate::terminal::TerminalRedrawState;
 
 /// Inline object entities spawned since the visibility pass last ran.
 type AddedInlineObjects<'w, 's> = Query<
@@ -44,7 +43,6 @@ impl Plugin for TerminalPlugin {
         crate::model::seed_embedded_scene_assets(app.world_mut());
         app.init_resource::<TerminalSelection>()
             .init_resource::<crate::model::CursorSettings>()
-            .init_resource::<TerminalRedrawState>()
             .init_resource::<TerminalKeyBindings>()
             .init_resource::<StageTween>()
             .init_non_send::<TerminalClipboard>()

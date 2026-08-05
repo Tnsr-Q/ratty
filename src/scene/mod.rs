@@ -24,7 +24,9 @@ use crate::inline::TerminalInlineObjects;
 use crate::present::{TerminalPresentMaterial, fullscreen_quad};
 use crate::runtime::TerminalRuntime;
 use crate::systems::TerminalFrameDirty;
-use crate::terminal::{TerminalLayout, TerminalSurface, render_scale_for_window};
+use crate::terminal::{
+    TerminalLayout, TerminalRedrawState, TerminalSurface, render_scale_for_window,
+};
 
 /// Marker for the 2D terminal sprite.
 #[derive(Component)]
@@ -397,6 +399,7 @@ pub(crate) fn setup_scene(mut params: SetupSceneParams) {
             back: back_mesh.clone(),
         },
         TerminalFrameDirty::default(),
+        TerminalRedrawState::default(),
         TerminalViewport {
             size: layout.logical_size,
             center: viewport_center,
@@ -767,6 +770,11 @@ mod tests {
             "exactly one seat carries the runtime"
         );
         assert_eq!(
+            world.query::<&TerminalRedrawState>().iter(&world).count(),
+            1,
+            "exactly one seat carries the redraw flag"
+        );
+        assert_eq!(
             world
                 .query::<(
                     &TerminalSurface,
@@ -776,6 +784,7 @@ mod tests {
                     &TerminalPlaneWarp,
                     &TerminalInlineObjects,
                     &TerminalRuntime,
+                    &TerminalRedrawState,
                 )>()
                 .iter(&world)
                 .count(),

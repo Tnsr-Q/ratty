@@ -185,7 +185,7 @@ pub fn pump_pty_output(
     mut viz_registry: ResMut<crate::viz::VizRegistry>,
     mut ai_commands: MessageWriter<crate::ai::AiCommand>,
     mut queries: MessageWriter<crate::query_channel::QueryRequest>,
-    mut redraw: ResMut<TerminalRedrawState>,
+    mut redraw: Query<&mut TerminalRedrawState>,
 ) {
     let mut inline_objects = match inline_objects.single_mut() {
         Ok(inline_objects) => inline_objects,
@@ -204,6 +204,16 @@ pub fn pump_pty_output(
             // seat, and the miss must name its system (#54's silent-.single()
             // finding).
             warn_once!("pump_pty_output: the runtime needs exactly one terminal seat: {err}");
+            return;
+        }
+    };
+    let mut redraw = match redraw.single_mut() {
+        Ok(redraw) => redraw,
+        Err(err) => {
+            // Latched once per process: the redraw flag lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!("pump_pty_output: the redraw flag needs exactly one terminal seat: {err}");
             return;
         }
     };
@@ -315,10 +325,12 @@ mod pump_disconnect_tests {
 
     fn pump_app(runtime: TerminalRuntime) -> App {
         let mut app = App::new();
-        app.world_mut()
-            .spawn((TerminalInlineObjects::default(), runtime));
+        app.world_mut().spawn((
+            TerminalInlineObjects::default(),
+            TerminalRedrawState::default(),
+            runtime,
+        ));
         app.init_resource::<VizRegistry>()
-            .init_resource::<TerminalRedrawState>()
             .add_message::<AppExit>()
             .add_message::<crate::ai::AiCommand>()
             .add_message::<crate::query_channel::QueryRequest>()
@@ -414,7 +426,7 @@ pub(crate) struct ResizeParams<'w, 's> {
     primary_window: Query<'w, 's, (Entity, &'static Window), With<PrimaryWindow>>,
     runtime: Query<'w, 's, &'static mut TerminalRuntime>,
     terminal: Query<'w, 's, &'static mut TerminalSurface>,
-    redraw: ResMut<'w, TerminalRedrawState>,
+    redraw: Query<'w, 's, &'static mut TerminalRedrawState>,
     viewport: Query<'w, 's, &'static mut TerminalViewport>,
     plane_query: TerminalPlaneLayoutQuery<'w, 's>,
     plane_back_query: TerminalPlaneBackLayoutQuery<'w, 's>,
@@ -468,6 +480,18 @@ pub(crate) fn handle_window_resize(
             // seat, and the miss must name its system (#54's silent-.single()
             // finding).
             warn_once!("handle_window_resize: the runtime needs exactly one terminal seat: {err}");
+            return;
+        }
+    };
+    let mut redraw = match redraw.single_mut() {
+        Ok(redraw) => redraw,
+        Err(err) => {
+            // Latched once per process: the redraw flag lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!(
+                "handle_window_resize: the redraw flag needs exactly one terminal seat: {err}"
+            );
             return;
         }
     };
@@ -566,7 +590,7 @@ pub(crate) struct RenderWidgetParams<'w, 's> {
     terminal: Query<'w, 's, &'static mut TerminalSurface>,
     selection: Res<'w, TerminalSelection>,
     time: Res<'w, Time>,
-    redraw: ResMut<'w, TerminalRedrawState>,
+    redraw: Query<'w, 's, &'static mut TerminalRedrawState>,
     images: ResMut<'w, Assets<Image>>,
     direct_render: Res<'w, DirectTerminalSceneExchange>,
     model_load_state: Res<'w, ModelLoadState>,
@@ -630,6 +654,18 @@ pub(crate) fn render_terminal_widget(mut params: RenderWidgetParams) {
             // finding).
             warn_once!(
                 "render_terminal_widget: the runtime needs exactly one terminal seat: {err}"
+            );
+            return;
+        }
+    };
+    let mut redraw = match redraw.single_mut() {
+        Ok(redraw) => redraw,
+        Err(err) => {
+            // Latched once per process: the redraw flag lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!(
+                "render_terminal_widget: the redraw flag needs exactly one terminal seat: {err}"
             );
             return;
         }
@@ -791,7 +827,7 @@ pub(crate) struct ModelLoadParams<'w, 's> {
     app_config: Res<'w, AppConfig>,
     cursor_settings: ResMut<'w, CursorSettings>,
     model_load_state: ResMut<'w, ModelLoadState>,
-    redraw: ResMut<'w, TerminalRedrawState>,
+    redraw: Query<'w, 's, &'static mut TerminalRedrawState>,
     commands: Commands<'w, 's>,
     meshes: ResMut<'w, Assets<Mesh>>,
     materials: ResMut<'w, Assets<StandardMaterial>>,
@@ -825,6 +861,18 @@ pub(crate) fn finish_terminal_model_load(mut params: ModelLoadParams) {
             // finding).
             warn_once!(
                 "finish_terminal_model_load: the frame-dirty flag needs exactly one terminal seat: {err}"
+            );
+            return;
+        }
+    };
+    let mut redraw = match redraw.single_mut() {
+        Ok(redraw) => redraw,
+        Err(err) => {
+            // Latched once per process: the redraw flag lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!(
+                "finish_terminal_model_load: the redraw flag needs exactly one terminal seat: {err}"
             );
             return;
         }
@@ -2922,8 +2970,20 @@ pub fn animate_mobius_transition(
     mut presentation: ResMut<TerminalPresentation>,
     mut mobius_transition: ResMut<MobiusTransition>,
     mut plane_view: ResMut<TerminalPlaneView>,
-    mut redraw: ResMut<TerminalRedrawState>,
+    mut redraw: Query<&mut TerminalRedrawState>,
 ) {
+    let mut redraw = match redraw.single_mut() {
+        Ok(redraw) => redraw,
+        Err(err) => {
+            // Latched once per process: the redraw flag lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!(
+                "animate_mobius_transition: the redraw flag needs exactly one terminal seat: {err}"
+            );
+            return;
+        }
+    };
     if presentation.mode != TerminalPresentationMode::Mobius3d {
         mobius_transition.stop();
         return;
@@ -2960,7 +3020,7 @@ pub fn apply_rgp_stage(
     mut plane_view: ResMut<TerminalPlaneView>,
     mut mobius_transition: ResMut<MobiusTransition>,
     mut stage_tween: ResMut<StageTween>,
-    mut redraw: ResMut<TerminalRedrawState>,
+    mut redraw: Query<&mut TerminalRedrawState>,
 ) {
     let mut plane_warp = match plane_warp.single_mut() {
         Ok(plane_warp) => plane_warp,
@@ -2969,6 +3029,16 @@ pub fn apply_rgp_stage(
             // seat, and the miss must name its system (#54's silent-.single()
             // finding).
             warn_once!("apply_rgp_stage: the plane warp needs exactly one terminal seat: {err}");
+            return;
+        }
+    };
+    let mut redraw = match redraw.single_mut() {
+        Ok(redraw) => redraw,
+        Err(err) => {
+            // Latched once per process: the redraw flag lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!("apply_rgp_stage: the redraw flag needs exactly one terminal seat: {err}");
             return;
         }
     };
@@ -3075,7 +3145,7 @@ pub fn animate_stage_tween(
     mut stage_tween: ResMut<StageTween>,
     mut plane_warp: Query<&mut TerminalPlaneWarp>,
     mut plane_view: ResMut<TerminalPlaneView>,
-    mut redraw: ResMut<TerminalRedrawState>,
+    mut redraw: Query<&mut TerminalRedrawState>,
 ) {
     let mut plane_warp = match plane_warp.single_mut() {
         Ok(plane_warp) => plane_warp,
@@ -3085,6 +3155,18 @@ pub fn animate_stage_tween(
             // finding).
             warn_once!(
                 "animate_stage_tween: the plane warp needs exactly one terminal seat: {err}"
+            );
+            return;
+        }
+    };
+    let mut redraw = match redraw.single_mut() {
+        Ok(redraw) => redraw,
+        Err(err) => {
+            // Latched once per process: the redraw flag lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!(
+                "animate_stage_tween: the redraw flag needs exactly one terminal seat: {err}"
             );
             return;
         }

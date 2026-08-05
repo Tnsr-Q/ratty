@@ -342,7 +342,7 @@ pub struct KeyboardSystemParams<'w, 's> {
     plane_query: TerminalPlaneLayoutQuery<'w, 's>,
     plane_back_query: TerminalPlaneBackLayoutQuery<'w, 's>,
     bindings: Res<'w, TerminalKeyBindings>,
-    redraw: ResMut<'w, TerminalRedrawState>,
+    redraw: Query<'w, 's, &'static mut TerminalRedrawState>,
     _marker: std::marker::PhantomData<&'s ()>,
 }
 
@@ -369,6 +369,18 @@ pub fn handle_keyboard_input(
             // seat, and the miss must name its system (#54's silent-.single()
             // finding).
             warn_once!("handle_keyboard_input: the runtime needs exactly one terminal seat: {err}");
+            return;
+        }
+    };
+    let mut redraw = match params.redraw.single_mut() {
+        Ok(redraw) => redraw,
+        Err(err) => {
+            // Latched once per process: the redraw flag lives on THE terminal
+            // seat, and the miss must name its system (#54's silent-.single()
+            // finding).
+            warn_once!(
+                "handle_keyboard_input: the redraw flag needs exactly one terminal seat: {err}"
+            );
             return;
         }
     };
@@ -404,7 +416,7 @@ pub fn handle_keyboard_input(
                         params.stage_tween.stop();
                     }
                     params.selection.clear();
-                    params.redraw.request();
+                    redraw.request();
                     continue;
                 }
                 BindingAction::ToggleMobiusMode => {
@@ -428,7 +440,7 @@ pub fn handle_keyboard_input(
                             .begin_enter(previous_mode, &params.plane_view);
                     }
                     params.selection.clear();
-                    params.redraw.request();
+                    redraw.request();
                     continue;
                 }
                 BindingAction::ScrollPageUp
@@ -472,7 +484,7 @@ pub fn handle_keyboard_input(
                         };
                         screen.set_scrollback(next);
                         params.selection.clear();
-                        params.redraw.request();
+                        redraw.request();
                     }
                     continue;
                 }
@@ -498,7 +510,7 @@ pub fn handle_keyboard_input(
                         }
                     };
                     plane_warp.adjust(delta);
-                    params.redraw.request();
+                    redraw.request();
                     continue;
                 }
                 BindingAction::Copy => {
@@ -508,7 +520,7 @@ pub fn handle_keyboard_input(
                         params.clipboard.copy(&text);
                     }
                     if params.selection.clear() {
-                        params.redraw.request();
+                        redraw.request();
                     }
                     continue;
                 }
@@ -519,7 +531,7 @@ pub fn handle_keyboard_input(
                         warn!("failed to read clipboard contents for paste");
                     }
                     if params.selection.clear() {
-                        params.redraw.request();
+                        redraw.request();
                     }
                     continue;
                 }
@@ -569,7 +581,7 @@ pub fn handle_keyboard_input(
                             &mut params.plane_query,
                             &mut params.plane_back_query,
                         );
-                        params.redraw.request();
+                        redraw.request();
                     }
                     continue;
                 }
@@ -580,7 +592,7 @@ pub fn handle_keyboard_input(
             && !is_modifier_key(binding_key_code)
             && params.selection.clear()
         {
-            params.redraw.request();
+            redraw.request();
         }
 
         if let Some(input) = keyboard.handle_event_with_modes(
@@ -592,7 +604,7 @@ pub fn handle_keyboard_input(
             let screen = runtime.parser.screen_mut();
             if screen.scrollback() != 0 {
                 screen.set_scrollback(0);
-                params.redraw.request();
+                redraw.request();
             }
             runtime.write_input(&input);
         }

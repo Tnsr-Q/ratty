@@ -50,7 +50,7 @@ impl TerminalLayout {
 }
 
 /// Terminal redraw flag.
-#[derive(Resource)]
+#[derive(Component)]
 pub struct TerminalRedrawState {
     needs_redraw: bool,
 }
