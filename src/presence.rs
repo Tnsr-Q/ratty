@@ -463,9 +463,6 @@ impl PresenceRegistry {
             })
     }
 
-    /// Full session reset: clear every roster. Presence is wire-tier
-    /// state with no trusted tier, so everything goes; called from the
-    /// `reset` tap, which acks elsewhere.
     /// Test-only: seeds one participant row, for the cross-module
     /// despawn-sweep test (`join` stays private to the applier).
     #[cfg(test)]
@@ -489,6 +486,9 @@ impl PresenceRegistry {
         self.participant_count(namespace) + self.note_count(namespace) > 0
     }
 
+    /// Full session reset: clear every roster. Presence is wire-tier
+    /// state with no trusted tier, so everything goes; called from the
+    /// `reset` tap, which acks elsewhere.
     fn reset(&mut self) {
         if self.is_empty() {
             return;

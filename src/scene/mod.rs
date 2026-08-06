@@ -634,11 +634,16 @@ pub fn spawn_terminal<E>(
 /// cleanup — it cannot be forgotten. The session halves on the seat
 /// entity need no line here: despawn destroys them with the entity.
 ///
-/// The namespace returns to the pool as the LAST act, and this is the
-/// ONLY release site paired with the spawner's only allocation site (a
-/// second sweeping observer would silently break that): a namespace is
-/// allocatable again only after nothing keyed by it exists, so no
-/// interleaving lets a new tenant coexist with unswept state.
+/// The namespace returns to the pool as the LAST act. This is the only
+/// release site for a lease that ever got keyed or bound to anything
+/// ([`spawn_terminal`]'s build-failure rollback also releases, but that
+/// lease never touched a seat or a registry); a second sweeping observer
+/// would silently break the pairing. Free-is-last means a namespace is
+/// allocatable again only after this observer has swept everything keyed
+/// by it — the registry release is synchronous here, while the owned
+/// plane/object despawns above are deferred `Commands`, but observer
+/// commands drain in the same flush and target captured `Entity` ids, so
+/// no new tenant can observe or collide with the corpse entities.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn sweep_despawned_terminal(
     remove: On<bevy::ecs::lifecycle::Remove, TerminalIdentity>,
@@ -653,6 +658,7 @@ pub(crate) fn sweep_despawned_terminal(
     mut avatar: ResMut<crate::avatar::AvatarState>,
     mut sound: ResMut<crate::sound::SoundState>,
     mut bookmarks: ResMut<crate::bookmarks::BookmarkRegistry>,
+    mut pending_jumps: ResMut<crate::bookmarks::PendingBookmarkJumps>,
     mut object_ids: ResMut<crate::ai::AiObjectRegistry>,
 ) {
     let seat = remove.entity;
@@ -669,6 +675,9 @@ pub(crate) fn sweep_despawned_terminal(
     // The scene lock: liveness — a holder dying mid-privileged-playback
     // must not wedge the scene (safety is the TerminalId re-key itself).
     macros.sweep_terminal(id);
+    // A jump relowered between the applier and the drain must not fire
+    // as a dead terminal's scene mutation next frame.
+    pending_jumps.sweep_terminal(id);
     // The namespace-keyed globals that lawfully remain (wire-facing
     // address axes): rendered-is-public presence rows, viz entries whose
     // ids embed the namespace, the avatar speech queue and its active
@@ -1281,6 +1290,7 @@ mod tests {
         world.init_resource::<crate::avatar::AvatarState>();
         world.init_resource::<crate::sound::SoundState>();
         world.init_resource::<crate::bookmarks::BookmarkRegistry>();
+        world.init_resource::<crate::bookmarks::PendingBookmarkJumps>();
         world.init_resource::<crate::ai::AiObjectRegistry>();
         world.add_observer(sweep_despawned_terminal);
 
@@ -1333,6 +1343,13 @@ mod tests {
         world
             .resource_mut::<crate::bookmarks::BookmarkRegistry>()
             .test_insert(ns_b, "spot");
+        {
+            // A jump relowered but not yet drained — stamped by TerminalId,
+            // so the sweep keys on identity, never the namespace.
+            let mut pending = world.resource_mut::<crate::bookmarks::PendingBookmarkJumps>();
+            pending.test_push(id_a.ingress());
+            pending.test_push(id_b.ingress());
+        }
         world
             .resource_mut::<crate::ai::AiObjectRegistry>()
             .test_reserve(B_OBJECT);
@@ -1405,6 +1422,14 @@ mod tests {
                 .get(ns_b, "spot")
                 .is_none(),
             "B's bookmarks are swept"
+        );
+        assert_eq!(
+            world
+                .resource::<crate::bookmarks::PendingBookmarkJumps>()
+                .test_sources(),
+            vec![id_a.ingress()],
+            "B's relower-pending jump is swept before the drain can fire \
+             it as a dead terminal's scene mutation; A's survives"
         );
         assert!(
             !world
@@ -1514,6 +1539,7 @@ mod tests {
         world.init_resource::<crate::avatar::AvatarState>();
         world.init_resource::<crate::sound::SoundState>();
         world.init_resource::<crate::bookmarks::BookmarkRegistry>();
+        world.init_resource::<crate::bookmarks::PendingBookmarkJumps>();
         world.init_resource::<crate::ai::AiObjectRegistry>();
         world.add_observer(sweep_despawned_terminal);
 

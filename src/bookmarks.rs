@@ -129,6 +129,32 @@ impl BookmarkRegistry {
 #[derive(Resource, Default)]
 pub struct PendingBookmarkJumps(Vec<(IngressSource, RattyAiCommand)>);
 
+impl PendingBookmarkJumps {
+    /// Despawn sweep (#56 decision 17's corollary): drops a dead
+    /// terminal's not-yet-relowered jumps so a terminal that dies between
+    /// the applier and the drain never mutates the scene from beyond the
+    /// grave. Keyed by [`crate::identity::TerminalId`] (the stamp rule),
+    /// never the namespace.
+    pub(crate) fn sweep_terminal(&mut self, id: crate::identity::TerminalId) {
+        self.0.retain(|(source, _)| source.terminal() != id);
+    }
+
+    /// Test-only: seeds one relower-pending jump command, for the
+    /// cross-module despawn-sweep test (the buffer stays private to the
+    /// applier/drain pair).
+    #[cfg(test)]
+    pub(crate) fn test_push(&mut self, source: IngressSource) {
+        self.0
+            .push((source, RattyAiCommand::SetWarp { intensity: 0.0 }));
+    }
+
+    /// Test-only: the stamped sources still awaiting relowering.
+    #[cfg(test)]
+    pub(crate) fn test_sources(&self) -> Vec<IngressSource> {
+        self.0.iter().map(|(source, _)| *source).collect()
+    }
+}
+
 /// Registers the bookmark registry and its appliers.
 ///
 /// Ordering: the applier runs after `pump_pty_output` (commands apply
