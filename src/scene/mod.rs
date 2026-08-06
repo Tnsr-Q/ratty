@@ -1781,6 +1781,7 @@ mod tests {
         world.init_resource::<Messages<FocusLost>>();
         world.init_resource::<Messages<KeyboardInput>>();
         world.init_resource::<Messages<TerminalSpawnRequested>>();
+        world.init_resource::<crate::terminals::PendingTerminalCloses>();
         world.init_resource::<Messages<crate::ai::AiCommand>>();
         world.init_resource::<Messages<crate::query_channel::AckOutcome>>();
         let bindings = {

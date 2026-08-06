@@ -237,6 +237,15 @@ impl FromWorld for TerminalKeyBindings {
                 },
                 BindingAction::SpawnTerminal,
             ),
+            KeyBinding::new(
+                KeyCode::KeyW,
+                BindingModifiers {
+                    control: true,
+                    alt: true,
+                    ..default()
+                },
+                BindingAction::CloseTerminal,
+            ),
         ];
 
         for binding in &app_config.bindings.keys {
@@ -369,6 +378,7 @@ pub struct KeyboardSystemParams<'w, 's> {
     focus: Res<'w, FocusedTerminal>,
     focus_requests: MessageWriter<'w, FocusRequest>,
     spawn_requests: MessageWriter<'w, TerminalSpawnRequested>,
+    pending_closes: ResMut<'w, crate::terminals::PendingTerminalCloses>,
     seats: Query<'w, 's, (Entity, &'static TerminalIdentity)>,
     _marker: std::marker::PhantomData<&'s ()>,
 }
@@ -658,6 +668,34 @@ pub fn handle_keyboard_input(
                     // only asks. Repeat-suppressed like every
                     // non-repeating chord — one press, one terminal.
                     params.spawn_requests.write(TerminalSpawnRequested);
+                    continue;
+                }
+                BindingAction::CloseTerminal => {
+                    // The human's close, and the live cap's release valve:
+                    // a shell that exits does not free its seat, so
+                    // without a chord a full cap would be permanent.
+                    //
+                    // Queued through the same buffer `term.close` uses, so
+                    // there is exactly one despawn site — and it already
+                    // runs after the query channel, which the wire needs
+                    // and the chord does not mind.
+                    //
+                    // Refused when it is the only live seat: closing the
+                    // last terminal leaves the app blank and deaf, and
+                    // quitting is the window's job, not a chord's.
+                    let Some(focused) = focused else {
+                        continue;
+                    };
+                    if params.seats.iter().count() < 2 {
+                        info!(
+                            "close-terminal chord ignored: this is the only live terminal \
+                             (close the window to quit)"
+                        );
+                        continue;
+                    }
+                    if let Ok((_, identity)) = params.seats.get(focused) {
+                        params.pending_closes.push_from_chord(identity.id());
+                    }
                     continue;
                 }
             }
@@ -1281,6 +1319,7 @@ mod routing_tests {
         world.init_resource::<Messages<FocusGained>>();
         world.init_resource::<Messages<FocusLost>>();
         world.init_resource::<Messages<TerminalSpawnRequested>>();
+        world.init_resource::<crate::terminals::PendingTerminalCloses>();
 
         let mut registry = TerminalRegistry::default();
         let seat = |world: &mut World, registry: &mut TerminalRegistry| {
@@ -1290,10 +1329,16 @@ mod routing_tests {
             let entity = world
                 .spawn((identity, runtime, TerminalRedrawState::default()))
                 .id();
+            registry
+                .bind(identity.id(), entity)
+                .expect("the just-allocated lease is live");
             (entity, host)
         };
         let seat_a = seat(&mut world, &mut registry);
         let seat_b = seat(&mut world, &mut registry);
+        // The registry is bound and installed so the close chord's drain
+        // can resolve a queued id back to its seat.
+        world.insert_resource(registry);
         (world, seat_a, seat_b)
     }
 
@@ -1406,6 +1451,101 @@ mod routing_tests {
         assert!(
             host_a.input_rx.try_recv().is_err() && host_b.input_rx.try_recv().is_err(),
             "a consumed chord never leaks bytes to any terminal"
+        );
+    }
+
+    /// The close chord queues the FOCUSED seat through the same buffer
+    /// `term.close` uses — one despawn site — and sends no bytes.
+    #[test]
+    fn the_close_chord_queues_the_focused_seat_and_sends_no_bytes() {
+        use crate::terminals::PendingTerminalCloses;
+
+        let (mut world, (seat_a, host_a), (seat_b, host_b)) = routing_world();
+        assert_eq!(
+            world.query::<&TerminalIdentity>().iter(&world).count(),
+            2,
+            "seat count asserted (#58 rider)"
+        );
+        focus(&mut world, seat_b);
+        let id_b = world
+            .get::<TerminalIdentity>(seat_b)
+            .expect("seat B identity")
+            .id();
+
+        {
+            let mut keys = world.resource_mut::<ButtonInput<KeyCode>>();
+            keys.press(KeyCode::ControlLeft);
+            keys.press(KeyCode::AltLeft);
+        }
+        type_key(
+            &mut world,
+            KeyCode::KeyW,
+            Key::Character("w".into()),
+            Some("w"),
+        );
+
+        assert_eq!(
+            world.resource::<PendingTerminalCloses>().test_pending(),
+            &[id_b],
+            "the focused seat is queued, not the boot seat"
+        );
+        assert!(
+            host_a.input_rx.try_recv().is_err() && host_b.input_rx.try_recv().is_err(),
+            "a consumed chord never leaks bytes to any terminal"
+        );
+
+        // The drain despawns it, and the seat count drops.
+        world
+            .run_system_once(crate::terminals::despawn_closed_terminals)
+            .expect("the drain runs");
+        world.flush();
+        assert_eq!(
+            world.query::<&TerminalIdentity>().iter(&world).count(),
+            1,
+            "seat count asserted (#58 rider)"
+        );
+        let _ = seat_a;
+    }
+
+    /// Closing the last terminal would leave the app blank and deaf, so
+    /// the chord refuses. Quitting is the window's job.
+    #[test]
+    fn the_close_chord_refuses_the_only_live_terminal() {
+        use crate::terminals::PendingTerminalCloses;
+
+        let (mut world, (seat_a, _host_a), (seat_b, _host_b)) = routing_world();
+        world.despawn(seat_b);
+        world.flush();
+        assert_eq!(
+            world.query::<&TerminalIdentity>().iter(&world).count(),
+            1,
+            "seat count asserted (#58 rider)"
+        );
+        focus(&mut world, seat_a);
+
+        {
+            let mut keys = world.resource_mut::<ButtonInput<KeyCode>>();
+            keys.press(KeyCode::ControlLeft);
+            keys.press(KeyCode::AltLeft);
+        }
+        type_key(
+            &mut world,
+            KeyCode::KeyW,
+            Key::Character("w".into()),
+            Some("w"),
+        );
+
+        assert!(
+            world
+                .resource::<PendingTerminalCloses>()
+                .test_pending()
+                .is_empty(),
+            "the last terminal is not closable by chord"
+        );
+        assert_eq!(
+            world.query::<&TerminalIdentity>().iter(&world).count(),
+            1,
+            "seat count asserted (#58 rider)"
         );
     }
 

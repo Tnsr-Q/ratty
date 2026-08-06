@@ -293,6 +293,15 @@ pub enum BindingAction {
     /// page API.
     #[serde(rename = "SpawnTerminal")]
     SpawnTerminal,
+    /// Closes the focused terminal, unless it is the only one left.
+    ///
+    /// The human's counterpart to `term.close`, and the release valve the
+    /// live cap requires: a shell that exits does NOT free its seat (the
+    /// terminal holds it with its final screen), so without this a few
+    /// spawn-and-exit cycles would fill `[terminal] max_live` for the rest
+    /// of the process lifetime with no way back.
+    #[serde(rename = "CloseTerminal")]
+    CloseTerminal,
 }
 
 /// Font configuration.

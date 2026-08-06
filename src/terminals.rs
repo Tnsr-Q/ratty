@@ -748,6 +748,13 @@ impl PendingTerminalCloses {
         }
     }
 
+    /// Queues a close from the user's chord. Same buffer, same drain —
+    /// one despawn site, so the wire and the human cannot diverge on
+    /// teardown ordering.
+    pub(crate) fn push_from_chord(&mut self, id: TerminalId) {
+        self.push(id);
+    }
+
     /// Despawn sweep: a terminal that died by another path between the
     /// applier and the drain must not be despawned again.
     pub(crate) fn sweep_terminal(&mut self, id: TerminalId) {
