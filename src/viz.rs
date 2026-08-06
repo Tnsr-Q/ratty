@@ -906,6 +906,10 @@ impl Plugin for VizPlugin {
                 Update,
                 crate::systems::sync_viz_objects
                     .after(crate::systems::rebuild_viz_objects)
+                    // Reads focus (roots materialize for the focused
+                    // namespace): after the drain, so a flip frame shows
+                    // the newly focused seat's charts.
+                    .after(crate::focus::drain_focus_requests)
                     .run_if(|roots: Query<(), With<VizObjectRoot>>| !roots.is_empty()),
             )
             .add_systems(
@@ -950,6 +954,23 @@ pub fn apply_viz_commands(
         ..
     } in commands.read()
     {
+        // Liveness gates every viz-family commit: a namespace-keyed record
+        // committed for a dead arrival would land after the despawn sweep
+        // and leak into the recycled slot's next tenant (#56 decision 17's
+        // corollary). Foreign families pass through untouched.
+        if matches!(
+            command,
+            RattyAiCommand::VizSet { .. }
+                | RattyAiCommand::VizEffect { .. }
+                | RattyAiCommand::VizRemove { .. }
+        ) && !seats
+            .iter()
+            .any(|(identity, _)| identity.id() == source.terminal())
+        {
+            warn!("ratty-viz: command dropped: its arrival terminal is gone");
+            continue;
+        }
+
         // Every rejection below both warns and lands in the caller's
         // `state.errors` ring; `tok=` commands additionally get their
         // error ack.

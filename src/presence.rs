@@ -1247,6 +1247,10 @@ impl Plugin for PresencePlugin {
                 sync_presence_cursor_markers
                     .after(apply_presence_commands)
                     .after(crate::systems::handle_window_resize)
+                    // Reads focus (markers materialize for the focused
+                    // namespace): after the drain, so a flip frame poses
+                    // against the newly focused seat.
+                    .after(crate::focus::drain_focus_requests)
                     .run_if(
                         |registry: Res<PresenceRegistry>,
                          markers: Query<(), With<PresenceCursorMarker>>| {
@@ -1319,12 +1323,25 @@ pub fn apply_presence_commands(
         }
         macro_rules! commit {
             ($action:literal, $result:expr) => {
+                // Liveness gates the COMMIT itself, not just the repaint: a
+                // namespace-keyed row committed for a dead arrival would
+                // land after the despawn sweep and leak into the recycled
+                // slot's next tenant (#56 decision 17's corollary).
+                if !seats
+                    .iter()
+                    .any(|(identity, _)| identity.id() == source.terminal())
+                {
+                    warn!(
+                        "ratty-presence: {} dropped: its arrival terminal is gone",
+                        $action
+                    );
+                    continue;
+                }
                 match $result {
                     Ok(()) => {
                         // The row rides its carrying stream (#25): the
                         // repaint belongs to the ARRIVAL terminal's texture
-                        // alone. A dead arrival terminal has no texture to
-                        // repaint; the registry row was still committed.
+                        // alone.
                         if let Some((_, mut redraw)) = seats
                             .iter_mut()
                             .find(|(identity, _)| identity.id() == source.terminal())
@@ -2397,5 +2414,79 @@ mod tests {
             .expect("the system should run");
         world.flush();
         assert_eq!(marker_namespaces(&mut world), vec![1]);
+
+        // 3D with no owned plane for the focused seat: the projection
+        // hides the marker (never a panic) — Flat2d never consults the
+        // plane, the 3D modes degrade to hidden until dress restores it.
+        world.insert_resource(TerminalPresentation {
+            mode: TerminalPresentationMode::Plane3d,
+        });
+        world
+            .run_system_once(sync_presence_cursor_markers)
+            .expect("the system should run");
+        world.flush();
+        let hidden = world
+            .query_filtered::<&Visibility, With<PresenceCursorMarker>>()
+            .iter(&world)
+            .all(|visibility| *visibility == Visibility::Hidden);
+        assert!(
+            hidden,
+            "3D markers hide while the focused seat has no owned plane"
+        );
+    }
+
+    #[test]
+    fn expiry_redraw_targets_only_seats_whose_namespace_holds_rows() {
+        use bevy::ecs::system::RunSystemOnce;
+
+        let mut world = World::new();
+        world.init_resource::<Time>();
+        world.init_resource::<PresenceRegistry>();
+        let mut registry = crate::identity::TerminalRegistry::default();
+        let id_a = registry.allocate().expect("lease a"); // namespace 0
+        let id_b = registry.allocate().expect("lease b"); // namespace 1
+        let seat_a = world.spawn((id_a, TerminalRedrawState::default())).id();
+        let seat_b = world.spawn((id_b, TerminalRedrawState::default())).id();
+        assert_eq!(
+            world
+                .query::<&crate::identity::TerminalIdentity>()
+                .iter(&world)
+                .count(),
+            2,
+            "seat count asserted (#58 rider)"
+        );
+
+        // Rows only in namespace 0.
+        world
+            .resource_mut::<PresenceRegistry>()
+            .set_note(0, "n1", "HI", 1, 1, None, false, Duration::ZERO)
+            .expect("registry op ok");
+        // Clear boot-time pending redraws so requests are observable.
+        let clear = |world: &mut World, seat: Entity| {
+            world
+                .get_mut::<TerminalRedrawState>(seat)
+                .expect("redraw flag")
+                .take();
+        };
+        clear(&mut world, seat_a);
+        clear(&mut world, seat_b);
+
+        world
+            .run_system_once(request_presence_expiry_redraw)
+            .expect("the system should run");
+        let taken = |world: &mut World, seat: Entity| {
+            world
+                .get_mut::<TerminalRedrawState>(seat)
+                .expect("redraw flag")
+                .take()
+        };
+        assert!(
+            taken(&mut world, seat_a),
+            "the seat whose namespace holds rows repaints"
+        );
+        assert!(
+            !taken(&mut world, seat_b),
+            "a seat that never carried presence has nothing to erase"
+        );
     }
 }

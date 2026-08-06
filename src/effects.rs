@@ -557,7 +557,8 @@ mod tests {
         fn tint_command(identity: TerminalIdentity) -> AiCommand {
             AiCommand {
                 source: identity.ingress(),
-                ack_token: None,
+                // Tokened, so ack presence/absence discriminates below.
+                ack_token: Some("t1".into()),
                 origin: crate::ai::CommandOrigin::Wire,
                 command: RattyAiCommand::Tint {
                     color: "#ff0000".into(),
@@ -576,18 +577,19 @@ mod tests {
 
         #[test]
         fn effect_commands_route_to_the_arrival_seat_and_the_wash_follows_focus() {
-            let (mut world, (seat_a, id_a), (seat_b, _id_b)) = wash_world();
+            let (mut world, (seat_a, _id_a), (seat_b, id_b)) = wash_world();
             assert_eq!(
                 world.query::<&TerminalIdentity>().iter(&world).count(),
                 2,
                 "seat count asserted (#58 rider)"
             );
 
-            // A's transport carries a tint: only A's state mutates, and
-            // only A's redraw is requested.
+            // B's transport carries the tint — deliberately the SECOND
+            // seat, so a broken router that grabs the first seat it
+            // iterates fails here — and only B's state mutates.
             world
                 .resource_mut::<Messages<AiCommand>>()
-                .write(tint_command(id_a));
+                .write(tint_command(id_b));
             world
                 .run_system_once(apply_ai_effect_commands)
                 .expect("applier runs");
@@ -598,18 +600,26 @@ mod tests {
                     .public_state()
                     .tint
             };
-            assert!(tinted(&mut world, seat_a), "the arrival seat is tinted");
+            assert!(tinted(&mut world, seat_b), "the arrival seat is tinted");
             assert!(
-                !tinted(&mut world, seat_b),
+                !tinted(&mut world, seat_a),
                 "a foreign seat's effects are untouched (decision 14 routing)"
             );
+            assert_eq!(
+                world
+                    .resource_mut::<Messages<crate::query_channel::AckOutcome>>()
+                    .drain()
+                    .count(),
+                1,
+                "the committed tint acks exactly once"
+            );
 
-            // Focused-wash: with B focused, A's mood does not render (the
-            // decision 14 stated gap) — the wash is idle-clear. Focus A
-            // and the wash shows A's overlay, no extra wiring.
+            // Focused-wash: with A focused, B's mood does not render (the
+            // decision 14 stated gap) — the wash is idle-clear. Focus B
+            // and the wash shows B's overlay, no extra wiring.
             world
                 .resource_mut::<FocusedTerminal>()
-                .set_for_test(Some(seat_b));
+                .set_for_test(Some(seat_a));
             world
                 .run_system_once(animate_ai_effects)
                 .expect("animator runs");
@@ -621,7 +631,7 @@ mod tests {
 
             world
                 .resource_mut::<FocusedTerminal>()
-                .set_for_test(Some(seat_a));
+                .set_for_test(Some(seat_b));
             world
                 .run_system_once(animate_ai_effects)
                 .expect("animator runs");
@@ -634,7 +644,7 @@ mod tests {
             // And back: the wash clears again when focus leaves the tint.
             world
                 .resource_mut::<FocusedTerminal>()
-                .set_for_test(Some(seat_b));
+                .set_for_test(Some(seat_a));
             world
                 .run_system_once(animate_ai_effects)
                 .expect("animator runs");
@@ -647,14 +657,21 @@ mod tests {
 
         #[test]
         fn a_dead_arrival_terminal_drops_the_command_without_a_panic() {
-            let (mut world, (seat_a, id_a), _seat_b) = wash_world();
+            let (mut world, (seat_a, id_a), (seat_b, _id_b)) = wash_world();
             world.despawn(seat_a);
+            assert_eq!(
+                world.query::<&TerminalIdentity>().iter(&world).count(),
+                1,
+                "seat count asserted (#58 rider)"
+            );
             world
                 .resource_mut::<Messages<AiCommand>>()
                 .write(tint_command(id_a));
             world
                 .run_system_once(apply_ai_effect_commands)
                 .expect("applier runs");
+            // The command was TOKENED (see tint_command): zero acks means
+            // the drop really happened, not that nothing asked for one.
             assert_eq!(
                 world
                     .resource_mut::<Messages<crate::query_channel::AckOutcome>>()
@@ -662,6 +679,14 @@ mod tests {
                     .count(),
                 0,
                 "no ack for a command whose arrival terminal is gone"
+            );
+            assert!(
+                !world
+                    .get::<AiEffects>(seat_b)
+                    .expect("survivor has effects")
+                    .public_state()
+                    .tint,
+                "a dead arrival's command is never rerouted to a survivor"
             );
         }
     }

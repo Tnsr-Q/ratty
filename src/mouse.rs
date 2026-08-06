@@ -19,6 +19,13 @@ use crate::terminal::TerminalSurface;
 const SELECTION_DRAG_THRESHOLD: f32 = 4.0;
 
 /// Active terminal text selection.
+///
+/// One selection exists screen-wide until picking lands (M4.6), but it
+/// BELONGS to the terminal it was made on (#56 decision 11: selections
+/// survive focus loss — on their own terminal): `owner` records the seat
+/// the press-capture started on, and every consumer (render, copy,
+/// typing-clear) attributes through it. `None` means unowned (a fresh
+/// state, or a test-made selection) and falls back to focused-only.
 #[derive(Resource, Clone, Default)]
 pub struct TerminalSelection {
     start: Option<UVec2>,
@@ -27,6 +34,7 @@ pub struct TerminalSelection {
     pending_position: Option<Vec2>,
     dragging: bool,
     cursor_position: Option<Vec2>,
+    owner: Option<Entity>,
 }
 
 #[derive(Default)]
@@ -172,7 +180,23 @@ impl TerminalSelection {
         self.pending_position = None;
         self.dragging = false;
         self.cursor_position = None;
+        self.owner = None;
         changed
+    }
+
+    /// Stamps the seat this selection belongs to (the press-capture
+    /// terminal); set where the drag begins.
+    pub(crate) fn set_owner(&mut self, owner: Entity) {
+        self.owner = Some(owner);
+    }
+
+    /// Whether `seat` may treat this selection as its own: it owns it, or
+    /// the selection is unowned (fresh, or test-made) and falls back to
+    /// whoever asks. A selection owned elsewhere is standing state — it
+    /// must neither render on, be copied from, nor be cleared by another
+    /// terminal (#56 decision 11).
+    pub(crate) fn owned_by_or_unowned(&self, seat: Entity) -> bool {
+        self.owner.is_none_or(|owner| owner == seat)
     }
 
     /// Stores the current pointer position.
@@ -411,6 +435,10 @@ pub(crate) fn handle_mouse_input(
                     && let Some(cell) = position_to_cell(pos, window_size, viewport, terminal)
                     && selection.begin_pending(cell, pos)
                 {
+                    // The press-capture terminal owns the selection for its
+                    // whole life (#56 decision 11): under M4.4's routing
+                    // that is the focused seat.
+                    selection.set_owner(focused);
                     redraw.request();
                 }
             }
@@ -553,7 +581,9 @@ pub(crate) fn handle_mouse_input(
                 let current = screen.scrollback() as isize;
                 let next = (current + amount).max(0) as usize;
                 screen.set_scrollback(next);
-                selection.clear();
+                if selection.owned_by_or_unowned(focused) {
+                    selection.clear();
+                }
                 redraw.request();
             }
         } else if matches!(

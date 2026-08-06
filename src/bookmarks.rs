@@ -218,6 +218,17 @@ pub fn apply_bookmark_commands(
         }
         match command {
             RattyAiCommand::Bookmark { name, replace } => {
+                // Liveness first: the stored warp is the arrival seat's own
+                // (#56 decision 17's corollary — never a 0.0 stand-in for a
+                // corpse), and a dead arrival's row must not outlive the
+                // sweep.
+                if !seats
+                    .iter()
+                    .any(|(identity, _)| identity.id() == source.terminal())
+                {
+                    warn!("ratty-bookmarks: bookmark dropped: its arrival terminal is gone");
+                    continue;
+                }
                 let namespace = source.namespace();
                 if name.is_empty() {
                     warn!("ratty-ai: bookmark rejected: empty name");

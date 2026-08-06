@@ -19,8 +19,11 @@
 //! 8. No implicit focus: no fallback-to-terminal-#1 from nothing, no focus
 //!    from wire spawn, no focus from a missing pick. Death succession among
 //!    live terminals (decision 8's restatement) is NOT implicit focus —
-//!    the drain's MRU fallback exists so a normal shell `exit` does not
-//!    leave the user deaf.
+//!    the drain's MRU fallback exists so closing the focused terminal does
+//!    not leave the user deaf. (A plain shell `exit` does NOT reach it in
+//!    M4.4 — disconnect holds the seat with its final screen; the fallback
+//!    fires on real seat despawns: today's test worlds, M4.5's
+//!    `term.close`.)
 //!
 //! Lifecycle policy (#56 decision 8): boot focuses the boot seat via
 //! [`FocusOrigin::SpawnPolicy`]; user-initiated spawns focus their child;
@@ -200,8 +203,8 @@ pub(crate) fn drain_focus_requests(
     // Death succession (#56 decision 8): the focused terminal died and no
     // valid request replaced it — the most-recently-focused survivor
     // takes over; with no history, mint order. Never `None` while live
-    // terminals exist: under `None` every normal shell `exit` would drop
-    // the user deaf until they click something.
+    // terminals exist: under `None` closing the focused terminal would
+    // drop the user deaf until they act again.
     let stale_current = focus.current.is_some_and(|current| !alive(current));
     if winner.is_none() && stale_current {
         let survivor = focus
@@ -314,6 +317,10 @@ mod tests {
         world
             .run_system_once(drain_focus_requests)
             .expect("drain runs");
+        // run_system_once never advances message buffers; drop the applied
+        // requests so a later drain in the same test cannot replay them
+        // (a replayed winner would mask the very policy under test).
+        world.resource_mut::<Messages<FocusRequest>>().clear();
     }
 
     fn focused(world: &mut World) -> Option<Entity> {
@@ -400,12 +407,21 @@ mod tests {
             1,
             "seat count asserted (#58 rider)"
         );
+        world.resource_mut::<Messages<FocusGained>>().clear();
         request(&mut world, Some(seat_b), FocusOrigin::WireVerb);
         run_drain(&mut world);
         assert_eq!(
             focused(&mut world),
             Some(seat_a),
             "the authority never points at a dead entity on purpose"
+        );
+        assert_eq!(
+            world
+                .resource_mut::<Messages<FocusGained>>()
+                .drain()
+                .count(),
+            0,
+            "a dropped corpse request fires nothing"
         );
     }
 
@@ -475,17 +491,25 @@ mod tests {
             "seat count asserted (#58 rider)"
         );
 
-        // History: A focused, then C — MRU is [C, A]; B never focused.
-        request(&mut world, Some(seat_a), FocusOrigin::SpawnPolicy);
+        // History: B focused, then C — MRU is [C, B]; A never focused.
+        // The MRU survivor (B) deliberately differs from the mint-order
+        // minimum (A): a fallback that ignored the history and fell to
+        // mint order would land on A and fail here.
+        request(&mut world, Some(seat_b), FocusOrigin::SpawnPolicy);
         run_drain(&mut world);
         request(&mut world, Some(seat_c), FocusOrigin::PointerPress);
         run_drain(&mut world);
 
-        // C dies mid-focus: succession lands on A, the most-recently-
-        // focused survivor — not on B, and not on `None` (decision 8).
+        // C dies mid-focus: succession lands on B, the most-recently-
+        // focused survivor — not on mint-first A, not on `None`
+        // (decision 8).
         world.despawn(seat_c);
         run_drain(&mut world);
-        assert_eq!(focused(&mut world), Some(seat_a));
+        assert_eq!(
+            focused(&mut world),
+            Some(seat_b),
+            "MRU succession, not mint order"
+        );
         let lost: Vec<_> = world
             .resource_mut::<Messages<FocusLost>>()
             .drain()
@@ -495,15 +519,20 @@ mod tests {
             "a corpse gets no events — it cannot repaint"
         );
 
-        // A dies with no focused history left: mint order breaks the tie
-        // rather than leaving the user deaf.
-        world.despawn(seat_a);
+        // B dies with no focused history left (C is a corpse): mint order
+        // breaks the tie rather than leaving the user deaf — A, the only
+        // survivor, was never focused at all.
+        world.despawn(seat_b);
         run_drain(&mut world);
-        assert_eq!(focused(&mut world), Some(seat_b));
+        assert_eq!(
+            focused(&mut world),
+            Some(seat_a),
+            "with no live history, succession falls to mint order"
+        );
 
         // Bounded-resource rider: the history holds live seats only.
         let mru = &world.resource::<FocusedTerminal>().mru;
-        assert_eq!(mru.as_slice(), &[seat_b], "MRU pruned to live seats");
+        assert_eq!(mru.as_slice(), &[seat_a], "MRU pruned to live seats");
     }
 
     #[test]

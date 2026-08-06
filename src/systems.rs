@@ -700,7 +700,10 @@ pub(crate) fn render_terminal_widget(mut params: RenderWidgetParams) {
         }
 
         let screen = runtime.parser.screen();
-        let seat_selection = if is_focused {
+        // Attribution, not just focus: the selection renders only on the
+        // seat that OWNS it (#56 decision 11 — a selection made on A must
+        // not highlight the same cell range on a later-focused B).
+        let seat_selection = if is_focused && selection.owned_by_or_unowned(seat) {
             &**selection
         } else {
             &empty_selection
@@ -1058,8 +1061,13 @@ pub(crate) fn sync_inline_objects(mut params: SyncInlineParams) {
         return;
     };
     // Per-object rebuilds (queued by `depth` updates and glTF restyles) only
-    // run when no full rebuild is due; a full rebuild subsumes them.
-    let full_sync = inline_objects.needs_sync(viewport.size, terminal.cols, terminal.rows);
+    // run when no full rebuild is due; a full rebuild subsumes them. A
+    // focus flip IS a full rebuild: the stage now projects a different
+    // seat's registry, and two seats with identical geometry would
+    // otherwise never trip `needs_sync` — the stale seat's sprites would
+    // squat the stage while the refocused seat's never respawn.
+    let full_sync = focus.is_changed()
+        || inline_objects.needs_sync(viewport.size, terminal.cols, terminal.rows);
     let rebuild_ids = if full_sync {
         None
     } else {
@@ -2913,7 +2921,14 @@ pub fn animate_terminal_plane_warp(
     let needs_update = match presentation.mode {
         TerminalPresentationMode::Flat2d => false,
         TerminalPresentationMode::Plane3d => {
-            presentation.is_changed() || warp.is_changed() || warp.amount > 0.0
+            // `focus.is_changed()`: a refocused seat's meshes may hold a
+            // warp shape written frames ago (its own change ticks never
+            // moved while it was off stage) — the flip itself demands one
+            // rebuild.
+            presentation.is_changed()
+                || focus.is_changed()
+                || warp.is_changed()
+                || warp.amount > 0.0
         }
         // Reapply the strip every frame so mode switches and time-based motion are visible.
         TerminalPresentationMode::Mobius3d => true,
@@ -4141,10 +4156,20 @@ mod single_plane_degrade_tests {
         world.init_resource::<Assets<StandardMaterial>>();
         world.init_resource::<Assets<Image>>();
         world.init_resource::<Assets<Mesh>>();
-        // Planes exist but neither is owned by the focused seat — the
-        // owner join must never anchor to a foreign plane.
-        world.spawn((TerminalPlane, Transform::default()));
-        world.spawn((TerminalPlane, Transform::default()));
+        // Planes exist but both are OWNED BY A FOREIGN SEAT — an owner
+        // predicate that matched any plane (or the first) would anchor
+        // here and skip the warn.
+        let foreign = world.spawn_empty().id();
+        world.spawn((
+            TerminalPlane,
+            crate::scene::TerminalOwner(foreign),
+            Transform::default(),
+        ));
+        world.spawn((
+            TerminalPlane,
+            crate::scene::TerminalOwner(foreign),
+            Transform::default(),
+        ));
 
         let warns = capture_warns(|| {
             world
@@ -4188,8 +4213,18 @@ mod single_plane_degrade_tests {
                 RgpAnimationState::default(),
             ))
             .id();
-        world.spawn((TerminalPlane, Transform::default()));
-        world.spawn((TerminalPlane, Transform::default()));
+        // Foreign-owned planes: the owner join must not anchor to them.
+        let foreign = world.spawn_empty().id();
+        world.spawn((
+            TerminalPlane,
+            crate::scene::TerminalOwner(foreign),
+            Transform::default(),
+        ));
+        world.spawn((
+            TerminalPlane,
+            crate::scene::TerminalOwner(foreign),
+            Transform::default(),
+        ));
 
         let warns = capture_warns(|| {
             world
@@ -4251,8 +4286,18 @@ mod single_plane_degrade_tests {
                 Visibility::Visible,
             ))
             .id();
-        world.spawn((TerminalPlane, Transform::default()));
-        world.spawn((TerminalPlane, Transform::default()));
+        // Foreign-owned planes: the owner join must not anchor to them.
+        let foreign = world.spawn_empty().id();
+        world.spawn((
+            TerminalPlane,
+            crate::scene::TerminalOwner(foreign),
+            Transform::default(),
+        ));
+        world.spawn((
+            TerminalPlane,
+            crate::scene::TerminalOwner(foreign),
+            Transform::default(),
+        ));
 
         let warns = capture_warns(|| {
             world
@@ -4289,10 +4334,19 @@ mod single_plane_degrade_tests {
         let cursor = world
             .spawn((CursorModel, Transform::default(), Visibility::Visible))
             .id();
-        // Two planes, neither owned by the seat the focus will point at —
-        // the owner join must never anchor to a foreign plane.
-        world.spawn((TerminalPlane, Transform::default()));
-        world.spawn((TerminalPlane, Transform::default()));
+        // Two planes, both owned by a FOREIGN seat — the owner join must
+        // never anchor the cursor to another terminal's plane.
+        let foreign = world.spawn_empty().id();
+        world.spawn((
+            TerminalPlane,
+            crate::scene::TerminalOwner(foreign),
+            Transform::default(),
+        ));
+        world.spawn((
+            TerminalPlane,
+            crate::scene::TerminalOwner(foreign),
+            Transform::default(),
+        ));
 
         // Zero focused (invariant 1's legal state): the model hides, with
         // no warn — there is nothing broken about an unfocused scene.
@@ -4341,6 +4395,96 @@ mod single_plane_degrade_tests {
             world.get::<Visibility>(cursor).copied(),
             Some(Visibility::Hidden),
             "the cursor model hides while the focused seat has no owned plane"
+        );
+    }
+
+    /// The review's flip-resync regression: two seats with IDENTICAL
+    /// geometry never trip `needs_sync`, so without the focus-flip
+    /// trigger the stale seat's inline sprites would squat the stage
+    /// forever and the refocused seat's would never spawn.
+    #[test]
+    fn a_focus_flip_forces_the_inline_stage_resync() {
+        let mut app = App::new();
+        app.add_plugins(AssetPlugin::default());
+        let world = app.world_mut();
+        world.insert_resource(AppConfig::default());
+        world.init_resource::<Assets<StandardMaterial>>();
+        world.init_resource::<Assets<Image>>();
+        world.init_resource::<Assets<Mesh>>();
+        world.init_resource::<Time>();
+        world.insert_resource(TerminalPresentation {
+            mode: TerminalPresentationMode::Flat2d,
+        });
+        world.init_resource::<crate::focus::FocusedTerminal>();
+
+        let mut registry = crate::identity::TerminalRegistry::default();
+        let seat = |world: &mut World, registry: &mut crate::identity::TerminalRegistry| {
+            let identity = registry.allocate().expect("test lease");
+            world
+                .spawn((
+                    identity,
+                    TerminalSurface::new(&AppConfig::default())
+                        .expect("surface construction is CPU-only"),
+                    TerminalViewport {
+                        size: Vec2::new(800.0, 480.0),
+                        center: Vec2::ZERO,
+                    },
+                    TerminalPlaneWarp::default(),
+                    TerminalInlineObjects::default(),
+                ))
+                .id()
+        };
+        let seat_a = seat(world, &mut registry);
+        let seat_b = seat(world, &mut registry);
+        // Each seat owns a plane, so the sync runs to `finish_sync` and
+        // `needs_sync` really settles — without this the registries stay
+        // permanently dirty and mask the trigger under test.
+        for owner in [seat_a, seat_b] {
+            world.spawn((
+                TerminalPlane,
+                crate::scene::TerminalOwner(owner),
+                Transform::default(),
+            ));
+        }
+        assert_eq!(
+            world
+                .query::<&crate::identity::TerminalIdentity>()
+                .iter(world)
+                .count(),
+            2,
+            "seat count asserted (#58 rider)"
+        );
+        app.add_systems(Update, sync_inline_objects);
+
+        // Settle both registries so `needs_sync` is spent: after this,
+        // only the focus-flip trigger can force a full resync.
+        let focus = |app: &mut App, seat: Entity| {
+            app.world_mut()
+                .resource_mut::<crate::focus::FocusedTerminal>()
+                .set_for_test(Some(seat));
+        };
+        focus(&mut app, seat_a);
+        app.update();
+        focus(&mut app, seat_b);
+        app.update();
+
+        // A stale sprite squats the stage (the flipped-away seat's
+        // projection); the flip back to A must clear it.
+        let stale = app.world_mut().spawn(TerminalInlineObjectSprite).id();
+        focus(&mut app, seat_a);
+        app.update();
+        assert!(
+            app.world().get_entity(stale).is_err(),
+            "the focus flip forces the full inline resync"
+        );
+
+        // Control: with focus quiet and geometry unchanged, no resync
+        // runs — the trigger really is the flip, not an every-frame sweep.
+        let stale = app.world_mut().spawn(TerminalInlineObjectSprite).id();
+        app.update();
+        assert!(
+            app.world().get_entity(stale).is_ok(),
+            "no flip, no resync — the stage is not rebuilt every frame"
         );
     }
 }

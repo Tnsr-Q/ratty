@@ -720,6 +720,14 @@ pub(crate) fn spawn_requested_terminals(
 /// cleanup — it cannot be forgotten. The session halves on the seat
 /// entity need no line here: despawn destroys them with the entity.
 ///
+/// Deliberately NOT swept here: the focused-stage projections (kitty
+/// inline sprites/planes, RGP roots, viz roots, presence markers). They
+/// are projections of the FOCUSED seat, not terminal-keyed state — a
+/// dying focused seat triggers the drain's MRU fallback, and the focus
+/// flip forces `sync_inline_objects`' full resync (and the marker/viz
+/// claim passes), which despawns the stale stage; a dying unfocused
+/// seat had nothing on stage to sweep.
+///
 /// The namespace returns to the pool as the LAST act. This is the only
 /// release site for a lease that ever got keyed or bound to anything
 /// ([`spawn_terminal`]'s build-failure rollback also releases, but that
@@ -1358,13 +1366,16 @@ mod tests {
         let handle_a = handle_of(&mut world, seat_a);
         let handle_b = handle_of(&mut world, seat_b);
 
-        // The single present quad, bound to A's texture the way setup_scene
-        // binds the boot seat's.
+        // The single present quad, bound to a sentinel texture no seat
+        // owns: any rebind the assertions below observe must have come
+        // from the system under test, and a rebind by the WRONG seat is
+        // distinguishable from no rebind at all.
+        let sentinel = world.resource_mut::<Assets<Image>>().reserve_handle();
         let quad_material =
             world
                 .resource_mut::<Assets<TerminalPresentMaterial>>()
                 .add(TerminalPresentMaterial {
-                    texture: handle_a.clone(),
+                    texture: sentinel.clone(),
                 });
         world.spawn((TerminalSprite, MeshMaterial2d(quad_material.clone())));
 
@@ -1424,6 +1435,28 @@ mod tests {
                 "focus moved: the stage follows it"
             );
         }
+        // A dirty UNFOCUSED seat must not steal the quad: with B focused
+        // and only A dirty, the binding stays on the sentinel (a gateless
+        // any-dirty-seat rebind would write A's handle here — the exact
+        // wrong-terminal-on-the-flat-screen bug decision 12 exists to
+        // prevent).
+        world
+            .get_mut::<crate::systems::TerminalFrameDirty>(seat_a)
+            .expect("dressed seat")
+            .0 = true;
+        world
+            .run_system_once(crate::systems::sync_terminal_materials)
+            .expect("materials sync runs");
+        assert_eq!(
+            world
+                .resource::<Assets<TerminalPresentMaterial>>()
+                .get(&quad_material)
+                .expect("quad material lives")
+                .texture,
+            sentinel,
+            "a dirty unfocused seat never steals the quad"
+        );
+
         world
             .get_mut::<crate::systems::TerminalFrameDirty>(seat_b)
             .expect("dressed seat")
@@ -1593,8 +1626,12 @@ mod tests {
             "boot focuses terminal #1"
         );
 
-        // Phase 2 — the user spawn: the child exists and takes focus
-        // (decision 8's user-spawn half).
+        // Phase 2 — the user spawn: the child exists and takes focus.
+        // The SpawnPolicy request is written by hand here — the story
+        // exercises the drain-side policy; the emitting halves are proven
+        // separately (`spawn_focused_terminal` in
+        // `a_user_spawn_focuses_its_child_and_its_death_falls_back_mru`,
+        // the chord in `the_spawn_chord_requests_one_terminal_and_sends_no_bytes`).
         let (seat_b, _id_b, host_b) = world
             .run_system_once(spawn_with_host)
             .expect("spawner system runs");

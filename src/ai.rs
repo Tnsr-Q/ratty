@@ -251,11 +251,11 @@ pub fn apply_ai_commands(
                 ack_commit(&mut acks, *source, ack_token);
             }
             RattyAiCommand::SetWarp { intensity } => {
-                // An explicit warp command wins over a running camera tween.
                 // Warp is the ARRIVAL terminal's own surface shape (#52's
                 // per-terminal half, arrival-is-the-address): the command
-                // morphs its own plane, never a neighbor's.
-                stage_tween.stop();
+                // morphs its own plane, never a neighbor's. Liveness gates
+                // EVERY side effect — a dead arrival's command must not
+                // even stop a running camera tween.
                 let Some((_, mut plane_warp, mut redraw)) = seats
                     .iter_mut()
                     .find(|(identity, ..)| identity.id() == source.terminal())
@@ -263,6 +263,8 @@ pub fn apply_ai_commands(
                     warn!("apply_ai_commands: warp dropped: its arrival terminal is gone");
                     continue;
                 };
+                // An explicit warp command wins over a running camera tween.
+                stage_tween.stop();
                 plane_warp.amount = intensity.clamp(0.0, 1.0);
                 redraw.request();
                 ack_commit(&mut acks, *source, ack_token);
@@ -652,6 +654,16 @@ pub fn apply_ai_object_commands(
                 brightness,
                 visible,
             } => {
+                // Liveness first: the cursor settings are scene-global, and
+                // a dead arrival's command must not half-apply them before
+                // being reported dropped.
+                if !seats
+                    .iter()
+                    .any(|(identity, ..)| identity.id() == source.terminal())
+                {
+                    warn!("ratty-ai: cursor dropped: its arrival terminal is gone");
+                    continue;
+                }
                 // The command is atomic: a bad model name rejects the whole
                 // update rather than partially applying the other fields,
                 // so the ack's reject-or-commit is the truth. (Previously
@@ -697,8 +709,12 @@ pub fn apply_ai_object_commands(
                 if let Some(visible) = visible {
                     cursor.visible = *visible;
                 }
-                let (_inline_objects, mut redraw) = arrival_seat!("cursor");
-                redraw.request();
+                // The settings are scene-global — `visible` flips the
+                // texture-side block cursor on EVERY seat, so every seat
+                // repaints, not just the arrival.
+                for (_, _, mut redraw) in seats.iter_mut() {
+                    redraw.request();
+                }
                 ack_commit(&mut acks, *source, ack_token);
             }
             RattyAiCommand::Reset => {

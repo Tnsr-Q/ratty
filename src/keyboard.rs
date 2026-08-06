@@ -501,7 +501,9 @@ pub fn handle_keyboard_input(
                             current.saturating_sub(amount)
                         };
                         screen.set_scrollback(next);
-                        params.selection.clear();
+                        if params.selection.owned_by_or_unowned(focused) {
+                            params.selection.clear();
+                        }
                         if let Ok(mut redraw) = params.redraw.get_mut(focused) {
                             redraw.request();
                         }
@@ -533,11 +535,17 @@ pub fn handle_keyboard_input(
                     continue;
                 }
                 BindingAction::Copy => {
-                    // Copy reads the FOCUSED terminal's selection against
-                    // its own screen; one clipboard.
+                    // Copy reads the FOCUSED terminal's OWN selection
+                    // against its own screen; one clipboard. A selection
+                    // owned by another terminal is that terminal's
+                    // standing state (#56 decision 11) — copying it here
+                    // would pair its cell range with the wrong screen.
                     let Some(focused) = focused else {
                         continue;
                     };
+                    if !params.selection.owned_by_or_unowned(focused) {
+                        continue;
+                    }
                     let Ok(runtime) = params.runtime.get_mut(focused) else {
                         continue;
                     };
@@ -565,7 +573,8 @@ pub fn handle_keyboard_input(
                     } else {
                         warn!("failed to read clipboard contents for paste");
                     }
-                    if params.selection.clear()
+                    if params.selection.owned_by_or_unowned(focused)
+                        && params.selection.clear()
                         && let Ok(mut redraw) = params.redraw.get_mut(focused)
                     {
                         redraw.request();
@@ -654,11 +663,14 @@ pub fn handle_keyboard_input(
             }
         }
 
-        // Typing clears the FOCUSED terminal's selection only; with no
-        // focus nothing receives the keystroke, so nothing clears.
+        // Typing clears the FOCUSED terminal's OWN selection only; a
+        // selection owned elsewhere is standing state (#56 decision 11),
+        // and with no focus nothing receives the keystroke, so nothing
+        // clears.
         if let Some(focused) = focused
             && event.state == ButtonState::Pressed
             && !is_modifier_key(binding_key_code)
+            && params.selection.owned_by_or_unowned(focused)
             && params.selection.clear()
             && let Ok(mut redraw) = params.redraw.get_mut(focused)
         {
@@ -1364,6 +1376,11 @@ mod routing_tests {
     #[test]
     fn the_focus_cycle_chord_requests_the_lru_seat_and_sends_no_bytes() {
         let (mut world, (seat_a, host_a), (seat_b, host_b)) = routing_world();
+        assert_eq!(
+            world.query::<&TerminalIdentity>().iter(&world).count(),
+            2,
+            "seat count asserted (#58 rider)"
+        );
         focus(&mut world, seat_a);
 
         // Hold Ctrl+Alt physically, press Tab.
@@ -1395,6 +1412,11 @@ mod routing_tests {
     #[test]
     fn no_focus_drops_bytes_but_scene_chords_still_work() {
         let (mut world, (_, host_a), (_, host_b)) = routing_world();
+        assert_eq!(
+            world.query::<&TerminalIdentity>().iter(&world).count(),
+            2,
+            "seat count asserted (#58 rider)"
+        );
 
         // Invariant 8: nothing is focused at this point, deliberately.
         type_key(
@@ -1420,6 +1442,42 @@ mod routing_tests {
             world.resource::<TerminalPresentation>().mode,
             TerminalPresentationMode::Plane3d,
             "scene chords survive zero focus"
+        );
+    }
+
+    #[test]
+    fn the_spawn_chord_requests_one_terminal_and_sends_no_bytes() {
+        let (mut world, (seat_a, host_a), (_, host_b)) = routing_world();
+        assert_eq!(
+            world.query::<&TerminalIdentity>().iter(&world).count(),
+            2,
+            "seat count asserted (#58 rider)"
+        );
+        focus(&mut world, seat_a);
+
+        {
+            let mut keys = world.resource_mut::<ButtonInput<KeyCode>>();
+            keys.press(KeyCode::ControlLeft);
+            keys.press(KeyCode::AltLeft);
+        }
+        type_key(
+            &mut world,
+            KeyCode::KeyT,
+            Key::Character("t".into()),
+            Some("t"),
+        );
+
+        let requests = world
+            .resource_mut::<Messages<TerminalSpawnRequested>>()
+            .drain()
+            .count();
+        assert_eq!(
+            requests, 1,
+            "one press asks for exactly one terminal (repeat-suppressed chord)"
+        );
+        assert!(
+            host_a.input_rx.try_recv().is_err() && host_b.input_rx.try_recv().is_err(),
+            "a consumed spawn chord never leaks bytes to any terminal"
         );
     }
 }
