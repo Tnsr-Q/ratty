@@ -189,7 +189,8 @@ impl Plugin for RattyAiPlugin {
                     .after(crate::reactive::evaluate_rules)
                     .after(crate::avatar::drive_avatar_speech)
                     .after(crate::avatar::apply_avatar_commands)
-                    .after(crate::presence::apply_presence_commands),
+                    .after(crate::presence::apply_presence_commands)
+                    .after(crate::terminals::apply_terminal_commands),
             );
     }
 }
@@ -372,14 +373,15 @@ pub fn apply_ai_commands(
             // day the subsystem exists. The message is `state.errors` prose
             // (`reject` records it; the ack carries only `code`), so this is
             // not a wire change.
-            // TEMPORARY (M4.5, in flight): the terminals organ does not
-            // exist yet, so this arm owns the `term.*` acks until each verb
-            // moves to `crate::terminals::apply_terminal_commands`. It is
-            // emptied one verb at a time and deleted with the last.
-            RattyAiCommand::TermSpawn { .. }
-            | RattyAiCommand::TermPlace { .. }
-            | RattyAiCommand::TermFocus { .. }
-            | RattyAiCommand::TermClose { .. } => {
+            // The terminals organ (crate::terminals::apply_terminal_commands)
+            // reads the same AiCommand messages independently and owns the
+            // term.spawn/term.focus acks, so this catch-all must never
+            // double-ack them.
+            RattyAiCommand::TermSpawn { .. } | RattyAiCommand::TermFocus { .. } => {}
+            // TEMPORARY (M4.5, in flight): the organ does not handle these
+            // two yet, so this arm still owns their acks. Emptied one verb
+            // at a time and deleted with the last.
+            RattyAiCommand::TermPlace { .. } | RattyAiCommand::TermClose { .. } => {
                 debug!("ratty-ai: term command received; the terminals organ is not built yet");
                 reject(
                     &mut diagnostics,

@@ -104,9 +104,10 @@ pub struct AckOutcome {
     /// success qualifier (e.g. `deferred` for a pre-unlock ambient set)
     /// when `ok` is true. The wire carries `code=` independently of `ok=`.
     pub code: Option<&'static str>,
-    /// Structured ack payload (the reply's `data=`), used by long-running
-    /// operations to carry the execution handle, queue position, and
-    /// estimated wait (#18). `None` for every immediate-mutation ack.
+    /// Structured ack payload (the reply's `data=`): the execution handle,
+    /// queue position and estimated wait for a long-running operation
+    /// (#18), or the new terminal's handle on an immediate-commit
+    /// `term.spawn` (#49). `None` for every other ack.
     pub payload: Option<serde_json::Value>,
 }
 
@@ -300,6 +301,38 @@ pub(crate) fn ack_commit_qualified(
             ok: true,
             code: Some(code),
             payload: None,
+        });
+    }
+}
+
+/// Writes a commit ack carrying a structured `data=` payload but NO
+/// status code — the shape an immediate-commit operation needs when its
+/// result includes a value the caller cannot otherwise learn.
+///
+/// Distinct from [`ack_commit_long_running`], which forces a status
+/// qualifier into `code=`. `term.spawn` needs exactly this and must NOT
+/// use that one: `protocols/query.md` makes absence from
+/// `state.executions` the completion signal, so `code=started` on a handle
+/// deliberately kept out of that roster would tell a conforming caller the
+/// spawn had FINISHED while it was still spawning (#56 decision 19).
+/// Its only caller today is the native `term.spawn` path; the wasm build
+/// refuses that verb (the page API owns lifecycle there), so the helper
+/// stays compiled on both targets rather than drifting behind a `cfg` —
+/// the same posture `spawn_focused_terminal` takes.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+pub(crate) fn ack_commit_with_payload(
+    acks: &mut MessageWriter<AckOutcome>,
+    source: IngressSource,
+    ack_token: &Option<String>,
+    payload: serde_json::Value,
+) {
+    if let Some(token) = ack_token {
+        acks.write(AckOutcome {
+            source,
+            token: token.clone(),
+            ok: true,
+            code: None,
+            payload: Some(payload),
         });
     }
 }
