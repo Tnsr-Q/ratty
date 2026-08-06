@@ -738,6 +738,13 @@ fn caps(ctx: &QueryCtx<'_>, source: IngressSource) -> Value {
                 .granted_to(source, ctx.config),
             "scene_ambient": crate::capability::SceneCapability::SceneAmbient
                 .granted_to(source, ctx.config),
+            // Both default DENY (#49): a caller must be able to read the
+            // grant before attempting the verb, so a refusal is never a
+            // surprise.
+            "terminal_lifecycle": crate::capability::SceneCapability::TerminalLifecycle
+                .granted_to(source, ctx.config),
+            "terminal_focus": crate::capability::SceneCapability::TerminalFocus
+                .granted_to(source, ctx.config),
         },
         // #18 honesty: whether the config-gated native sensor adapter is
         // active in this process (always false on wasm), and the sensors
@@ -2346,6 +2353,9 @@ mod tests {
         let caps = payload(&reply);
         assert_eq!(caps["trust"]["avatar_scene"], json!(true));
         assert_eq!(caps["trust"]["scene_ambient"], json!(true));
+        // Both terminal grants are readable and both default DENY.
+        assert_eq!(caps["trust"]["terminal_lifecycle"], json!(false));
+        assert_eq!(caps["trust"]["terminal_focus"], json!(false));
         assert_eq!(
             caps["limits"]["avatar_text_bytes"],
             json!(crate::avatar::MAX_AVATAR_TEXT_BYTES)

@@ -40,6 +40,22 @@ pub enum SceneCapability {
     /// bit lives at `[audio] allow_scene_ambient`, unchanged; this variant
     /// routes it through the one capability spine (see the module doc).
     SceneAmbient,
+    /// Terminal lifecycle (#49): create, place and close terminals
+    /// (`term.spawn` / `term.place` / `term.close`). The grant bit lives at
+    /// `[trust.local] terminal_lifecycle`, **default DENY** — unlike
+    /// [`Self::AvatarScene`], because these verbs fork processes and
+    /// destroy live sessions rather than restyle a shared scene. Holding
+    /// it is necessary but not sufficient: the targeted forms additionally
+    /// require creator ownership.
+    TerminalLifecycle,
+    /// Terminal focus (#49): aim the user's keyboard at a terminal
+    /// (`term.focus`). The grant bit lives at `[trust.local]
+    /// terminal_focus`, **default DENY**, and is deliberately separate
+    /// from [`Self::TerminalLifecycle`] (#56 decision 18): focus is the
+    /// keystroke-capture primitive, not a convenience verb, so an operator
+    /// granting workspace choreography must not be forced to also grant
+    /// keystroke redirection — or the reverse.
+    TerminalFocus,
 }
 
 impl SceneCapability {
@@ -57,6 +73,8 @@ impl SceneCapability {
             IngressSource::Local(_) => match self {
                 SceneCapability::AvatarScene => config.trust.local.avatar_scene,
                 SceneCapability::SceneAmbient => config.audio.allow_scene_ambient,
+                SceneCapability::TerminalLifecycle => config.trust.local.terminal_lifecycle,
+                SceneCapability::TerminalFocus => config.trust.local.terminal_focus,
             },
         }
     }
@@ -80,10 +98,51 @@ mod tests {
         assert!(!SceneCapability::AvatarScene.granted_to(IngressSource::test_boot(), &config));
         assert!(!SceneCapability::SceneAmbient.granted_to(IngressSource::test_boot(), &config));
 
-        // The two grants are independent bits.
+        // The grants are independent bits.
         config.trust.local.avatar_scene = true;
         assert!(SceneCapability::AvatarScene.granted_to(IngressSource::test_boot(), &config));
         assert!(!SceneCapability::SceneAmbient.granted_to(IngressSource::test_boot(), &config));
+
+        // The two terminal grants move independently of each other and of
+        // the avatar bit — #56 decision 18's whole point: an operator may
+        // grant workspace choreography without granting keystroke
+        // redirection, or the reverse.
+        config.trust.local.terminal_lifecycle = true;
+        assert!(SceneCapability::TerminalLifecycle.granted_to(IngressSource::test_boot(), &config));
+        assert!(!SceneCapability::TerminalFocus.granted_to(IngressSource::test_boot(), &config));
+        config.trust.local.terminal_lifecycle = false;
+        config.trust.local.terminal_focus = true;
+        assert!(
+            !SceneCapability::TerminalLifecycle.granted_to(IngressSource::test_boot(), &config)
+        );
+        assert!(SceneCapability::TerminalFocus.granted_to(IngressSource::test_boot(), &config));
+    }
+
+    /// Both terminal grants default to DENY — inverting this file's own
+    /// local convention (`avatar_scene` defaults granted), because these
+    /// verbs fork processes, destroy live sessions, and redirect the
+    /// human's keystrokes.
+    #[test]
+    fn terminal_grants_default_to_denied() {
+        let config = AppConfig::default();
+        assert!(
+            !SceneCapability::TerminalLifecycle.granted_to(IngressSource::test_boot(), &config)
+        );
+        assert!(!SceneCapability::TerminalFocus.granted_to(IngressSource::test_boot(), &config));
+    }
+
+    /// A partial `[trust.local]` table fills the rest from `Default`:
+    /// naming one bit must never silently revoke or grant another.
+    #[test]
+    fn a_partial_trust_table_leaves_the_other_grants_at_their_defaults() {
+        let config = AppConfig::from_toml_str("[trust.local]\nterminal_lifecycle = true\n")
+            .expect("trust section parses");
+        assert!(SceneCapability::TerminalLifecycle.granted_to(IngressSource::test_boot(), &config));
+        assert!(
+            !SceneCapability::TerminalFocus.granted_to(IngressSource::test_boot(), &config),
+            "the focus grant is not implied by the lifecycle grant"
+        );
+        assert!(SceneCapability::AvatarScene.granted_to(IngressSource::test_boot(), &config));
     }
 
     #[test]
@@ -107,5 +166,9 @@ mod tests {
     fn absent_trust_section_defaults_cleanly() {
         let config = AppConfig::from_toml_str("").expect("empty config parses");
         assert!(SceneCapability::AvatarScene.granted_to(IngressSource::test_boot(), &config));
+        assert!(
+            !SceneCapability::TerminalLifecycle.granted_to(IngressSource::test_boot(), &config)
+        );
+        assert!(!SceneCapability::TerminalFocus.granted_to(IngressSource::test_boot(), &config));
     }
 }

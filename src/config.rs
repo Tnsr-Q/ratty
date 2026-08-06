@@ -560,11 +560,28 @@ pub struct LocalTrustConfig {
     /// a single-tenant session directs its own scene, mirroring
     /// `[audio] allow_scene_ambient`; multi-writer operators revoke it.
     pub avatar_scene: bool,
+    /// Grants terminal lifecycle (`term.spawn`/`place`/`close`, #49).
+    /// **Default false.** These verbs fork processes and destroy live
+    /// sessions; the avatar-scene reasoning ("a single-tenant session
+    /// directs its own scene") does not carry, because one PTY is one
+    /// principal and a grant here reaches every process writing this
+    /// terminal. Granting it still does not let a caller close a terminal
+    /// it did not create.
+    pub terminal_lifecycle: bool,
+    /// Grants terminal focus (`term.focus`, #49). **Default false**, and
+    /// separate from `terminal_lifecycle` (#56 decision 18) because focus
+    /// is the keystroke-capture primitive: granting it means the wire may
+    /// redirect where the human's typing lands, continuously — not once.
+    pub terminal_focus: bool,
 }
 
 impl Default for LocalTrustConfig {
     fn default() -> Self {
-        Self { avatar_scene: true }
+        Self {
+            avatar_scene: true,
+            terminal_lifecycle: false,
+            terminal_focus: false,
+        }
     }
 }
 
