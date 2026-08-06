@@ -1495,6 +1495,141 @@ mod tests {
         );
     }
 
+    /// The M4.3 exit criterion in executable form — the whole milestone in
+    /// one test world: two terminals through the REAL spawner with the
+    /// seat count asserted explicitly, two live DirectTerminalSceneExchange
+    /// instances (distinct slots, no cross-talk), distinct monotonic
+    /// TerminalIds on distinct namespace leases, session-half components
+    /// born with each seat, scene_lock keyed by TerminalId — then one
+    /// terminal dies: the sweep runs, the namespace recycles to the next
+    /// spawn, and the TerminalId is NOT reused.
+    #[test]
+    fn m4_3_two_terminals_coexist_then_one_dies_clean() {
+        use bevy::ecs::system::RunSystemOnce;
+
+        let mut world = spawner_world();
+        world.init_resource::<crate::macros::MacroRegistry>();
+        world.init_resource::<crate::presence::PresenceRegistry>();
+        world.init_resource::<crate::viz::VizRegistry>();
+        world.init_resource::<crate::avatar::AvatarState>();
+        world.init_resource::<crate::sound::SoundState>();
+        world.init_resource::<crate::bookmarks::BookmarkRegistry>();
+        world.init_resource::<crate::ai::AiObjectRegistry>();
+        world.add_observer(sweep_despawned_terminal);
+
+        // ── Coexistence ──
+        let (seat_a, id_a) = world
+            .run_system_once(spawn_virtual_terminal)
+            .expect("spawner system runs");
+        let (seat_b, id_b) = world
+            .run_system_once(spawn_virtual_terminal)
+            .expect("spawner system runs");
+        assert_eq!(
+            world
+                .query::<(
+                    &TerminalIdentity,
+                    &TerminalSurface,
+                    &TerminalRuntime,
+                    &DirectTerminalSceneExchange,
+                    &crate::macros::TerminalMacros,
+                    &crate::reactive::TerminalReactive,
+                    &crate::query_channel::TerminalDiagnostics,
+                )>()
+                .iter(&world)
+                .count(),
+            2,
+            "exactly two seats, each carrying identity, surface, runtime, \
+             its own exchange, and every session-half component"
+        );
+        assert_eq!(
+            (id_a.id(), id_a.namespace(), id_b.id(), id_b.namespace()),
+            (
+                crate::identity::TerminalId::from_raw(1),
+                0,
+                crate::identity::TerminalId::from_raw(2),
+                1
+            ),
+            "monotonic ids on lowest-free namespace leases"
+        );
+        let exchange_a = world
+            .entity(seat_a)
+            .get::<DirectTerminalSceneExchange>()
+            .expect("A's mailbox")
+            .clone();
+        let exchange_b = world
+            .entity(seat_b)
+            .get::<DirectTerminalSceneExchange>()
+            .expect("B's mailbox")
+            .clone();
+        assert!(
+            !DirectTerminalSceneExchange::same_slot(&exchange_a, &exchange_b),
+            "two exchanges, two slots — never a shared Arc (#54's false PASS)"
+        );
+        exchange_a.publish_test_frame(11);
+        exchange_b.publish_test_frame(22);
+        assert_eq!(exchange_a.take_pending_width(), Some(11));
+        assert_eq!(exchange_b.take_pending_width(), Some(22));
+
+        // ── The stamp rule live: B holds the scene lock by TerminalId ──
+        world
+            .resource_mut::<crate::macros::MacroRegistry>()
+            .test_hold_scene_lock(id_b.id());
+
+        // ── One terminal dies ──
+        world.despawn(seat_b);
+        world.flush();
+        assert_eq!(
+            world.query::<&TerminalIdentity>().iter(&world).count(),
+            1,
+            "exactly one seat survives"
+        );
+        assert_eq!(
+            world
+                .resource::<crate::macros::MacroRegistry>()
+                .test_scene_lock(),
+            None,
+            "the sweep released the dead holder's lock"
+        );
+        assert_eq!(
+            world.resource::<TerminalRegistry>().entity_of(id_b.id()),
+            None,
+            "the dead TerminalId resolves None forever"
+        );
+
+        // ── The recycled slot's next tenant ──
+        let (seat_c, id_c) = world
+            .run_system_once(spawn_virtual_terminal)
+            .expect("spawner system runs");
+        assert_eq!(
+            world
+                .query::<(&TerminalIdentity, &DirectTerminalSceneExchange)>()
+                .iter(&world)
+                .count(),
+            2,
+            "exactly two seats again after the respawn"
+        );
+        assert_eq!(id_c.namespace(), 1, "B's namespace lease recycled to C");
+        assert_eq!(
+            id_c.id(),
+            crate::identity::TerminalId::from_raw(3),
+            "C's TerminalId is fresh — B's is never reissued"
+        );
+        let exchange_c = world
+            .entity(seat_c)
+            .get::<DirectTerminalSceneExchange>()
+            .expect("C's mailbox")
+            .clone();
+        assert!(
+            !DirectTerminalSceneExchange::same_slot(&exchange_a, &exchange_c),
+            "C's exchange is a fresh slot, not an inherited one"
+        );
+        // A was untouched throughout: its mailbox still works and its
+        // single-slot semantics held.
+        exchange_a.publish_test_frame(33);
+        assert_eq!(exchange_a.take_pending_width(), Some(33));
+        assert_eq!(exchange_a.take_pending_width(), None);
+    }
+
     fn fixtures() -> (TerminalPresentation, TerminalPlaneView, MobiusTransition) {
         (
             TerminalPresentation {
