@@ -70,11 +70,17 @@ impl Plugin for TerminalPlugin {
             // before the focus drain — the ordering edge auto-inserts a
             // command flush, so the child seat is live (and focusable) the
             // same frame its chord was pressed.
+            // Also before the query channel: this system now writes the
+            // wire roster through `TerminalSpawnParams`, and the query
+            // channel reads it. Without the edge, whether a same-frame
+            // `state.terminals` observes a chord spawn is a schedule
+            // tiebreak.
             .add_systems(
                 Update,
                 spawn_requested_terminals
                     .after(handle_keyboard_input)
-                    .before(drain_focus_requests),
+                    .before(drain_focus_requests)
+                    .before(crate::query_channel::answer_queries),
             )
             // The single focus writer (invariant 2), after every request
             // emitter in the tree and before every focus consumer: the
@@ -250,6 +256,7 @@ impl Plugin for TerminalPlugin {
             .add_plugins(crate::viz::VizPlugin)
             .add_plugins(crate::effects::AiEffectsPlugin)
             .add_plugins(crate::sound::SoundPlugin)
+            .add_plugins(crate::terminals::TerminalsPlugin)
             .add_plugins(DirectTerminalRenderPlugin)
             .add_plugins(TerminalPresentPlugin);
         // THE single despawn-sweep site (#56 decision 17), registered

@@ -42,6 +42,7 @@ pub mod scene;
 pub mod sound;
 pub mod systems;
 pub mod terminal;
+pub mod terminals;
 pub mod viz;
 mod viz_draw;
 pub mod viz_wire;
