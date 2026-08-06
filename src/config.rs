@@ -279,6 +279,12 @@ pub enum BindingAction {
     /// picking exists).
     #[serde(rename = "FocusCycle")]
     FocusCycle,
+    /// Spawns a fresh terminal running the config-default shell and
+    /// focuses it (#56 decision 8: user-initiated spawns focus their
+    /// child). Native only — the web build's lifecycle belongs to the
+    /// page API.
+    #[serde(rename = "SpawnTerminal")]
+    SpawnTerminal,
 }
 
 /// Font configuration.

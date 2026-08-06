@@ -15,7 +15,8 @@ use crate::mouse::{TerminalSelection, handle_mouse_input};
 use crate::present::TerminalPresentPlugin;
 use crate::scene::{
     MobiusTransition, StageTween, TerminalPlaneView, TerminalPresentation,
-    TerminalPresentationMode, apply_terminal_presentation, setup_scene,
+    TerminalPresentationMode, TerminalSpawnRequested, apply_terminal_presentation, setup_scene,
+    spawn_requested_terminals,
 };
 use crate::systems::{
     TerminalRedrawSet, animate_inline_kitty_planes, animate_mobius_transition, animate_stage_tween,
@@ -53,11 +54,22 @@ impl Plugin for TerminalPlugin {
             .add_message::<FocusRequest>()
             .add_message::<FocusGained>()
             .add_message::<FocusLost>()
+            .add_message::<TerminalSpawnRequested>()
             .init_non_send::<TerminalClipboard>()
             .add_systems(Startup, setup_scene)
             // Boot lifecycle policy (#56 decision 8): startup focuses the
             // boot seat through the same request bus as every other writer.
             .add_systems(Startup, focus_boot_terminal.after(setup_scene))
+            // The user-spawn drain (decision 8): after the chord's emitter,
+            // before the focus drain — the ordering edge auto-inserts a
+            // command flush, so the child seat is live (and focusable) the
+            // same frame its chord was pressed.
+            .add_systems(
+                Update,
+                spawn_requested_terminals
+                    .after(handle_keyboard_input)
+                    .before(drain_focus_requests),
+            )
             // The single focus writer (invariant 2), after every request
             // emitter in the tree and before every focus consumer: the
             // render set (blink, materials), the presentation applier

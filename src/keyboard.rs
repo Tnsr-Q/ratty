@@ -18,7 +18,7 @@ use crate::runtime::TerminalRuntime;
 use crate::scene::{
     MobiusTransition, StageTween, TerminalPlaneBackLayoutQuery, TerminalPlaneLayoutQuery,
     TerminalPlaneView, TerminalPlaneWarp, TerminalPresentation, TerminalPresentationMode,
-    TerminalViewport, sync_terminal_layout,
+    TerminalSpawnRequested, TerminalViewport, sync_terminal_layout,
 };
 use crate::terminal::{TerminalRedrawState, TerminalSurface, render_scale_for_window};
 
@@ -228,6 +228,15 @@ impl FromWorld for TerminalKeyBindings {
                 },
                 BindingAction::FocusCycle,
             ),
+            KeyBinding::new(
+                KeyCode::KeyT,
+                BindingModifiers {
+                    control: true,
+                    alt: true,
+                    ..default()
+                },
+                BindingAction::SpawnTerminal,
+            ),
         ];
 
         for binding in &app_config.bindings.keys {
@@ -359,6 +368,7 @@ pub struct KeyboardSystemParams<'w, 's> {
     redraw: Query<'w, 's, &'static mut TerminalRedrawState>,
     focus: Res<'w, FocusedTerminal>,
     focus_requests: MessageWriter<'w, FocusRequest>,
+    spawn_requests: MessageWriter<'w, TerminalSpawnRequested>,
     seats: Query<'w, 's, (Entity, &'static TerminalIdentity)>,
     _marker: std::marker::PhantomData<&'s ()>,
 }
@@ -631,6 +641,14 @@ pub fn handle_keyboard_input(
                             origin: FocusOrigin::Keybinding,
                         });
                     }
+                    continue;
+                }
+                BindingAction::SpawnTerminal => {
+                    // Decision 8's user-spawn half: the spawner system
+                    // builds the seat and focuses the child; this chord
+                    // only asks. Repeat-suppressed like every
+                    // non-repeating chord — one press, one terminal.
+                    params.spawn_requests.write(TerminalSpawnRequested);
                     continue;
                 }
             }
@@ -1250,6 +1268,7 @@ mod routing_tests {
         world.init_resource::<Messages<FocusRequest>>();
         world.init_resource::<Messages<FocusGained>>();
         world.init_resource::<Messages<FocusLost>>();
+        world.init_resource::<Messages<TerminalSpawnRequested>>();
 
         let mut registry = TerminalRegistry::default();
         let seat = |world: &mut World, registry: &mut TerminalRegistry| {

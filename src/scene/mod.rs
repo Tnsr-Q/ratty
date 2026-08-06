@@ -627,6 +627,87 @@ pub fn spawn_terminal<E>(
     Ok((seat, identity))
 }
 
+/// A user-initiated request for a fresh terminal (the spawn chord;
+/// #56 decision 8's user class). Carries nothing: #12's
+/// no-runtime-arguments is structural — a spawned terminal runs the
+/// config-default shell, and nothing here could say otherwise.
+#[derive(bevy::ecs::message::Message, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TerminalSpawnRequested;
+
+/// Spawns a terminal through [`spawn_terminal`] and emits the
+/// [`crate::focus::FocusOrigin::SpawnPolicy`] request for its child —
+/// decision 8's user-spawn half in one place, shared by the production
+/// PTY closure and the virtual-transport tests. Failures are loud, never
+/// swallowed: pool exhaustion and transport failure both land in the log
+/// with the lease already restored by [`spawn_terminal`]'s rollback.
+///
+/// The wasm build never calls it — the page API owns lifecycle there —
+/// but the policy stays compiled on both targets so it cannot drift.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+pub(crate) fn spawn_focused_terminal<E: std::fmt::Debug>(
+    params: &mut TerminalSpawnParams,
+    focus_requests: &mut MessageWriter<crate::focus::FocusRequest>,
+    build: impl FnOnce(IngressSource) -> Result<(TerminalSurface, TerminalRuntime), E>,
+) {
+    match spawn_terminal(params, build) {
+        Ok((seat, identity)) => {
+            info!(
+                "spawned terminal {:?} on namespace {}",
+                identity.id(),
+                identity.namespace()
+            );
+            focus_requests.write(crate::focus::FocusRequest {
+                target: Some(seat),
+                origin: crate::focus::FocusOrigin::SpawnPolicy,
+            });
+        }
+        Err(error) => {
+            error!("terminal spawn failed: {error:?}");
+        }
+    }
+}
+
+/// Drains [`TerminalSpawnRequested`] into real seats (native: a PTY
+/// running the config-default shell in the current working directory)
+/// and focuses each child (decision 8: user-initiated spawns focus their
+/// child; the wire's `term.spawn` — M4.5 — never will). Ordered before
+/// the focus drain so the child is live and focused the same frame.
+///
+/// On wasm the request is refused loudly: terminal lifecycle on the web
+/// belongs to the page API (#53's canvas, #86's fork), not a chord.
+pub(crate) fn spawn_requested_terminals(
+    mut requests: MessageReader<TerminalSpawnRequested>,
+    mut params: TerminalSpawnParams,
+    mut focus_requests: MessageWriter<crate::focus::FocusRequest>,
+) {
+    #[cfg(not(target_arch = "wasm32"))]
+    for _ in requests.read() {
+        let config = params.app_config.as_ref().clone();
+        spawn_focused_terminal(&mut params, &mut focus_requests, |source| {
+            let runtime = TerminalRuntime::spawn(
+                &config,
+                &crate::runtime::RuntimeOptions {
+                    command: None,
+                    working_dir: std::env::current_dir().ok(),
+                },
+                source,
+            )?;
+            let surface = TerminalSurface::new(&config)?;
+            Ok::<_, anyhow::Error>((surface, runtime))
+        });
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = &mut params;
+        let _ = &mut focus_requests;
+        for _ in requests.read() {
+            warn!(
+                "terminal spawn is not available in the web build: the page API owns lifecycle there"
+            );
+        }
+    }
+}
+
 /// THE despawn sweep (#56 decision 17's corollary as one reviewable
 /// site): every scene-global structure keyed by a terminal is swept here
 /// when that terminal dies, and any future terminal-keyed scene-global
@@ -1128,6 +1209,89 @@ mod tests {
             ))
         })
         .expect("the scaffold spawn succeeds")
+    }
+
+    /// Decision 8's user-spawn half through the real spawner: the child
+    /// is focused via its SpawnPolicy request, and the child's death
+    /// falls back to the most-recently-focused survivor.
+    #[test]
+    fn a_user_spawn_focuses_its_child_and_its_death_falls_back_mru() {
+        use bevy::ecs::message::Messages;
+        use bevy::ecs::system::RunSystemOnce;
+
+        use crate::focus::{
+            FocusGained, FocusLost, FocusOrigin, FocusRequest, FocusedTerminal,
+            drain_focus_requests,
+        };
+
+        let mut world = spawner_world();
+        world.init_resource::<FocusedTerminal>();
+        world.init_resource::<Messages<FocusRequest>>();
+        world.init_resource::<Messages<FocusGained>>();
+        world.init_resource::<Messages<FocusLost>>();
+
+        // Boot analog: seat A exists and is focused.
+        let (seat_a, _id_a) = world
+            .run_system_once(spawn_virtual_terminal)
+            .expect("spawner system runs");
+        world
+            .resource_mut::<Messages<FocusRequest>>()
+            .write(FocusRequest {
+                target: Some(seat_a),
+                origin: FocusOrigin::SpawnPolicy,
+            });
+        world
+            .run_system_once(drain_focus_requests)
+            .expect("drain runs");
+        world.resource_mut::<Messages<FocusRequest>>().clear();
+
+        // The spawn chord's path: one spawner call that also emits the
+        // child's SpawnPolicy focus request.
+        fn spawn_virtual_focused(
+            mut params: TerminalSpawnParams,
+            mut focus_requests: bevy::ecs::message::MessageWriter<crate::focus::FocusRequest>,
+        ) {
+            spawn_focused_terminal(&mut params, &mut focus_requests, |source| {
+                let (runtime, _host) =
+                    TerminalRuntime::virtual_channel(&AppConfig::default(), source);
+                Ok::<_, std::convert::Infallible>((
+                    TerminalSurface::new(&AppConfig::default())
+                        .expect("surface construction is CPU-only"),
+                    runtime,
+                ))
+            });
+        }
+        world
+            .run_system_once(spawn_virtual_focused)
+            .expect("spawner system runs");
+        world
+            .run_system_once(drain_focus_requests)
+            .expect("drain runs");
+        world.resource_mut::<Messages<FocusRequest>>().clear();
+
+        assert_eq!(
+            world.query::<&TerminalIdentity>().iter(&world).count(),
+            2,
+            "seat count asserted (#58 rider)"
+        );
+        let child = world
+            .resource::<FocusedTerminal>()
+            .get()
+            .expect("the child is focused");
+        assert_ne!(child, seat_a, "decision 8: a user spawn focuses its child");
+
+        // The child dies through the plain despawn path; succession lands
+        // on the most-recently-focused survivor, not None.
+        world.despawn(child);
+        world.flush();
+        world
+            .run_system_once(drain_focus_requests)
+            .expect("drain runs");
+        assert_eq!(
+            world.resource::<FocusedTerminal>().get(),
+            Some(seat_a),
+            "decision 8: MRU succession after the focused child dies"
+        );
     }
 
     /// The M4.3 exit-criteria test: two DirectTerminalSceneExchange
