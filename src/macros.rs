@@ -720,6 +720,33 @@ impl MacroRegistry {
             self.scene_lock = None;
         }
     }
+
+    /// Despawn-sweep release (#56 decision 17's named leak): a terminal
+    /// dying mid-privileged-playback must not wedge the scene for the
+    /// recycled slot's next tenant. The sweep is liveness; the
+    /// `TerminalId` re-key is safety even under a sweep bug — a leaked id
+    /// can never equal any future terminal's, whereas a leaked namespace
+    /// aliased the slot's next tenant.
+    pub(crate) fn sweep_terminal(&mut self, terminal: TerminalId) {
+        if self.scene_lock == Some(terminal) {
+            self.scene_lock = None;
+        }
+    }
+}
+
+#[cfg(test)]
+impl MacroRegistry {
+    /// Test-only: pins the scene lock to a holder, for the despawn-sweep
+    /// test outside this module (the field stays private — production
+    /// acquisition is `start_playback` alone).
+    pub(crate) fn test_hold_scene_lock(&mut self, terminal: TerminalId) {
+        self.scene_lock = Some(terminal);
+    }
+
+    /// Test-only: the current lock holder.
+    pub(crate) fn test_scene_lock(&self) -> Option<TerminalId> {
+        self.scene_lock
+    }
 }
 
 #[cfg(test)]

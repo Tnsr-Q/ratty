@@ -114,6 +114,31 @@ pub struct AiObjectRegistry {
     used: HashSet<u32>,
 }
 
+impl AiObjectRegistry {
+    /// Despawn sweep (#56 decision 17 / the #56 rider: "recycling is safe
+    /// only while the object-id ledger dies with its terminal"): frees a
+    /// dead terminal's id space. Ids embed the namespace, so without this
+    /// the recycled slot's next tenant would inherit the corpse's
+    /// exhausted ledger — never-reuse is a per-terminal-lifetime
+    /// guarantee, not a per-slot one.
+    pub(crate) fn sweep_namespace(&mut self, namespace: u8) {
+        self.used
+            .retain(|id| crate::osc::ai_object_namespace(*id) != Some(namespace));
+    }
+
+    /// Test-only: reserves an id, for the cross-module despawn-sweep test.
+    #[cfg(test)]
+    pub(crate) fn test_reserve(&mut self, id: u32) {
+        self.used.insert(id);
+    }
+
+    /// Test-only: whether an id is reserved.
+    #[cfg(test)]
+    pub(crate) fn test_is_used(&self, id: u32) -> bool {
+        self.used.contains(&id)
+    }
+}
+
 /// Registers the AI command message and its handler systems.
 pub struct RattyAiPlugin;
 

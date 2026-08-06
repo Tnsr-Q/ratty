@@ -759,6 +759,25 @@ impl VizRegistry {
         existed
     }
 
+    /// Despawn sweep (#56 decision 17's corollary): removes every
+    /// visualization whose id sits in a dead terminal's namespace,
+    /// queueing granular despawns for the render sync. Without this the
+    /// recycled slot's next tenant would OWN the corpse's visualizations
+    /// outright — the ownership check passes on namespace bits —
+    /// inheriting both cap pressure and mutation rights over stale
+    /// objects.
+    pub(crate) fn sweep_namespace(&mut self, namespace: u8) {
+        let dead: Vec<u32> = self
+            .entries
+            .keys()
+            .copied()
+            .filter(|id| ai_object_namespace(*id) == Some(namespace))
+            .collect();
+        for id in dead {
+            self.remove(id);
+        }
+    }
+
     /// Clears every visualization (the `reset` command), queueing
     /// granular despawns for all of them.
     pub(crate) fn clear_all(&mut self) {

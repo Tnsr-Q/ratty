@@ -97,6 +97,29 @@ impl BookmarkRegistry {
     fn clear(&mut self) {
         self.entries.clear();
     }
+
+    /// Despawn sweep (#56 decision 17's corollary): drops a dead
+    /// terminal's bookmarks so the recycled namespace slot's next tenant
+    /// starts with an empty, cap-free namespace instead of inheriting the
+    /// corpse's saved views.
+    pub(crate) fn sweep_namespace(&mut self, namespace: u8) {
+        self.entries.retain(|(ns, _), _| *ns != namespace);
+    }
+
+    /// Test-only: seeds one bookmark, for the cross-module despawn-sweep
+    /// test (`insert` stays private to the applier).
+    #[cfg(test)]
+    pub(crate) fn test_insert(&mut self, namespace: u8, name: &str) {
+        self.insert(
+            namespace,
+            name.to_string(),
+            ViewBookmark {
+                v: BOOKMARK_VERSION,
+                mode: "flat",
+                warp: 0.0,
+            },
+        );
+    }
 }
 
 /// Jump commands awaiting relowering: the applier both reads and (via

@@ -623,6 +623,86 @@ pub fn spawn_terminal<E>(
     Ok((seat, identity))
 }
 
+/// THE despawn sweep (#56 decision 17's corollary as one reviewable
+/// site): every scene-global structure keyed by a terminal is swept here
+/// when that terminal dies, and any future terminal-keyed scene-global
+/// state joins this body.
+///
+/// An observer on [`TerminalIdentity`] removal rather than a
+/// `despawn_terminal()` function because it fires on EVERY despawn path —
+/// the future `term.close`, a test world's `despawn()`, panic-path
+/// cleanup — it cannot be forgotten. The session halves on the seat
+/// entity need no line here: despawn destroys them with the entity.
+///
+/// The namespace returns to the pool as the LAST act, and this is the
+/// ONLY release site paired with the spawner's only allocation site (a
+/// second sweeping observer would silently break that): a namespace is
+/// allocatable again only after nothing keyed by it exists, so no
+/// interleaving lets a new tenant coexist with unswept state.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn sweep_despawned_terminal(
+    remove: On<bevy::ecs::lifecycle::Remove, TerminalIdentity>,
+    identities: Query<&TerminalIdentity>,
+    owned: Query<(Entity, &TerminalOwner)>,
+    rgp_objects: Query<(Entity, &crate::inline::TerminalRgpObject)>,
+    mut commands: Commands,
+    mut terminals: ResMut<TerminalRegistry>,
+    mut macros: ResMut<crate::macros::MacroRegistry>,
+    mut presence: ResMut<crate::presence::PresenceRegistry>,
+    mut viz: ResMut<crate::viz::VizRegistry>,
+    mut avatar: ResMut<crate::avatar::AvatarState>,
+    mut sound: ResMut<crate::sound::SoundState>,
+    mut bookmarks: ResMut<crate::bookmarks::BookmarkRegistry>,
+    mut object_ids: ResMut<crate::ai::AiObjectRegistry>,
+) {
+    let seat = remove.entity;
+    // During OnRemove the dying entity's components are still readable.
+    let Ok(identity) = identities.get(seat) else {
+        error!(
+            "sweep_despawned_terminal: seat {seat} lost its identity before the sweep could \
+             read it; its namespace lease and scene-global state leak"
+        );
+        return;
+    };
+    let (id, namespace) = (identity.id(), identity.namespace());
+
+    // The scene lock: liveness — a holder dying mid-privileged-playback
+    // must not wedge the scene (safety is the TerminalId re-key itself).
+    macros.sweep_terminal(id);
+    // The namespace-keyed globals that lawfully remain (wire-facing
+    // address axes): rendered-is-public presence rows, viz entries whose
+    // ids embed the namespace, the avatar speech queue and its active
+    // utterance, the sound rate bucket, saved bookmarks, and the
+    // object-id ledger.
+    presence.sweep_namespace(namespace);
+    viz.sweep_namespace(namespace);
+    avatar.speech.sweep_namespace(namespace);
+    sound.sweep_namespace(namespace);
+    bookmarks.sweep_namespace(namespace);
+    object_ids.sweep_namespace(namespace);
+    // The seat's scene entities: the owned planes, and the inline render
+    // entities whose diff-sync ([`crate::systems::sync_inline_objects`])
+    // can never observe the removal because the component it diffs dies
+    // with the seat. Live AI ids partition by namespace across live
+    // terminals, so the namespace match is exact.
+    for (entity, owner) in owned.iter() {
+        if owner.0 == seat {
+            commands.entity(entity).despawn();
+        }
+    }
+    for (entity, object) in rgp_objects.iter() {
+        if crate::osc::ai_object_namespace(object.object_id) == Some(namespace) {
+            commands.entity(entity).despawn();
+        }
+    }
+
+    // LAST: return the lease. Double-free would be a broken invariant —
+    // loud, never swallowed.
+    if let Err(error) = terminals.release(id) {
+        error!("sweep_despawned_terminal: releasing {id:?} failed: {error}");
+    }
+}
+
 /// Synchronizes Bevy presentation entities to the terminal texture layout.
 pub(crate) fn sync_terminal_layout(
     layout: TerminalLayout,
@@ -1178,6 +1258,240 @@ mod tests {
             next.id(),
             crate::identity::TerminalId::from_raw(2),
             "the TerminalId consumed by the failed spawn is skipped, never reissued"
+        );
+    }
+
+    /// THE despawn-sweep test (#56 decision 17, an M4.3 exit criterion):
+    /// seed every scene-global structure with the dying terminal's state,
+    /// despawn it through the plain entity path (the observer must fire on
+    /// EVERY despawn path, not a bespoke close function), and assert
+    /// nothing keyed by it survives — then spawn onto the recycled slot
+    /// and prove the next tenant inherits nothing while its TerminalId is
+    /// NOT reused.
+    #[test]
+    fn despawning_a_terminal_sweeps_scene_globals_and_recycles_the_slot_last() {
+        use bevy::ecs::system::RunSystemOnce;
+
+        let mut world = spawner_world();
+        // The sweep's registries — the scaffold world is deliberately not
+        // TerminalPlugin (see `spawner_world`), so they are added here.
+        world.init_resource::<crate::macros::MacroRegistry>();
+        world.init_resource::<crate::presence::PresenceRegistry>();
+        world.init_resource::<crate::viz::VizRegistry>();
+        world.init_resource::<crate::avatar::AvatarState>();
+        world.init_resource::<crate::sound::SoundState>();
+        world.init_resource::<crate::bookmarks::BookmarkRegistry>();
+        world.init_resource::<crate::ai::AiObjectRegistry>();
+        world.add_observer(sweep_despawned_terminal);
+
+        let (seat_a, id_a) = world
+            .run_system_once(spawn_virtual_terminal)
+            .expect("spawner system runs");
+        let (seat_b, id_b) = world
+            .run_system_once(spawn_virtual_terminal)
+            .expect("spawner system runs");
+        assert_eq!(
+            world.query::<&TerminalIdentity>().iter(&world).count(),
+            2,
+            "exactly two seats before the despawn"
+        );
+        let ns_b = id_b.namespace();
+        // AI object ids embed the namespace in bits 24..31 above the
+        // 0x8000_0000 range bit: 0x8100_xxxx is namespace 1 (B's).
+        const B_OBJECT: u32 = 0x8100_0007;
+        const A_OBJECT: u32 = 0x8000_0001;
+
+        // Seed B-keyed state in EVERY swept structure.
+        world
+            .resource_mut::<crate::macros::MacroRegistry>()
+            .test_hold_scene_lock(id_b.id());
+        world
+            .resource_mut::<crate::presence::PresenceRegistry>()
+            .test_join(ns_b, "agent-b");
+        world.resource_mut::<crate::viz::VizRegistry>().upsert(
+            B_OBJECT,
+            crate::viz_wire::VizPayload::Ps(crate::viz_wire::PsV1 {
+                capture: crate::viz_wire::VizCapture {
+                    source: "test".to_string(),
+                    ts: "0".to_string(),
+                },
+                items: Vec::new(),
+            }),
+            None,
+        );
+        {
+            let mut avatar = world.resource_mut::<crate::avatar::AvatarState>();
+            // First admission takes the voice (active); second queues.
+            avatar.speech.test_admit(ns_b, "utter-active");
+            avatar.speech.test_admit(ns_b, "utter-queued");
+            assert_eq!(avatar.speech.test_active_namespace(), Some(ns_b));
+            assert_eq!(avatar.speech.test_pending_for(ns_b), 1);
+        }
+        world
+            .resource_mut::<crate::sound::SoundState>()
+            .test_seed_bucket(ns_b);
+        world
+            .resource_mut::<crate::bookmarks::BookmarkRegistry>()
+            .test_insert(ns_b, "spot");
+        world
+            .resource_mut::<crate::ai::AiObjectRegistry>()
+            .test_reserve(B_OBJECT);
+        // Inline render entities sync from a component that dies with the
+        // seat, so their diff can never observe the removal — the sweep
+        // must despawn B's and leave A's alone.
+        world.spawn(crate::inline::TerminalRgpObject {
+            object_id: B_OBJECT,
+        });
+        world.spawn(crate::inline::TerminalRgpObject {
+            object_id: A_OBJECT,
+        });
+        let presence_seq_before = world
+            .resource::<crate::presence::PresenceRegistry>()
+            .mutation_seq();
+
+        // The plain despawn path — no bespoke close function to remember.
+        world.despawn(seat_b);
+        world.flush();
+
+        assert_eq!(
+            world.query::<&TerminalIdentity>().iter(&world).count(),
+            1,
+            "exactly one seat survives the despawn"
+        );
+        assert_eq!(
+            world
+                .resource::<crate::macros::MacroRegistry>()
+                .test_scene_lock(),
+            None,
+            "the dying holder's scene lock is released (decision 17's named leak)"
+        );
+        let presence = world.resource::<crate::presence::PresenceRegistry>();
+        assert!(
+            !presence.test_has_namespace_rows(ns_b),
+            "B's presence rows are swept"
+        );
+        assert!(
+            presence.mutation_seq() > presence_seq_before,
+            "the sweep bumps mutation_seq so the marker sync observes it"
+        );
+        let viz = world.resource::<crate::viz::VizRegistry>();
+        assert_eq!(
+            viz.namespace_len(ns_b),
+            0,
+            "B's visualizations are swept — the recycled slot's tenant \
+             must not own the corpse's viz"
+        );
+        let avatar = world.resource::<crate::avatar::AvatarState>();
+        assert_eq!(
+            avatar.speech.test_active_namespace(),
+            None,
+            "B's ACTIVE utterance is stopped, not left to display under a \
+             namespace the next tenant could cancel"
+        );
+        assert_eq!(
+            avatar.speech.test_pending_for(ns_b),
+            0,
+            "B's queued utterances are swept"
+        );
+        assert!(
+            !world
+                .resource::<crate::sound::SoundState>()
+                .test_has_bucket(ns_b),
+            "B's drained play bucket is swept, never inherited"
+        );
+        assert!(
+            world
+                .resource::<crate::bookmarks::BookmarkRegistry>()
+                .get(ns_b, "spot")
+                .is_none(),
+            "B's bookmarks are swept"
+        );
+        assert!(
+            !world
+                .resource::<crate::ai::AiObjectRegistry>()
+                .test_is_used(B_OBJECT),
+            "B's object-id ledger entries are swept (per-terminal-lifetime \
+             never-reuse, per the #56 rider)"
+        );
+        let owners: Vec<_> = world
+            .query::<&TerminalOwner>()
+            .iter(&world)
+            .copied()
+            .collect();
+        assert_eq!(owners.len(), 2, "only A's two planes survive");
+        assert!(
+            owners.iter().all(|owner| owner.0 == seat_a),
+            "the surviving planes are A's"
+        );
+        let rgp: Vec<u32> = world
+            .query::<&crate::inline::TerminalRgpObject>()
+            .iter(&world)
+            .map(|object| object.object_id)
+            .collect();
+        assert_eq!(
+            rgp,
+            vec![A_OBJECT],
+            "B's inline render entity is despawned; A's survives"
+        );
+        {
+            let registry = world.resource::<TerminalRegistry>();
+            assert_eq!(
+                registry.entity_of(id_b.id()),
+                None,
+                "the dead TerminalId resolves None"
+            );
+            assert_eq!(
+                registry.entity_of(id_a.id()),
+                Some(seat_a),
+                "the survivor stays bound"
+            );
+        }
+
+        // Spawn onto the recycled slot: freshness is Default-at-spawn, not
+        // cleanup discipline — and the TerminalId is NOT reused.
+        let (seat_c, id_c) = world
+            .run_system_once(spawn_virtual_terminal)
+            .expect("spawner system runs");
+        assert_eq!(
+            world.query::<&TerminalIdentity>().iter(&world).count(),
+            2,
+            "exactly two seats after the respawn"
+        );
+        assert_eq!(
+            id_c.namespace(),
+            ns_b,
+            "the freed namespace slot recycles (lowest-free-first)"
+        );
+        assert_eq!(
+            id_c.id(),
+            crate::identity::TerminalId::from_raw(3),
+            "the TerminalId keeps climbing — B's id is never reissued"
+        );
+        assert_ne!(id_c.id(), id_b.id());
+        let seat_c_ref = world.entity(seat_c);
+        assert_eq!(
+            seat_c_ref
+                .get::<crate::macros::TerminalMacros>()
+                .expect("C carries its macro component")
+                .session_len(),
+            0,
+            "C's session macros are Default-fresh"
+        );
+        assert_eq!(
+            seat_c_ref
+                .get::<crate::reactive::TerminalReactive>()
+                .expect("C carries its reactive component")
+                .session_len(),
+            0,
+            "C's wire rules are Default-fresh"
+        );
+        // The recycled slot's id space is free again: C may use the very
+        // id B had spawned.
+        assert!(
+            !world
+                .resource::<crate::ai::AiObjectRegistry>()
+                .test_is_used(B_OBJECT),
+            "C's namespace starts with an empty object ledger"
         );
     }
 

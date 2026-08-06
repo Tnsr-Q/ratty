@@ -544,6 +544,57 @@ impl SpeechQueue {
         }
     }
 
+    /// Despawn sweep (#56 decision 17's corollary): drops a dead
+    /// terminal's queue, its rotation-pass slot, and — unlike
+    /// [`Self::clear_namespace`] — STOPS its active utterance. Stopping
+    /// (vs. letting it finish) forecloses the window where a recycled
+    /// slot's tenant could cancel a corpse's utterance displaying under
+    /// its namespace. The pending #18 execution handles vanish with the
+    /// queue — honest: absent = finished or cancelled.
+    pub(crate) fn sweep_namespace(&mut self, namespace: u8) {
+        if self
+            .active
+            .as_ref()
+            .is_some_and(|active| active.utterance.namespace == namespace)
+        {
+            self.active = None;
+        }
+        self.clear_namespace(namespace);
+        self.pass.retain(|ns| *ns != namespace);
+    }
+
+    /// Test-only: admits a minimal utterance for `namespace`, for the
+    /// cross-module despawn-sweep test (`Utterance.seq` is private).
+    #[cfg(test)]
+    pub(crate) fn test_admit(&mut self, namespace: u8, id: &str) {
+        self.admit(
+            Utterance {
+                id: id.to_string(),
+                namespace,
+                seq: 0,
+                text: "test".to_string(),
+                from: None,
+                duration: Duration::from_secs(1),
+            },
+            Duration::ZERO,
+        )
+        .expect("test utterance admits");
+    }
+
+    /// Test-only: the active utterance's namespace.
+    #[cfg(test)]
+    pub(crate) fn test_active_namespace(&self) -> Option<u8> {
+        self.active
+            .as_ref()
+            .map(|active| active.utterance.namespace)
+    }
+
+    /// Test-only: pending utterances queued for `namespace`.
+    #[cfg(test)]
+    pub(crate) fn test_pending_for(&self, namespace: u8) -> usize {
+        self.queues.get(&namespace).map_or(0, VecDeque::len)
+    }
+
     /// Cancels the current utterance and clears the whole queue.
     pub fn clear_all(&mut self) {
         self.active = None;

@@ -221,6 +221,20 @@ impl PresenceRegistry {
         self.mutation_seq
     }
 
+    /// Despawn sweep (#56 decision 17's corollary): drops every row keyed
+    /// by a dead terminal's namespace, bumping `mutation_seq` so the
+    /// expiry-redraw and marker sync observe the removal. Namespace keying
+    /// stays lawful here — it is the public identity axis — precisely
+    /// because this sweep makes the rows die with their terminal.
+    pub(crate) fn sweep_namespace(&mut self, namespace: u8) {
+        let before = self.participants.len() + self.notes.len();
+        self.participants.retain(|(ns, _), _| *ns != namespace);
+        self.notes.retain(|(ns, _), _| *ns != namespace);
+        if self.participants.len() + self.notes.len() != before {
+            self.mutation_seq += 1;
+        }
+    }
+
     /// Whether the registry holds no rows at all (the render systems'
     /// run condition).
     pub fn is_empty(&self) -> bool {
@@ -452,6 +466,29 @@ impl PresenceRegistry {
     /// Full session reset: clear every roster. Presence is wire-tier
     /// state with no trusted tier, so everything goes; called from the
     /// `reset` tap, which acks elsewhere.
+    /// Test-only: seeds one participant row, for the cross-module
+    /// despawn-sweep test (`join` stays private to the applier).
+    #[cfg(test)]
+    pub(crate) fn test_join(&mut self, namespace: u8, id: &str) {
+        self.join(
+            namespace,
+            id,
+            "Test",
+            "#ffffff",
+            None,
+            false,
+            std::time::Duration::ZERO,
+        )
+        .expect("test participant joins");
+    }
+
+    /// Test-only: whether any row (participant or note) is keyed by
+    /// `namespace`.
+    #[cfg(test)]
+    pub(crate) fn test_has_namespace_rows(&self, namespace: u8) -> bool {
+        self.participant_count(namespace) + self.note_count(namespace) > 0
+    }
+
     fn reset(&mut self) {
         if self.is_empty() {
             return;

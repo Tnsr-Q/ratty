@@ -165,8 +165,13 @@ pub struct SoundVoice {
     /// Monotonic voice id, unique for the session. The playback layer keys
     /// its kira instance bookkeeping on it so ends free the right slot.
     pub id: u64,
-    /// The namespace that requested the play (for the per-namespace cap).
-    pub namespace: u8,
+    /// The terminal that requested the play, for the per-caller cap.
+    /// Keyed by [`TerminalId`] (#56 decision 17's stamp rule): a voice
+    /// legitimately outlives its terminal — it decays on the playback
+    /// layer's clock — so it is not sweepable state, and a dead
+    /// terminal's decaying voices must never count against the recycled
+    /// namespace slot's next tenant. Ids never collide, so they cannot.
+    pub owner: crate::identity::TerminalId,
     /// The registered kind (canonical registry string).
     pub kind: &'static str,
     /// Final per-play gain after the registry clamp, before master gain.
@@ -379,12 +384,34 @@ impl SoundState {
             .try_take(now)
     }
 
-    /// Live voices owned by `namespace`.
-    fn namespace_voices(&self, namespace: u8) -> usize {
+    /// Live voices owned by `owner`.
+    fn owner_voices(&self, owner: crate::identity::TerminalId) -> usize {
         self.voices
             .iter()
-            .filter(|voice| voice.namespace == namespace)
+            .filter(|voice| voice.owner == owner)
             .count()
+    }
+
+    /// Despawn sweep (#56 decision 17's corollary): drops a dead
+    /// terminal's rate bucket so the recycled slot's next tenant never
+    /// inherits a partially drained one. Its voices stay — they decay on
+    /// the playback layer's clock and their cap keys on `TerminalId`, so
+    /// they can never bind to the next tenant.
+    pub(crate) fn sweep_namespace(&mut self, namespace: u8) {
+        self.play_buckets.remove(&namespace);
+    }
+
+    /// Test-only: seeds (partially drains) a rate bucket for `namespace`,
+    /// for the cross-module despawn-sweep test.
+    #[cfg(test)]
+    pub(crate) fn test_seed_bucket(&mut self, namespace: u8) {
+        assert!(self.try_take_play_token(namespace, 0.0));
+    }
+
+    /// Test-only: whether a rate bucket exists for `namespace`.
+    #[cfg(test)]
+    pub(crate) fn test_has_bucket(&self, namespace: u8) -> bool {
+        self.play_buckets.contains_key(&namespace)
     }
 }
 
@@ -541,7 +568,7 @@ pub fn apply_sound_commands(
                     );
                     continue;
                 }
-                if state.namespace_voices(namespace) >= MAX_SOUND_VOICES_PER_NAMESPACE {
+                if state.owner_voices(source.terminal()) >= MAX_SOUND_VOICES_PER_NAMESPACE {
                     reject!(
                         "sound.play",
                         codes::VOICE_CAP,
@@ -563,7 +590,7 @@ pub fn apply_sound_commands(
                 state.next_voice_id += 1;
                 state.voices.push(SoundVoice {
                     id,
-                    namespace,
+                    owner: source.terminal(),
                     kind: spec.kind,
                     gain,
                     started: false,
@@ -1280,7 +1307,7 @@ mod tests {
             for index in 0..MAX_SOUND_VOICES_PER_NAMESPACE {
                 state.voices.push(SoundVoice {
                     id: index as u64,
-                    namespace: 0,
+                    owner: crate::identity::TerminalId::from_raw(1),
                     kind: "click",
                     gain: 0.5,
                     started: true,
@@ -1300,7 +1327,7 @@ mod tests {
             for index in 0..MAX_SOUND_VOICES {
                 state.voices.push(SoundVoice {
                     id: 100 + index as u64,
-                    namespace: 1 + (index % 2) as u8,
+                    owner: crate::identity::TerminalId::from_raw(2 + (index % 2) as u64),
                     kind: "click",
                     gain: 0.5,
                     started: true,
@@ -1322,7 +1349,7 @@ mod tests {
         let mut state = SoundState::default();
         state.voices.push(SoundVoice {
             id: 0,
-            namespace: 0,
+            owner: crate::identity::TerminalId::from_raw(1),
             kind: "chime",
             gain: 0.5,
             started: true,
