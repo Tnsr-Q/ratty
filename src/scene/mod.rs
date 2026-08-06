@@ -220,12 +220,16 @@ type PlaneBackTransformQuery<'w, 's> =
     Query<'w, 's, &'static mut Transform, With<TerminalPlaneBack>>;
 type PlaneCameraQuery<'w, 's> =
     Query<'w, 's, (&'static mut Projection, &'static mut Transform), With<TerminalPlaneCamera>>;
-pub(crate) type TerminalPlaneLayoutQuery<'w, 's> =
-    Query<'w, 's, &'static mut Transform, (With<TerminalPlane>, Without<TerminalSprite>)>;
+pub(crate) type TerminalPlaneLayoutQuery<'w, 's> = Query<
+    'w,
+    's,
+    (&'static mut Transform, &'static TerminalOwner),
+    (With<TerminalPlane>, Without<TerminalSprite>),
+>;
 pub(crate) type TerminalPlaneBackLayoutQuery<'w, 's> = Query<
     'w,
     's,
-    &'static mut Transform,
+    (&'static mut Transform, &'static TerminalOwner),
     (
         With<TerminalPlaneBack>,
         Without<TerminalPlane>,
@@ -712,8 +716,12 @@ pub(crate) fn sweep_despawned_terminal(
     }
 }
 
-/// Synchronizes Bevy presentation entities to the terminal texture layout.
+/// Synchronizes one seat's presentation entities to its terminal texture
+/// layout: the seat's viewport, and only the plane pair that seat owns
+/// ([`TerminalOwner`] join) — seat A's font-size step must never rescale
+/// seat B's planes.
 pub(crate) fn sync_terminal_layout(
+    seat: Entity,
     layout: TerminalLayout,
     viewport: &mut TerminalViewport,
     plane_query: &mut TerminalPlaneLayoutQuery,
@@ -722,12 +730,16 @@ pub(crate) fn sync_terminal_layout(
     viewport.size = layout.logical_size;
     viewport.center = Vec2::ZERO;
 
-    for mut transform in plane_query.iter_mut() {
-        transform.scale = layout.logical_size.extend(1.0);
+    for (mut transform, owner) in plane_query.iter_mut() {
+        if owner.0 == seat {
+            transform.scale = layout.logical_size.extend(1.0);
+        }
     }
 
-    for mut transform in plane_back_query.iter_mut() {
-        transform.scale = layout.logical_size.extend(1.0);
+    for (mut transform, owner) in plane_back_query.iter_mut() {
+        if owner.0 == seat {
+            transform.scale = layout.logical_size.extend(1.0);
+        }
     }
 }
 

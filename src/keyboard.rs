@@ -336,7 +336,7 @@ pub struct KeyboardSystemParams<'w, 's> {
     stage_tween: ResMut<'w, StageTween>,
     clipboard: NonSendMut<'w, TerminalClipboard>,
     runtime: Query<'w, 's, &'static mut TerminalRuntime>,
-    terminal: Query<'w, 's, &'static mut TerminalSurface>,
+    terminal: Query<'w, 's, (Entity, &'static mut TerminalSurface)>,
     primary_window: Query<'w, 's, &'static Window, With<PrimaryWindow>>,
     viewport: Query<'w, 's, &'static mut TerminalViewport>,
     plane_query: TerminalPlaneLayoutQuery<'w, 's>,
@@ -352,7 +352,7 @@ pub fn handle_keyboard_input(
     mut keyboard: Local<TerminalKeyboard>,
     mut params: KeyboardSystemParams,
 ) {
-    let mut terminal = match params.terminal.single_mut() {
+    let (seat, mut terminal) = match params.terminal.single_mut() {
         Ok(terminal) => terminal,
         Err(err) => {
             // Latched once per process: the surface lives on THE terminal
@@ -576,6 +576,7 @@ pub fn handle_keyboard_input(
                             }
                         };
                         sync_terminal_layout(
+                            seat,
                             layout,
                             &mut viewport,
                             &mut params.plane_query,

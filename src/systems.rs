@@ -138,24 +138,12 @@ pub(crate) fn request_exit_on_primary_window_close(
     }
 }
 
-/// Shuts down the PTY runtime when Bevy begins exiting.
+/// Shuts down every terminal's runtime when Bevy begins exiting.
 pub(crate) fn shutdown_terminal_runtime_on_exit(
     mut app_exit: MessageReader<AppExit>,
-    mut runtime: Query<&mut TerminalRuntime>,
+    mut runtimes: Query<&mut TerminalRuntime>,
     mut shutdown_started: Local<bool>,
 ) {
-    let mut runtime = match runtime.single_mut() {
-        Ok(runtime) => runtime,
-        Err(err) => {
-            // Latched once per process: the runtime lives on THE terminal
-            // seat, and the miss must name its system (#54's silent-.single()
-            // finding).
-            warn_once!(
-                "shutdown_terminal_runtime_on_exit: the runtime needs exactly one terminal seat: {err}"
-            );
-            return;
-        }
-    };
     if *shutdown_started {
         app_exit.clear();
         return;
@@ -163,136 +151,120 @@ pub(crate) fn shutdown_terminal_runtime_on_exit(
 
     if app_exit.read().next().is_some() {
         *shutdown_started = true;
-        runtime.shutdown();
+        for mut runtime in runtimes.iter_mut() {
+            runtime.shutdown();
+        }
     }
 }
 
-/// Pumps PTY output into the terminal parser.
+/// Pumps every terminal's transport output into its own parser.
 ///
-/// This runs early in the update schedule, before [`render_terminal_widget`]. It drains PTY output
-/// from [`TerminalRuntime`], feeds it through [`TerminalInlineObjects::consume_pty_output`] and
-/// requests a redraw through [`TerminalRedrawState`] when terminal state changed.
+/// This runs early in the update schedule, before [`render_terminal_widget`]. Per seat, it drains
+/// output from that [`TerminalRuntime`], feeds it through that seat's
+/// [`TerminalInlineObjects::consume_pty_output`] and requests a redraw through that seat's
+/// [`TerminalRedrawState`] when terminal state changed — output-driven redraw is per-terminal and
+/// never focus-gated: a background `tail -f` keeps painting its own texture, which is the point of
+/// N terminals in one space.
 ///
-/// It also updates scroll-coupled inline anchors before the redraw and sync passes rebuild the
-/// scene.
+/// It also updates scroll-coupled inline and viz anchors (scoped to the pumping seat's namespace)
+/// before the redraw and sync passes rebuild the scene.
 ///
-/// On transport disconnect the runtime is reaped in place and the final screen is retained
-/// (the `--hold` semantic); the app exits only through
+/// On transport disconnect that runtime is reaped in place and its final screen is retained
+/// (the `--hold` semantic), while every other seat keeps pumping; the app exits only through
 /// [`request_exit_on_primary_window_close`].
 pub fn pump_pty_output(
-    mut runtime: Query<&mut TerminalRuntime>,
-    mut inline_objects: Query<&mut TerminalInlineObjects>,
+    mut seats: Query<(
+        &crate::identity::TerminalIdentity,
+        &mut TerminalRuntime,
+        &mut TerminalInlineObjects,
+        &mut TerminalRedrawState,
+    )>,
     mut viz_registry: ResMut<crate::viz::VizRegistry>,
     mut ai_commands: MessageWriter<crate::ai::AiCommand>,
     mut queries: MessageWriter<crate::query_channel::QueryRequest>,
-    mut redraw: Query<&mut TerminalRedrawState>,
 ) {
-    let mut inline_objects = match inline_objects.single_mut() {
-        Ok(inline_objects) => inline_objects,
-        Err(err) => {
-            // Latched once per process: the inline registry lives on THE
-            // terminal seat, and the miss must name its system (#54's
-            // silent-.single() finding).
-            warn_once!("pump_pty_output: inline objects need exactly one terminal seat: {err}");
-            return;
-        }
-    };
-    let mut runtime = match runtime.single_mut() {
-        Ok(runtime) => runtime,
-        Err(err) => {
-            // Latched once per process: the runtime lives on THE terminal
-            // seat, and the miss must name its system (#54's silent-.single()
-            // finding).
-            warn_once!("pump_pty_output: the runtime needs exactly one terminal seat: {err}");
-            return;
-        }
-    };
-    let mut redraw = match redraw.single_mut() {
-        Ok(redraw) => redraw,
-        Err(err) => {
-            // Latched once per process: the redraw flag lives on THE terminal
-            // seat, and the miss must name its system (#54's silent-.single()
-            // finding).
-            warn_once!("pump_pty_output: the redraw flag needs exactly one terminal seat: {err}");
-            return;
-        }
-    };
-    // A reaped transport has nothing more to say; leave the retained final
-    // screen untouched.
-    if runtime.pty_disconnected {
-        return;
-    }
-
     let screen_rows = |screen: &vt100::Screen| {
         let (_, cols) = screen.size();
         screen.rows(0, cols).collect::<Vec<_>>()
     };
 
-    let mut processed_output = false;
-    loop {
-        match runtime.try_recv() {
-            Ok(chunk) => {
-                // Viz anchors always scroll with text, so any anchored
-                // visualization keeps scroll inference alive too.
-                let track_scroll =
-                    inline_objects.has_scroll_tracked_anchors() || viz_registry.has_anchors();
-                let prev_rows: Option<Vec<String>> = if track_scroll {
-                    let (_, cols) = runtime.parser.screen().size();
-                    Some(runtime.parser.screen().rows(0, cols).collect::<Vec<_>>())
-                } else {
-                    None
-                };
-                let mut replies = inline_objects.consume_pty_output(&chunk, &mut runtime.parser);
-                replies.extend(runtime.parser.callbacks_mut().take_replies());
-                for reply in replies {
-                    runtime.write_input(&reply);
+    // Zero seats iterates zero times — legal (a latched warn inside the loop
+    // would fire for one seat and never again).
+    for (identity, mut runtime, mut inline_objects, mut redraw) in seats.iter_mut() {
+        // A reaped transport has nothing more to say; leave the retained
+        // final screen untouched and move to the next seat.
+        if runtime.pty_disconnected {
+            continue;
+        }
+
+        let mut processed_output = false;
+        loop {
+            match runtime.try_recv() {
+                Ok(chunk) => {
+                    // Viz anchors always scroll with text, so any anchored
+                    // visualization keeps scroll inference alive too — for
+                    // this seat's namespace only.
+                    let track_scroll = inline_objects.has_scroll_tracked_anchors()
+                        || viz_registry.has_anchors_in(identity.namespace());
+                    let prev_rows: Option<Vec<String>> = if track_scroll {
+                        let (_, cols) = runtime.parser.screen().size();
+                        Some(runtime.parser.screen().rows(0, cols).collect::<Vec<_>>())
+                    } else {
+                        None
+                    };
+                    let mut replies =
+                        inline_objects.consume_pty_output(&chunk, &mut runtime.parser);
+                    replies.extend(runtime.parser.callbacks_mut().take_replies());
+                    for reply in replies {
+                        runtime.write_input(&reply);
+                    }
+                    for (source, ack_token, command) in
+                        runtime.parser.callbacks_mut().take_ai_commands()
+                    {
+                        ai_commands.write(crate::ai::AiCommand {
+                            source,
+                            ack_token,
+                            origin: crate::ai::CommandOrigin::Wire,
+                            command,
+                        });
+                    }
+                    for (source, envelope) in runtime.parser.callbacks_mut().take_queries() {
+                        queries.write(crate::query_channel::QueryRequest {
+                            source,
+                            item: crate::query_channel::QueryItem::Query(envelope),
+                        });
+                    }
+                    for (source, error) in runtime.parser.callbacks_mut().take_wire_errors() {
+                        queries.write(crate::query_channel::QueryRequest {
+                            source,
+                            item: crate::query_channel::QueryItem::Error(error),
+                        });
+                    }
+                    if let Some(prev_rows) = prev_rows {
+                        let next_rows = screen_rows(runtime.parser.screen());
+                        let scrolled = infer_upward_scroll(&prev_rows, &next_rows);
+                        inline_objects.apply_scroll(scrolled);
+                        viz_registry.apply_scroll_in(identity.namespace(), scrolled);
+                    }
+                    inline_objects.refresh_placeholder_anchors(runtime.parser.screen());
+                    processed_output = true;
                 }
-                for (source, ack_token, command) in
-                    runtime.parser.callbacks_mut().take_ai_commands()
-                {
-                    ai_commands.write(crate::ai::AiCommand {
-                        source,
-                        ack_token,
-                        origin: crate::ai::CommandOrigin::Wire,
-                        command,
-                    });
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    // The shell exited. Reap the transport in place (the same
+                    // path Drop takes) but keep the final screen readable; the
+                    // app exits only through the primary-window close latch.
+                    if !runtime.pty_disconnected {
+                        runtime.shutdown();
+                    }
+                    break;
                 }
-                for (source, envelope) in runtime.parser.callbacks_mut().take_queries() {
-                    queries.write(crate::query_channel::QueryRequest {
-                        source,
-                        item: crate::query_channel::QueryItem::Query(envelope),
-                    });
-                }
-                for (source, error) in runtime.parser.callbacks_mut().take_wire_errors() {
-                    queries.write(crate::query_channel::QueryRequest {
-                        source,
-                        item: crate::query_channel::QueryItem::Error(error),
-                    });
-                }
-                if let Some(prev_rows) = prev_rows {
-                    let next_rows = screen_rows(runtime.parser.screen());
-                    let scrolled = infer_upward_scroll(&prev_rows, &next_rows);
-                    inline_objects.apply_scroll(scrolled);
-                    viz_registry.apply_scroll(scrolled);
-                }
-                inline_objects.refresh_placeholder_anchors(runtime.parser.screen());
-                processed_output = true;
-            }
-            Err(TryRecvError::Empty) => break,
-            Err(TryRecvError::Disconnected) => {
-                // The shell exited. Reap the transport in place (the same
-                // path Drop takes) but keep the final screen readable; the
-                // app exits only through the primary-window close latch.
-                if !runtime.pty_disconnected {
-                    runtime.shutdown();
-                }
-                break;
             }
         }
-    }
 
-    if processed_output {
-        redraw.request();
+        if processed_output {
+            redraw.request();
+        }
     }
 }
 
@@ -328,6 +300,7 @@ mod pump_disconnect_tests {
         app.world_mut().spawn((
             TerminalInlineObjects::default(),
             TerminalRedrawState::default(),
+            crate::identity::TerminalIdentity::test_boot(),
             runtime,
         ));
         app.init_resource::<VizRegistry>()
@@ -336,6 +309,95 @@ mod pump_disconnect_tests {
             .add_message::<crate::query_channel::QueryRequest>()
             .add_systems(Update, pump_pty_output);
         app
+    }
+
+    /// Spawns a second seat with a real (distinct) identity next to the
+    /// harness's boot seat, returning its entity and virtual host.
+    fn spawn_second_seat(app: &mut App) -> (Entity, crate::runtime::VirtualTerminalHost) {
+        let mut registry = crate::identity::TerminalRegistry::default();
+        let _boot = registry.allocate().expect("boot lease");
+        let identity = registry.allocate().expect("second lease");
+        let (runtime, host) =
+            TerminalRuntime::virtual_channel(&AppConfig::default(), identity.ingress());
+        let seat = app
+            .world_mut()
+            .spawn((
+                TerminalInlineObjects::default(),
+                TerminalRedrawState::default(),
+                identity,
+                runtime,
+            ))
+            .id();
+        (seat, host)
+    }
+
+    #[test]
+    fn two_seats_pump_independently_and_one_disconnect_holds_only_that_seat() {
+        let (runtime_a, host_a) = TerminalRuntime::virtual_channel(
+            &AppConfig::default(),
+            crate::runtime::IngressSource::test_boot(),
+        );
+        let mut app = pump_app(runtime_a);
+        let (seat_b, host_b) = spawn_second_seat(&mut app);
+        assert_eq!(
+            app.world_mut()
+                .query::<&crate::identity::TerminalIdentity>()
+                .iter(app.world())
+                .count(),
+            2,
+            "seat count asserted (#58 rider)"
+        );
+
+        host_a
+            .feed_tx
+            .send(b"alpha output".to_vec())
+            .expect("virtual feed should accept bytes");
+        host_b
+            .feed_tx
+            .send(b"beta output".to_vec())
+            .expect("virtual feed should accept bytes");
+        app.update();
+
+        let world = app.world_mut();
+        let mut seats = world.query::<(Entity, &TerminalRuntime)>();
+        for (entity, runtime) in seats.iter(world) {
+            let contents = runtime.parser.screen().contents();
+            if entity == seat_b {
+                assert!(contents.contains("beta output"), "B pumped its own bytes");
+                assert!(!contents.contains("alpha"), "no cross-seat bleed into B");
+            } else {
+                assert!(contents.contains("alpha output"), "A pumped its own bytes");
+                assert!(!contents.contains("beta"), "no cross-seat bleed into A");
+            }
+        }
+
+        // B's shell exits: B is reaped and holds its final screen; A keeps
+        // pumping — a dead seat never stalls the survivors.
+        drop(host_b);
+        app.update();
+        host_a
+            .feed_tx
+            .send(b"alpha lives".to_vec())
+            .expect("virtual feed should accept bytes");
+        app.update();
+
+        let world = app.world_mut();
+        let mut seats = world.query::<(Entity, &TerminalRuntime)>();
+        for (entity, runtime) in seats.iter(world) {
+            if entity == seat_b {
+                assert!(runtime.pty_disconnected, "B's disconnect is latched");
+                assert!(
+                    runtime.parser.screen().contents().contains("beta output"),
+                    "B's final screen is retained"
+                );
+            } else {
+                assert!(!runtime.pty_disconnected, "A is untouched by B's death");
+                assert!(
+                    runtime.parser.screen().contents().contains("alpha lives"),
+                    "A keeps pumping after B died"
+                );
+            }
+        }
     }
 
     fn drained_exits(app: &mut App) -> Vec<AppExit> {
@@ -430,21 +492,30 @@ mod pump_disconnect_tests {
 #[derive(SystemParam)]
 pub(crate) struct ResizeParams<'w, 's> {
     primary_window: Query<'w, 's, (Entity, &'static Window), With<PrimaryWindow>>,
-    runtime: Query<'w, 's, &'static mut TerminalRuntime>,
-    terminal: Query<'w, 's, &'static mut TerminalSurface>,
-    redraw: Query<'w, 's, &'static mut TerminalRedrawState>,
-    viewport: Query<'w, 's, &'static mut TerminalViewport>,
+    seats: Query<
+        'w,
+        's,
+        (
+            Entity,
+            &'static mut TerminalSurface,
+            &'static mut TerminalRuntime,
+            &'static mut TerminalViewport,
+            &'static mut TerminalRedrawState,
+        ),
+    >,
     plane_query: TerminalPlaneLayoutQuery<'w, 's>,
     plane_back_query: TerminalPlaneBackLayoutQuery<'w, 's>,
 }
 
 /// Handles primary window resize events.
 ///
-/// This updates both the PTY grid and the rendered scene dimensions. It resizes
-/// [`TerminalRuntime`], [`TerminalSurface`], [`TerminalViewport`], the 2D terminal sprite and the
-/// front and back terminal plane transforms.
+/// This updates both the PTY grid and the rendered scene dimensions for every
+/// seat — each terminal's grid derives from its own surface geometry against
+/// the shared window, never from who is focused. Per seat it resizes
+/// [`TerminalRuntime`], [`TerminalSurface`], [`TerminalViewport`] and that
+/// seat's own plane-pair transforms ([`TerminalOwner`] join).
 ///
-/// The redraw system runs after this system and uploads the resized terminal image in the same
+/// The redraw system runs after this system and uploads the resized terminal images in the same
 /// frame.
 pub(crate) fn handle_window_resize(
     mut resize_events: MessageReader<WindowResized>,
@@ -452,55 +523,10 @@ pub(crate) fn handle_window_resize(
 ) {
     let ResizeParams {
         primary_window,
-        runtime,
-        terminal,
-        redraw,
-        viewport,
+        seats,
         plane_query,
         plane_back_query,
     } = &mut params;
-    let mut viewport = match viewport.single_mut() {
-        Ok(viewport) => viewport,
-        Err(err) => {
-            // Latched once per process: the viewport lives on THE terminal
-            // seat, and the miss must name its system (#54's silent-.single()
-            // finding).
-            warn_once!("handle_window_resize: the viewport needs exactly one terminal seat: {err}");
-            return;
-        }
-    };
-    let mut terminal = match terminal.single_mut() {
-        Ok(terminal) => terminal,
-        Err(err) => {
-            // Latched once per process: the surface lives on THE terminal
-            // seat, and the miss must name its system (#54's silent-.single()
-            // finding).
-            warn_once!("handle_window_resize: the surface needs exactly one terminal seat: {err}");
-            return;
-        }
-    };
-    let mut runtime = match runtime.single_mut() {
-        Ok(runtime) => runtime,
-        Err(err) => {
-            // Latched once per process: the runtime lives on THE terminal
-            // seat, and the miss must name its system (#54's silent-.single()
-            // finding).
-            warn_once!("handle_window_resize: the runtime needs exactly one terminal seat: {err}");
-            return;
-        }
-    };
-    let mut redraw = match redraw.single_mut() {
-        Ok(redraw) => redraw,
-        Err(err) => {
-            // Latched once per process: the redraw flag lives on THE terminal
-            // seat, and the miss must name its system (#54's silent-.single()
-            // finding).
-            warn_once!(
-                "handle_window_resize: the redraw flag needs exactly one terminal seat: {err}"
-            );
-            return;
-        }
-    };
     let Ok((primary_window, window)) = primary_window.single() else {
         return;
     };
@@ -516,24 +542,26 @@ pub(crate) fn handle_window_resize(
         return;
     };
 
-    // Minimizing the window reports a 0x0 size. Skip it so the terminal keeps
-    // its last good grid instead of collapsing to a degenerate size that the
-    // vt100 parser can't safely process.
+    // Minimizing the window reports a 0x0 size. Skip it so the terminals keep
+    // their last good grids instead of collapsing to a degenerate size that
+    // the vt100 parser can't safely process.
     if window_size.x < 1.0 || window_size.y < 1.0 {
         return;
     }
 
     let window_size = window_size.max(Vec2::ONE);
-    let layout = terminal.resize_to_fit(window_size, render_scale_for_window(window));
-    let pty_pixels = layout.pty_pixels();
-    runtime.resize(
-        layout.cols,
-        layout.rows,
-        pty_pixels.x as u16,
-        pty_pixels.y as u16,
-    );
-    sync_terminal_layout(layout, &mut viewport, plane_query, plane_back_query);
-    redraw.request();
+    for (seat, mut terminal, mut runtime, mut viewport, mut redraw) in seats.iter_mut() {
+        let layout = terminal.resize_to_fit(window_size, render_scale_for_window(window));
+        let pty_pixels = layout.pty_pixels();
+        runtime.resize(
+            layout.cols,
+            layout.rows,
+            pty_pixels.x as u16,
+            pty_pixels.y as u16,
+        );
+        sync_terminal_layout(seat, layout, &mut viewport, plane_query, plane_back_query);
+        redraw.request();
+    }
 }
 
 /// Applies inline object visibility for the current presentation mode.
@@ -3979,7 +4007,7 @@ mod viz_render_tests {
             (5, 3, 10, 4)
         );
         // Scrolled fully off the top: anchor dropped, payload kept, hidden.
-        registry.apply_scroll(20);
+        registry.apply_scroll_in(0, 20);
         assert!(registry.get(ID).is_some(), "the payload survives");
         assert!(viz_root_anchor(&registry, ID).is_none());
     }

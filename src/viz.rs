@@ -699,10 +699,13 @@ impl VizRegistry {
         self.entries.get(&id).map_or(0, |entry| entry.revision)
     }
 
-    /// Whether any live visualization is anchored (the scroll-tracking
-    /// gate in `pump_pty_output`).
-    pub fn has_anchors(&self) -> bool {
-        self.entries.values().any(|entry| entry.anchor.is_some())
+    /// Whether any of `namespace`'s live visualizations is anchored (the
+    /// scroll-tracking gate in `pump_pty_output`, per pumping seat — a
+    /// terminal's scroll may only ever move its own agent's anchors).
+    pub fn has_anchors_in(&self, namespace: u8) -> bool {
+        self.entries.iter().any(|(id, entry)| {
+            entry.anchor.is_some() && crate::osc::ai_object_namespace(*id) == Some(namespace)
+        })
     }
 
     /// Inserts or atomically replaces the entry under `id`, stamping a
@@ -823,16 +826,22 @@ impl VizRegistry {
             .unwrap_or_default()
     }
 
-    /// Applies upward terminal scroll to anchors, mirroring the inline
-    /// registry: rows shift up, and an anchor scrolled fully off the top
-    /// is dropped while the payload is kept (the renderer hides it; a
-    /// later placing `viz.set` re-anchors it). No rebuilds are queued —
+    /// Applies one terminal's upward scroll to that namespace's anchors,
+    /// mirroring the inline registry: rows shift up, and an anchor
+    /// scrolled fully off the top is dropped while the payload is kept
+    /// (the renderer hides it; a later placing `viz.set` re-anchors it).
+    /// Scoped to the scrolling seat's namespace — the registry is one
+    /// resource but its anchors live in per-terminal grids, and seat A's
+    /// scroll must never move seat B's charts. No rebuilds are queued —
     /// the renderer positions from anchors per-frame.
-    pub(crate) fn apply_scroll(&mut self, rows_scrolled: u16) {
+    pub(crate) fn apply_scroll_in(&mut self, namespace: u8, rows_scrolled: u16) {
         if rows_scrolled == 0 {
             return;
         }
-        for entry in self.entries.values_mut() {
+        for (id, entry) in self.entries.iter_mut() {
+            if crate::osc::ai_object_namespace(*id) != Some(namespace) {
+                continue;
+            }
             let Some(anchor) = entry.anchor else {
                 continue;
             };
@@ -1499,7 +1508,14 @@ mod tests {
         registry.upsert(ID, decoded_ps(&[1]), anchor(5, 4));
         registry.upsert(ID + 1, decoded_ps(&[2]), anchor(1, 2));
         let revision_before = registry.revision(ID);
-        registry.apply_scroll(3);
+        // A foreign seat's scroll must not move this namespace's anchors.
+        registry.apply_scroll_in(1, 3);
+        assert_eq!(
+            registry.get(ID).expect("entry lives").anchor,
+            anchor(5, 4),
+            "a foreign namespace's scroll leaves the anchor untouched"
+        );
+        registry.apply_scroll_in(0, 3);
         let shifted = registry.get(ID).expect("payload kept");
         assert_eq!(shifted.anchor.expect("still anchored").row, 2);
         let dropped = registry.get(ID + 1).expect("payload kept");
