@@ -272,40 +272,63 @@ pub struct RuleSpec {
     pub cooldown: Option<f32>,
 }
 
-/// The sensor and rule registries, publish rate buckets, and the adapter
-/// capability flag — one resource, the reactive analog of
-/// [`crate::macros::MacroRegistry`].
+/// One terminal seat's session-half reactive state (#56 decision 5): its
+/// wire rules, its wire sensors (full `agent.<ns>.*` names — the wire's
+/// address vocabulary, lawful here because the map dies with its
+/// terminal), and its publish rate bucket. A component on the seat
+/// entity, born `Default`-fresh at spawn and destroyed by despawn — a
+/// recycled namespace slot's next tenant can never inherit rules,
+/// sensors, or a drained bucket.
+#[derive(Component, Default)]
+pub struct TerminalReactive {
+    /// This terminal's wire rules by name (the seat entity replaced the
+    /// old namespace key). Cleared by `reset`.
+    rules: HashMap<String, RuleRecord>,
+    /// This terminal's wire sensors by full name (`agent.<ns>.*`).
+    sensors: HashMap<String, SensorRecord>,
+    /// This terminal's sensor-publish rate bucket.
+    publish_bucket: Option<PublishBucket>,
+}
+
+/// The trusted/config half of the reactive organ (#56 decision 5): the
+/// system sensors, the trusted config rules, and the adapter capability
+/// flag — the globals that survive any terminal. The session half lives
+/// on each seat as [`TerminalReactive`].
 #[derive(Resource, Default)]
 pub struct ReactiveRegistry {
-    /// Registered sensors by full name (`sys.*`, `agent.<ns>.*`).
+    /// System-adapter sensors by name (`sys.*`). Wire sensors live on
+    /// their owning seat.
     sensors: HashMap<String, SensorRecord>,
-    /// Wire rules, keyed by (namespace, name). Session-scoped; cleared by
-    /// `reset`.
-    session: HashMap<(u8, String), RuleRecord>,
     /// Trusted config rules, keyed by name. Wire-immutable; survive
     /// `reset`.
     trusted: HashMap<String, RuleRecord>,
-    /// Per-namespace publish rate buckets (bounded: namespaces are 7-bit).
-    publish_buckets: HashMap<u8, PublishBucket>,
     /// Whether the native system-sensor adapter is compiled in *and*
     /// granted by config — set once at startup, reported by `caps`.
     system_enabled: bool,
 }
 
-impl ReactiveRegistry {
-    /// Number of wire rules stored in `namespace`.
-    pub fn session_len(&self, namespace: u8) -> usize {
-        self.session
-            .keys()
-            .filter(|(entry_namespace, _)| *entry_namespace == namespace)
-            .count()
+impl TerminalReactive {
+    /// Number of wire rules this terminal stores.
+    pub fn session_len(&self) -> usize {
+        self.rules.len()
     }
 
-    /// Whether any rule can evaluate (the evaluator's run condition).
+    /// Whether any of this terminal's rules can evaluate (half of the
+    /// evaluator's run condition; the trusted half is
+    /// [`ReactiveRegistry::has_evaluable_trusted`]).
     pub fn has_evaluable_rules(&self) -> bool {
-        self.session
+        self.rules
             .values()
-            .chain(self.trusted.values())
+            .any(|rule| rule.enabled && rule.invalid.is_none())
+    }
+}
+
+impl ReactiveRegistry {
+    /// Whether any trusted rule can evaluate (the run condition's global
+    /// half).
+    pub fn has_evaluable_trusted(&self) -> bool {
+        self.trusted
+            .values()
             .any(|rule| rule.enabled && rule.invalid.is_none())
     }
 
@@ -513,7 +536,9 @@ impl ReactiveRegistry {
         }
         Ok((cmp, threshold, clear, debounce, cooldown, action))
     }
+}
 
+impl TerminalReactive {
     /// Registers (or `mode=replace`s) a wire rule for `source`.
     #[allow(clippy::too_many_arguments)]
     fn set_rule(
@@ -537,25 +562,25 @@ impl ReactiveRegistry {
                 format!("name exceeds {MAX_RULE_NAME_BYTES} bytes"),
             ));
         }
-        let exists = self.session.contains_key(&(namespace, name.to_string()));
+        let exists = self.rules.contains_key(name);
         if exists && !replace {
             return Err((
                 codes::ALREADY_EXISTS,
                 format!("rule '{name}' exists (pass mode=replace to overwrite it)"),
             ));
         }
-        if !exists && self.session_len(namespace) >= MAX_RULES_PER_NAMESPACE {
+        if !exists && self.session_len() >= MAX_RULES_PER_NAMESPACE {
             return Err((
                 codes::NAMESPACE_CAP,
                 format!("namespace {namespace} is at its {MAX_RULES_PER_NAMESPACE}-rule limit"),
             ));
         }
         let (cmp, threshold, clear, debounce, cooldown, action) =
-            Self::validate_rule(namespace, sensor, spec, action, seat_macros, macros)?;
+            ReactiveRegistry::validate_rule(namespace, sensor, spec, action, seat_macros, macros)?;
         // Replacement resets the transition state: a replaced rule is a
         // fresh rule.
-        self.session.insert(
-            (namespace, name.to_string()),
+        self.rules.insert(
+            name.to_string(),
             RuleRecord {
                 source,
                 sensor: sensor.to_string(),
@@ -577,26 +602,21 @@ impl ReactiveRegistry {
         Ok(())
     }
 
-    /// Removes one of `source`'s wire rules. Trusted rules are not
+    /// Removes one of this terminal's wire rules. Trusted rules are not
     /// wire-addressable: a trusted name answers a flat `unknown-id`.
-    fn remove_rule(&mut self, source: IngressSource, name: &str) -> Result<(), ReactiveReject> {
-        self.session
-            .remove(&(source.namespace(), name.to_string()))
+    fn remove_rule(&mut self, name: &str) -> Result<(), ReactiveReject> {
+        self.rules
+            .remove(name)
             .map(|_| ())
             .ok_or_else(|| (codes::UNKNOWN_ID, format!("no session rule named '{name}'")))
     }
 
-    /// Enables or disables one of `source`'s wire rules. Disabling freezes
-    /// the rule's transition state exactly as sensor dormancy does.
-    fn set_rule_enabled(
-        &mut self,
-        source: IngressSource,
-        name: &str,
-        enabled: bool,
-    ) -> Result<(), ReactiveReject> {
+    /// Enables or disables one of this terminal's wire rules. Disabling
+    /// freezes the rule's transition state exactly as sensor dormancy does.
+    fn set_rule_enabled(&mut self, name: &str, enabled: bool) -> Result<(), ReactiveReject> {
         let rule = self
-            .session
-            .get_mut(&(source.namespace(), name.to_string()))
+            .rules
+            .get_mut(name)
             .ok_or_else(|| (codes::UNKNOWN_ID, format!("no session rule named '{name}'")))?;
         rule.enabled = enabled;
         // Disabling freezes the latch exactly as dormancy does — and
@@ -647,9 +667,8 @@ impl ReactiveRegistry {
             }
         };
         if !self
-            .publish_buckets
-            .entry(namespace)
-            .or_insert_with(|| PublishBucket::new(now.as_secs_f64()))
+            .publish_bucket
+            .get_or_insert_with(|| PublishBucket::new(now.as_secs_f64()))
             .try_take(now.as_secs_f64())
         {
             return Err((
@@ -662,7 +681,9 @@ impl ReactiveRegistry {
         }
         let name = format!("agent.{namespace}.{suffix}");
         let existing = self.sensors.get(&name);
-        if existing.is_none() && self.wire_sensor_count(namespace) >= MAX_SENSORS_PER_NAMESPACE {
+        // Every sensor in this component is one of this terminal's wire
+        // sensors, so the cap check is simply the map's size.
+        if existing.is_none() && self.sensors.len() >= MAX_SENSORS_PER_NAMESPACE {
             return Err((
                 codes::NAMESPACE_CAP,
                 format!("namespace {namespace} is at its {MAX_SENSORS_PER_NAMESPACE}-sensor limit"),
@@ -719,6 +740,20 @@ impl ReactiveRegistry {
         })
     }
 
+    /// Session reset, arrival-terminal scoped (the same #56 decision-15
+    /// choice as [`crate::macros::MacroRegistry::reset`]): clear this
+    /// terminal's wire rules, wire sensors, and rate bucket. Trusted rules
+    /// and system sensors are trusted-tier state on the global registry and
+    /// survive by construction; called from the `reset` tap, which acks
+    /// elsewhere.
+    fn reset(&mut self) {
+        self.rules.clear();
+        self.sensors.clear();
+        self.publish_bucket = None;
+    }
+}
+
+impl ReactiveRegistry {
     /// Publishes a system-adapter sample (trusted internal path — no caps,
     /// no rate limits; the adapter is config-gated and cadence-bounded).
     pub fn publish_system_sensor(&mut self, name: &str, value: f32, ttl: Duration, now: Duration) {
@@ -844,107 +879,141 @@ impl ReactiveRegistry {
         }
     }
 
-    /// Wire sensors owned by `namespace`.
-    fn wire_sensor_count(&self, namespace: u8) -> usize {
-        self.sensors
-            .values()
-            .filter(|record| record.source == SensorSource::Wire(namespace))
-            .count()
-    }
-
-    /// Evaluates every enabled rule against the sensor registry, advancing
-    /// transition state and returning the fires (owner ingress + action)
-    /// this pass produced, bounded by [`MAX_RULE_FIRES_PER_FRAME`].
-    ///
-    /// Semantics, in order:
-    ///
-    /// - **unbound** (no sensor of that name) and **dormant** (sensor past
-    ///   its TTL): evaluation pauses; the transition state is frozen and
-    ///   the debounce clock resets.
-    /// - **debounce**: the raw condition must hold continuously for the
-    ///   debounce duration before the rule activates.
-    /// - **transition**: the inactive→active edge fires. Registering a
-    ///   rule while its condition already holds fires once the debounce
-    ///   matures — the rule's own state transitions.
-    /// - **hysteresis**: while active, the rule deactivates only when the
-    ///   value crosses `clear` (release side); deactivation never fires.
-    /// - **cooldown / frame budget**: a transition inside the cooldown or
-    ///   past the per-frame fire budget is latched but its fire is
-    ///   suppressed and counted.
-    fn evaluate(&mut self, now: Duration) -> Vec<(IngressSource, RattyAiCommand)> {
+    /// Evaluates the trusted rules against the system sensors plus the
+    /// live seats' wire sensors (`lookup_wire` resolves an `agent.<ns>.*`
+    /// name through whichever live seat currently holds that namespace —
+    /// namespace-as-address by a trusted author, lawful under decision
+    /// 17's wire-facing-address clause and documented rather than
+    /// "fixed"). Shares `budget` with the per-seat session passes.
+    fn evaluate_trusted(
+        &mut self,
+        lookup_wire: impl Fn(&str) -> Option<SensorRecord>,
+        now: Duration,
+        budget: &mut usize,
+    ) -> Vec<(IngressSource, RattyAiCommand)> {
         let mut fired = Vec::new();
-        let mut budget = MAX_RULE_FIRES_PER_FRAME;
         let Self {
-            sensors,
-            session,
-            trusted,
-            ..
+            sensors, trusted, ..
         } = self;
-        for rule in session.values_mut().chain(trusted.values_mut()) {
-            if !rule.enabled || rule.invalid.is_some() {
-                continue;
+        for rule in trusted.values_mut() {
+            let sensor = sensors
+                .get(&rule.sensor)
+                .cloned()
+                .or_else(|| lookup_wire(&rule.sensor));
+            // Trusted fires keep their seeded source (the boot terminal's
+            // ingress); decision 15's trusted-rule fan-out is M4.5's.
+            if let Some(fire) = step_rule(rule, sensor.as_ref(), now, budget) {
+                fired.push(fire);
             }
-            let Some(sensor) = sensors.get(&rule.sensor) else {
-                // Unbound: the rule waits for its sensor to appear.
-                rule.raw_since = None;
-                continue;
-            };
-            if !sensor.fresh(now) {
-                // Dormant: never evaluate a stale value as if it were true.
-                rule.raw_since = None;
-                continue;
-            }
-            let value = sensor.value;
-            if rule.active {
-                let released = match rule.cmp {
-                    RuleCmp::Above => value < rule.clear,
-                    RuleCmp::Below => value > rule.clear,
-                };
-                if released {
-                    rule.active = false;
-                    rule.raw_since = None;
-                }
-                continue;
-            }
-            let raw = match rule.cmp {
-                RuleCmp::Above => value >= rule.threshold,
-                RuleCmp::Below => value <= rule.threshold,
-            };
-            if !raw {
-                rule.raw_since = None;
-                continue;
-            }
-            let since = *rule.raw_since.get_or_insert(now);
-            if now.saturating_sub(since) < rule.debounce {
-                continue;
-            }
-            // The transition: latch active, then decide the fire.
-            rule.active = true;
-            rule.raw_since = None;
-            let cooled = rule
-                .last_fired
-                .is_none_or(|last| now.saturating_sub(last) >= rule.cooldown);
-            if !cooled || budget == 0 {
-                rule.suppressed += 1;
-                continue;
-            }
-            budget -= 1;
-            rule.fires += 1;
-            rule.last_fired = Some(now);
-            fired.push((rule.source, rule.action.clone()));
         }
         fired
     }
+}
 
-    /// Full session reset: clear wire rules, wire sensors, and rate
-    /// buckets. Trusted rules and system sensors are trusted-tier state
-    /// and survive; called from the `reset` tap, which acks elsewhere.
-    fn reset(&mut self) {
-        self.session.clear();
-        self.publish_buckets.clear();
-        self.sensors
-            .retain(|_, record| record.source == SensorSource::System);
+impl TerminalReactive {
+    /// Evaluates this terminal's rules, with sensor lookup falling through
+    /// this terminal's wire sensors to the global system sensors — the
+    /// only two classes a session rule can reference
+    /// ([`ReactiveRegistry::validate_sensor_ref`]), so the fallthrough is
+    /// total. Fires are stamped with the owning seat's `ingress` at fire
+    /// time, so a stored stamp can never disagree with the live owner.
+    /// Shares `budget` with every other seat and the trusted pass.
+    fn evaluate(
+        &mut self,
+        ingress: IngressSource,
+        system_sensors: &HashMap<String, SensorRecord>,
+        now: Duration,
+        budget: &mut usize,
+    ) -> Vec<(IngressSource, RattyAiCommand)> {
+        let mut fired = Vec::new();
+        let Self { rules, sensors, .. } = self;
+        for rule in rules.values_mut() {
+            let sensor = sensors
+                .get(&rule.sensor)
+                .or_else(|| system_sensors.get(&rule.sensor));
+            if let Some((_, action)) = step_rule(rule, sensor, now, budget) {
+                fired.push((ingress, action));
+            }
+        }
+        fired
     }
+}
+
+/// Advances one rule's transition state against its (possibly absent)
+/// sensor, returning the fire it produced, if any.
+///
+/// Semantics, in order:
+///
+/// - **unbound** (no sensor of that name) and **dormant** (sensor past
+///   its TTL): evaluation pauses; the transition state is frozen and
+///   the debounce clock resets.
+/// - **debounce**: the raw condition must hold continuously for the
+///   debounce duration before the rule activates.
+/// - **transition**: the inactive→active edge fires. Registering a
+///   rule while its condition already holds fires once the debounce
+///   matures — the rule's own state transitions.
+/// - **hysteresis**: while active, the rule deactivates only when the
+///   value crosses `clear` (release side); deactivation never fires.
+/// - **cooldown / frame budget**: a transition inside the cooldown or
+///   past the per-frame fire budget is latched but its fire is
+///   suppressed and counted.
+fn step_rule(
+    rule: &mut RuleRecord,
+    sensor: Option<&SensorRecord>,
+    now: Duration,
+    budget: &mut usize,
+) -> Option<(IngressSource, RattyAiCommand)> {
+    if !rule.enabled || rule.invalid.is_some() {
+        return None;
+    }
+    let Some(sensor) = sensor else {
+        // Unbound: the rule waits for its sensor to appear.
+        rule.raw_since = None;
+        return None;
+    };
+    if !sensor.fresh(now) {
+        // Dormant: never evaluate a stale value as if it were true.
+        rule.raw_since = None;
+        return None;
+    }
+    let value = sensor.value;
+    if rule.active {
+        let released = match rule.cmp {
+            RuleCmp::Above => value < rule.clear,
+            RuleCmp::Below => value > rule.clear,
+        };
+        if released {
+            rule.active = false;
+            rule.raw_since = None;
+        }
+        return None;
+    }
+    let raw = match rule.cmp {
+        RuleCmp::Above => value >= rule.threshold,
+        RuleCmp::Below => value <= rule.threshold,
+    };
+    if !raw {
+        rule.raw_since = None;
+        return None;
+    }
+    let since = *rule.raw_since.get_or_insert(now);
+    if now.saturating_sub(since) < rule.debounce {
+        return None;
+    }
+    // The transition: latch active, then decide the fire.
+    rule.active = true;
+    rule.raw_since = None;
+    let cooled = rule
+        .last_fired
+        .is_none_or(|last| now.saturating_sub(last) >= rule.cooldown);
+    if !cooled || *budget == 0 {
+        rule.suppressed += 1;
+        return None;
+    }
+    *budget -= 1;
+    rule.fires += 1;
+    rule.last_fired = Some(now);
+    Some((rule.source, rule.action.clone()))
 }
 
 /// Whether a sensor name component is well-formed: ascii alphanumerics
@@ -990,7 +1059,12 @@ impl Plugin for ReactivePlugin {
                     .before(crate::sound::apply_sound_commands)
                     .before(crate::effects::apply_ai_effect_commands)
                     .before(crate::bookmarks::apply_bookmark_commands)
-                    .run_if(|registry: Res<ReactiveRegistry>| registry.has_evaluable_rules()),
+                    .run_if(
+                        |registry: Res<ReactiveRegistry>, seats: Query<&TerminalReactive>| {
+                            registry.has_evaluable_trusted()
+                                || seats.iter().any(|seat| seat.has_evaluable_rules())
+                        },
+                    ),
             );
         #[cfg(not(target_arch = "wasm32"))]
         app.add_systems(
@@ -1054,11 +1128,11 @@ pub fn seed_reactive_from_config(
 pub fn apply_reactive_commands(
     time: Res<Time>,
     mut commands: MessageReader<AiCommand>,
-    mut registry: ResMut<ReactiveRegistry>,
     macros: Res<MacroRegistry>,
-    macro_seats: Query<(
+    mut seats: Query<(
         &crate::identity::TerminalIdentity,
         &crate::macros::TerminalMacros,
+        &mut TerminalReactive,
     )>,
     mut acks: MessageWriter<AckOutcome>,
     mut diagnostics: DiagnosticsSink,
@@ -1071,6 +1145,20 @@ pub fn apply_reactive_commands(
         command,
     } in commands.read()
     {
+        // Arrival resolution keys on TerminalId (the stamp rule): a
+        // command whose arrival terminal died earlier this frame is
+        // dropped loudly, never rerouted — a same-frame recycled
+        // namespace cannot capture it.
+        let Some((_, seat_macros, mut seat)) = seats
+            .iter_mut()
+            .find(|(identity, ..)| identity.id() == source.terminal())
+        else {
+            warn!(
+                "apply_reactive_commands: command dropped: arrival terminal {:?} no longer exists",
+                source.terminal()
+            );
+            continue;
+        };
         macro_rules! reject {
             ($action:literal, $code:expr, $message:expr) => {
                 reject(
@@ -1122,22 +1210,7 @@ pub fn apply_reactive_commands(
                     debounce: *debounce,
                     cooldown: *cooldown,
                 };
-                // The caller's session macros, for pinning a
-                // `do=macro.play` action — resolved by TerminalId (the
-                // stamp rule); a rule.set whose arrival terminal died is
-                // dropped loudly like every stamped command.
-                let Some((_, seat_macros)) = macro_seats
-                    .iter()
-                    .find(|(identity, _)| identity.id() == source.terminal())
-                else {
-                    warn!(
-                        "apply_reactive_commands: rule.set dropped: arrival terminal {:?} no \
-                         longer exists",
-                        source.terminal()
-                    );
-                    continue;
-                };
-                match registry.set_rule(
+                match seat.set_rule(
                     *source,
                     name,
                     sensor,
@@ -1156,7 +1229,7 @@ pub fn apply_reactive_commands(
             }
             RattyAiCommand::RuleRemove { name } => {
                 guard_wire_origin!("rule.remove");
-                match registry.remove_rule(*source, name) {
+                match seat.remove_rule(name) {
                     Ok(()) => ack_commit(&mut acks, *source, ack_token),
                     Err((code, message)) => {
                         warn!("ratty-reactive: rule.remove rejected: {message}");
@@ -1166,7 +1239,7 @@ pub fn apply_reactive_commands(
             }
             RattyAiCommand::RuleEnable { name } => {
                 guard_wire_origin!("rule.enable");
-                match registry.set_rule_enabled(*source, name, true) {
+                match seat.set_rule_enabled(name, true) {
                     Ok(()) => ack_commit(&mut acks, *source, ack_token),
                     Err((code, message)) => {
                         warn!("ratty-reactive: rule.enable rejected: {message}");
@@ -1176,7 +1249,7 @@ pub fn apply_reactive_commands(
             }
             RattyAiCommand::RuleDisable { name } => {
                 guard_wire_origin!("rule.disable");
-                match registry.set_rule_enabled(*source, name, false) {
+                match seat.set_rule_enabled(name, false) {
                     Ok(()) => ack_commit(&mut acks, *source, ack_token),
                     Err((code, message)) => {
                         warn!("ratty-reactive: rule.disable rejected: {message}");
@@ -1191,7 +1264,7 @@ pub fn apply_reactive_commands(
                 seq,
             } => {
                 guard_wire_origin!("sensor.publish");
-                match registry.publish_wire_sensor(*source, name, *value, *ttl, *seq, now) {
+                match seat.publish_wire_sensor(*source, name, *value, *ttl, *seq, now) {
                     Ok(()) => ack_commit(&mut acks, *source, ack_token),
                     Err((code, message)) => {
                         warn!("ratty-reactive: sensor.publish rejected: {message}");
@@ -1201,7 +1274,7 @@ pub fn apply_reactive_commands(
             }
             RattyAiCommand::SensorRemove { name } => {
                 guard_wire_origin!("sensor.remove");
-                match registry.remove_wire_sensor(*source, name) {
+                match seat.remove_wire_sensor(*source, name) {
                     Ok(()) => ack_commit(&mut acks, *source, ack_token),
                     Err((code, message)) => {
                         warn!("ratty-reactive: sensor.remove rejected: {message}");
@@ -1210,10 +1283,11 @@ pub fn apply_reactive_commands(
                 }
             }
             RattyAiCommand::Reset => {
-                // Full session reset. Reset's single ack belongs to
-                // apply_ai_commands; the reactive registry clears its wire
-                // tier silently.
-                registry.reset();
+                // Full session reset, scoped to the ARRIVAL terminal (the
+                // same #56 decision-15 choice as the macro reset). Reset's
+                // single ack belongs to apply_ai_commands; the seat clears
+                // its wire tier silently.
+                seat.reset();
             }
             _ => {}
         }
@@ -1221,17 +1295,37 @@ pub fn apply_reactive_commands(
 }
 
 /// Evaluates every enabled rule against the sensor registry and fires
-/// transitions ([`ReactiveRegistry::evaluate`] holds the semantics),
-/// re-injecting allowlisted actions into the [`AiCommand`] stream
-/// token-less with [`CommandOrigin::Rule`] — the same mechanism as macro
-/// playback, ordered before the choreography appliers so a fire lowers the
-/// same frame.
+/// transitions ([`step_rule`] holds the semantics), re-injecting
+/// allowlisted actions into the [`AiCommand`] stream token-less with
+/// [`CommandOrigin::Rule`] — the same mechanism as macro playback, ordered
+/// before the choreography appliers so a fire lowers the same frame.
+///
+/// One [`MAX_RULE_FIRES_PER_FRAME`] budget spans every seat's session pass
+/// plus the trusted pass (session-then-trusted, the pre-split order at
+/// N=1). Seat iteration order is arbitrary — N tests assert aggregates,
+/// never cross-terminal ordering.
 pub fn evaluate_rules(
     time: Res<Time>,
     mut registry: ResMut<ReactiveRegistry>,
+    mut seats: Query<(&crate::identity::TerminalIdentity, &mut TerminalReactive)>,
     mut commands: MessageWriter<AiCommand>,
 ) {
-    for (source, command) in registry.evaluate(time.elapsed()) {
+    let now = time.elapsed();
+    let mut budget = MAX_RULE_FIRES_PER_FRAME;
+    let mut fired = Vec::new();
+    for (identity, mut seat) in seats.iter_mut() {
+        fired.extend(seat.evaluate(identity.ingress(), &registry.sensors, now, &mut budget));
+    }
+    fired.extend(registry.evaluate_trusted(
+        |name| {
+            seats
+                .iter()
+                .find_map(|(_, seat)| seat.sensors.get(name).cloned())
+        },
+        now,
+        &mut budget,
+    ));
+    for (source, command) in fired {
         commands.write(AiCommand {
             source,
             ack_token: None,
@@ -1393,25 +1487,29 @@ fn rule_row(name: &str, scope: &'static str, rule: &RuleRecord, now: Duration) -
     row
 }
 
-/// `state.rules`: the caller's wire rules plus the trusted rules, each
-/// tagged with its scope and live binding state. Deterministically ordered
-/// and paginated.
+/// `state.rules`: the caller's wire rules (its seat's session half) plus
+/// the trusted rules, each tagged with its scope and live binding state.
+/// Deterministically ordered and paginated; rows and sort keys are
+/// byte-identical to the pre-split projection at N=1.
 pub fn rules_state_items(
+    seat: &TerminalReactive,
     registry: &ReactiveRegistry,
-    namespace: u8,
     now: Duration,
 ) -> Vec<(u64, Value)> {
+    // Sensor lookup falls through the caller's wire sensors to the global
+    // system sensors — the same fallthrough the evaluator uses, and the
+    // union the pre-split single map held at N=1.
     let binding = |rule: &RuleRecord| {
-        let sensor = registry.sensors.get(&rule.sensor);
+        let sensor = seat
+            .sensors
+            .get(&rule.sensor)
+            .or_else(|| registry.sensors.get(&rule.sensor));
         let bound = sensor.is_some();
         let dormant = sensor.is_some_and(|record| !record.fresh(now));
         (bound, dormant)
     };
     let mut rows: Vec<(String, Value)> = Vec::new();
-    for ((entry_namespace, name), rule) in &registry.session {
-        if *entry_namespace != namespace {
-            continue;
-        }
+    for (name, rule) in &seat.rules {
         let (bound, dormant) = binding(rule);
         let mut row = rule_row(name, "session", rule, now);
         row["bound"] = json!(bound);
@@ -1434,19 +1532,18 @@ pub fn rules_state_items(
 
 /// `state.sensors`: the system sensors (scene-global trigger substrate,
 /// readable by every caller) plus the caller's own wire sensors — never
-/// another agent's. Each row carries freshness and how many caller-visible
-/// rules reference it. Deterministically ordered and paginated.
+/// another agent's, structurally now: foreign wire sensors live on foreign
+/// seats' components and are unreachable from here. Each row carries
+/// freshness and how many caller-visible rules reference it.
+/// Deterministically ordered and paginated.
 pub fn sensors_state_items(
+    seat: &TerminalReactive,
     registry: &ReactiveRegistry,
-    namespace: u8,
     now: Duration,
 ) -> Vec<(u64, Value)> {
     let visible_rule_refs = |sensor_name: &str| {
-        registry
-            .session
-            .iter()
-            .filter(|((entry_namespace, _), _)| *entry_namespace == namespace)
-            .map(|(_, rule)| rule)
+        seat.rules
+            .values()
             .chain(registry.trusted.values())
             .filter(|rule| rule.sensor == sensor_name)
             .count()
@@ -1454,10 +1551,7 @@ pub fn sensors_state_items(
     let mut rows: Vec<(String, Value)> = registry
         .sensors
         .iter()
-        .filter(|(_, record)| match record.source {
-            SensorSource::System => true,
-            SensorSource::Wire(owner) => owner == namespace,
-        })
+        .chain(seat.sensors.iter())
         .map(|(name, record)| {
             (
                 name.clone(),
@@ -1512,13 +1606,13 @@ mod tests {
     }
 
     fn set_simple(
-        registry: &mut ReactiveRegistry,
+        seat: &mut TerminalReactive,
         macros: &MacroRegistry,
         name: &str,
         sensor: &str,
         spec: RuleSpec,
     ) -> Result<(), ReactiveReject> {
-        registry.set_rule(
+        seat.set_rule(
             NS0,
             name,
             sensor,
@@ -1530,19 +1624,28 @@ mod tests {
         )
     }
 
-    fn publish(registry: &mut ReactiveRegistry, suffix: &str, value: f32, now: Duration) {
-        registry
-            .publish_wire_sensor(NS0, suffix, value, None, None, now)
+    fn publish(seat: &mut TerminalReactive, suffix: &str, value: f32, now: Duration) {
+        seat.publish_wire_sensor(NS0, suffix, value, None, None, now)
             .expect("registry op ok");
     }
 
-    /// One pass of the real evaluator, returning just the fired actions.
-    fn evaluate_at(registry: &mut ReactiveRegistry, now: Duration) -> Vec<RattyAiCommand> {
-        registry
-            .evaluate(now)
-            .into_iter()
-            .map(|(_, command)| command)
-            .collect()
+    /// One full evaluator pass — the seat's session rules then the trusted
+    /// rules, one shared budget, exactly as [`evaluate_rules`] runs them —
+    /// returning just the fired actions.
+    fn evaluate_at(
+        seat: &mut TerminalReactive,
+        registry: &mut ReactiveRegistry,
+        now: Duration,
+    ) -> Vec<RattyAiCommand> {
+        let mut budget = MAX_RULE_FIRES_PER_FRAME;
+        let mut fired = seat.evaluate(NS0, &registry.sensors, now, &mut budget);
+        let wire_sensors = seat.sensors.clone();
+        fired.extend(registry.evaluate_trusted(
+            |name| wire_sensors.get(name).cloned(),
+            now,
+            &mut budget,
+        ));
+        fired.into_iter().map(|(_, command)| command).collect()
     }
 
     #[test]
@@ -1563,17 +1666,17 @@ mod tests {
     #[test]
     fn rule_validation_rejects_bad_names_refs_and_numbers() {
         let macros = MacroRegistry::default();
-        let mut registry = ReactiveRegistry::default();
+        let mut seat = TerminalReactive::default();
         let (code, _) =
-            set_simple(&mut registry, &macros, "", "sys.cpu", spec_above(1.0)).expect_err("empty");
+            set_simple(&mut seat, &macros, "", "sys.cpu", spec_above(1.0)).expect_err("empty");
         assert_eq!(code, codes::BAD_PAYLOAD);
         let long = "x".repeat(MAX_RULE_NAME_BYTES + 1);
-        let (code, _) = set_simple(&mut registry, &macros, &long, "sys.cpu", spec_above(1.0))
+        let (code, _) = set_simple(&mut seat, &macros, &long, "sys.cpu", spec_above(1.0))
             .expect_err("too long");
         assert_eq!(code, codes::TOO_LARGE);
         // Foreign agent namespace: not-owner. Malformed refs: bad-payload.
-        let (code, _) = set_simple(&mut registry, &macros, "r", "agent.5.x", spec_above(1.0))
-            .expect_err("foreign");
+        let (code, _) =
+            set_simple(&mut seat, &macros, "r", "agent.5.x", spec_above(1.0)).expect_err("foreign");
         assert_eq!(code, codes::NOT_OWNER);
         for bad_ref in [
             "cpu",
@@ -1586,12 +1689,12 @@ mod tests {
             "agent.00.load",
             "agent.+0.load",
         ] {
-            let (code, _) = set_simple(&mut registry, &macros, "r", bad_ref, spec_above(1.0))
+            let (code, _) = set_simple(&mut seat, &macros, "r", bad_ref, spec_above(1.0))
                 .expect_err("malformed");
             assert_eq!(code, codes::BAD_PAYLOAD, "ref '{bad_ref}'");
         }
         // Non-finite numbers and inverted hysteresis reject.
-        let (code, _) = set_simple(&mut registry, &macros, "r", "sys.cpu", spec_above(f32::NAN))
+        let (code, _) = set_simple(&mut seat, &macros, "r", "sys.cpu", spec_above(f32::NAN))
             .expect_err("nan threshold");
         assert_eq!(code, codes::BAD_PAYLOAD);
         let inverted = RuleSpec {
@@ -1599,13 +1702,13 @@ mod tests {
             ..spec_above(80.0)
         };
         let (code, _) =
-            set_simple(&mut registry, &macros, "r", "sys.cpu", inverted).expect_err("inverted");
+            set_simple(&mut seat, &macros, "r", "sys.cpu", inverted).expect_err("inverted");
         assert_eq!(code, codes::BAD_PAYLOAD);
         let bad_cooldown = RuleSpec {
             cooldown: Some(-1.0),
             ..spec_above(80.0)
         };
-        let (code, _) = set_simple(&mut registry, &macros, "r", "sys.cpu", bad_cooldown)
+        let (code, _) = set_simple(&mut seat, &macros, "r", "sys.cpu", bad_cooldown)
             .expect_err("negative cooldown");
         assert_eq!(code, codes::BAD_PAYLOAD);
     }
@@ -1613,27 +1716,25 @@ mod tests {
     #[test]
     fn collision_replace_and_namespace_cap() {
         let macros = MacroRegistry::default();
-        let mut registry = ReactiveRegistry::default();
-        set_simple(&mut registry, &macros, "r", "sys.cpu", spec_above(1.0))
-            .expect("registry op ok");
-        let (code, _) = set_simple(&mut registry, &macros, "r", "sys.cpu", spec_above(1.0))
-            .expect_err("collision");
+        let mut seat = TerminalReactive::default();
+        set_simple(&mut seat, &macros, "r", "sys.cpu", spec_above(1.0)).expect("registry op ok");
+        let (code, _) =
+            set_simple(&mut seat, &macros, "r", "sys.cpu", spec_above(1.0)).expect_err("collision");
         assert_eq!(code, codes::ALREADY_EXISTS);
-        registry
-            .set_rule(
-                NS0,
-                "r",
-                "sys.cpu",
-                spec_above(2.0),
-                think(),
-                true,
-                &crate::macros::TerminalMacros::default(),
-                &macros,
-            )
-            .expect("replace overwrites");
+        seat.set_rule(
+            NS0,
+            "r",
+            "sys.cpu",
+            spec_above(2.0),
+            think(),
+            true,
+            &crate::macros::TerminalMacros::default(),
+            &macros,
+        )
+        .expect("replace overwrites");
         for index in 1..MAX_RULES_PER_NAMESPACE {
             set_simple(
-                &mut registry,
+                &mut seat,
                 &macros,
                 &format!("r{index}"),
                 "sys.cpu",
@@ -1641,34 +1742,27 @@ mod tests {
             )
             .expect("registry op ok");
         }
-        let (code, _) = set_simple(
-            &mut registry,
-            &macros,
-            "overflow",
-            "sys.cpu",
-            spec_above(1.0),
-        )
-        .expect_err("at the cap");
+        let (code, _) = set_simple(&mut seat, &macros, "overflow", "sys.cpu", spec_above(1.0))
+            .expect_err("at the cap");
         assert_eq!(code, codes::NAMESPACE_CAP);
         // Replacing at the cap is not a new slot.
-        registry
-            .set_rule(
-                NS0,
-                "r",
-                "sys.cpu",
-                spec_above(3.0),
-                think(),
-                true,
-                &crate::macros::TerminalMacros::default(),
-                &macros,
-            )
-            .expect("registry op ok");
+        seat.set_rule(
+            NS0,
+            "r",
+            "sys.cpu",
+            spec_above(3.0),
+            think(),
+            true,
+            &crate::macros::TerminalMacros::default(),
+            &macros,
+        )
+        .expect("registry op ok");
     }
 
     #[test]
     fn action_allowlist_is_enforced_at_rule_set() {
         let macros = MacroRegistry::default();
-        let mut registry = ReactiveRegistry::default();
+        let mut seat = TerminalReactive::default();
         // Denied classes reject not-permitted.
         for denied in [
             RattyAiCommand::SetMode {
@@ -1715,7 +1809,7 @@ mod tests {
                 brightness: None,
             },
         ] {
-            let (code, _) = registry
+            let (code, _) = seat
                 .set_rule(
                     NS0,
                     "r",
@@ -1738,7 +1832,7 @@ mod tests {
             spin: Some(1.0),
             brightness: None,
         };
-        let (code, _) = registry
+        let (code, _) = seat
             .set_rule(
                 NS0,
                 "r",
@@ -1779,18 +1873,17 @@ mod tests {
         .into_iter()
         .enumerate()
         {
-            registry
-                .set_rule(
-                    NS0,
-                    &format!("ok{index}"),
-                    "sys.cpu",
-                    spec_above(1.0),
-                    allowed,
-                    false,
-                    &crate::macros::TerminalMacros::default(),
-                    &macros,
-                )
-                .expect("allowlisted action commits");
+            seat.set_rule(
+                NS0,
+                &format!("ok{index}"),
+                "sys.cpu",
+                spec_above(1.0),
+                allowed,
+                false,
+                &crate::macros::TerminalMacros::default(),
+                &macros,
+            )
+            .expect("allowlisted action commits");
         }
     }
 
@@ -1798,7 +1891,7 @@ mod tests {
     fn macro_play_actions_pin_a_rule_safe_macro_by_hash() {
         let macros = MacroRegistry::default();
         let mut seat_macros = crate::macros::TerminalMacros::default();
-        let mut registry = ReactiveRegistry::default();
+        let mut seat = TerminalReactive::default();
         let play = |name: &str| RattyAiCommand::MacroPlay {
             name: name.to_string(),
             hash: None,
@@ -1807,7 +1900,7 @@ mod tests {
             scope: None,
         };
         // Unresolvable macro: rejected (a rule pins its target at set).
-        let (code, _) = registry
+        let (code, _) = seat
             .set_rule(
                 NS0,
                 "r",
@@ -1836,7 +1929,7 @@ mod tests {
                 replace: false,
             }],
         );
-        let (code, _) = registry
+        let (code, _) = seat
             .set_rule(
                 NS0,
                 "r",
@@ -1849,19 +1942,18 @@ mod tests {
             )
             .expect_err("not rule-safe");
         assert_eq!(code, codes::NOT_PERMITTED);
-        registry
-            .set_rule(
-                NS0,
-                "r",
-                "sys.cpu",
-                spec_above(1.0),
-                play("soft"),
-                false,
-                &seat_macros,
-                &macros,
-            )
-            .expect("registry op ok");
-        let rule = registry.session.get(&(0, "r".to_string())).expect("stored");
+        seat.set_rule(
+            NS0,
+            "r",
+            "sys.cpu",
+            spec_above(1.0),
+            play("soft"),
+            false,
+            &seat_macros,
+            &macros,
+        )
+        .expect("registry op ok");
+        let rule = seat.rules.get("r").expect("stored");
         let RattyAiCommand::MacroPlay { hash, .. } = &rule.action else {
             panic!("macro.play action");
         };
@@ -1871,6 +1963,7 @@ mod tests {
     #[test]
     fn transitions_fire_once_with_hysteresis_and_debounce() {
         let macros = MacroRegistry::default();
+        let mut seat = TerminalReactive::default();
         let mut registry = ReactiveRegistry::default();
         let spec = RuleSpec {
             above: Some(80.0),
@@ -1879,42 +1972,45 @@ mod tests {
             debounce: Some(1.0),
             cooldown: Some(0.25),
         };
-        set_simple(&mut registry, &macros, "cpu", "agent.0.load", spec).expect("registry op ok");
+        set_simple(&mut seat, &macros, "cpu", "agent.0.load", spec).expect("registry op ok");
 
         // Below threshold: nothing.
-        publish(&mut registry, "load", 50.0, t(0.0));
-        assert!(evaluate_at(&mut registry, t(0.0)).is_empty());
+        publish(&mut seat, "load", 50.0, t(0.0));
+        assert!(evaluate_at(&mut seat, &mut registry, t(0.0)).is_empty());
         // Above threshold, debounce not yet mature: nothing.
-        publish(&mut registry, "load", 90.0, t(1.0));
-        assert!(evaluate_at(&mut registry, t(1.0)).is_empty());
+        publish(&mut seat, "load", 90.0, t(1.0));
+        assert!(evaluate_at(&mut seat, &mut registry, t(1.0)).is_empty());
         // Mature: fires exactly once.
-        assert_eq!(evaluate_at(&mut registry, t(2.0)).len(), 1);
+        assert_eq!(evaluate_at(&mut seat, &mut registry, t(2.0)).len(), 1);
         // Still above: latched active, no re-fire every frame.
-        assert!(evaluate_at(&mut registry, t(2.1)).is_empty());
+        assert!(evaluate_at(&mut seat, &mut registry, t(2.1)).is_empty());
         // Dropping to 75 is inside the hysteresis band: still active.
-        publish(&mut registry, "load", 75.0, t(3.0));
-        assert!(evaluate_at(&mut registry, t(3.0)).is_empty());
-        publish(&mut registry, "load", 90.0, t(3.5));
+        publish(&mut seat, "load", 75.0, t(3.0));
+        assert!(evaluate_at(&mut seat, &mut registry, t(3.0)).is_empty());
+        publish(&mut seat, "load", 90.0, t(3.5));
         assert!(
-            evaluate_at(&mut registry, t(3.5)).is_empty(),
+            evaluate_at(&mut seat, &mut registry, t(3.5)).is_empty(),
             "re-rise inside the band is not a transition"
         );
         // Crossing clear releases; the next mature rise fires again.
-        publish(&mut registry, "load", 60.0, t(4.0));
-        assert!(evaluate_at(&mut registry, t(4.0)).is_empty());
-        publish(&mut registry, "load", 95.0, t(5.0));
-        assert!(evaluate_at(&mut registry, t(5.0)).is_empty(), "debounce");
-        assert_eq!(evaluate_at(&mut registry, t(6.0)).len(), 1);
-        // An interrupted debounce resets the clock.
-        publish(&mut registry, "load", 60.0, t(7.0));
-        evaluate_at(&mut registry, t(7.0));
-        publish(&mut registry, "load", 95.0, t(8.0));
-        assert!(evaluate_at(&mut registry, t(8.0)).is_empty());
-        publish(&mut registry, "load", 60.0, t(8.5));
-        evaluate_at(&mut registry, t(8.5));
-        publish(&mut registry, "load", 95.0, t(9.0));
+        publish(&mut seat, "load", 60.0, t(4.0));
+        assert!(evaluate_at(&mut seat, &mut registry, t(4.0)).is_empty());
+        publish(&mut seat, "load", 95.0, t(5.0));
         assert!(
-            evaluate_at(&mut registry, t(9.0)).is_empty(),
+            evaluate_at(&mut seat, &mut registry, t(5.0)).is_empty(),
+            "debounce"
+        );
+        assert_eq!(evaluate_at(&mut seat, &mut registry, t(6.0)).len(), 1);
+        // An interrupted debounce resets the clock.
+        publish(&mut seat, "load", 60.0, t(7.0));
+        evaluate_at(&mut seat, &mut registry, t(7.0));
+        publish(&mut seat, "load", 95.0, t(8.0));
+        assert!(evaluate_at(&mut seat, &mut registry, t(8.0)).is_empty());
+        publish(&mut seat, "load", 60.0, t(8.5));
+        evaluate_at(&mut seat, &mut registry, t(8.5));
+        publish(&mut seat, "load", 95.0, t(9.0));
+        assert!(
+            evaluate_at(&mut seat, &mut registry, t(9.0)).is_empty(),
             "the hold restarts after the dip"
         );
     }
@@ -1922,6 +2018,7 @@ mod tests {
     #[test]
     fn cooldown_suppresses_but_latches_transitions() {
         let macros = MacroRegistry::default();
+        let mut seat = TerminalReactive::default();
         let mut registry = ReactiveRegistry::default();
         let spec = RuleSpec {
             above: Some(80.0),
@@ -1930,69 +2027,63 @@ mod tests {
             debounce: None,
             cooldown: Some(10.0),
         };
-        set_simple(&mut registry, &macros, "cpu", "agent.0.load", spec).expect("registry op ok");
-        publish(&mut registry, "load", 90.0, t(0.0));
-        assert_eq!(evaluate_at(&mut registry, t(0.0)).len(), 1);
+        set_simple(&mut seat, &macros, "cpu", "agent.0.load", spec).expect("registry op ok");
+        publish(&mut seat, "load", 90.0, t(0.0));
+        assert_eq!(evaluate_at(&mut seat, &mut registry, t(0.0)).len(), 1);
         // Release and re-rise inside the cooldown: the transition latches
         // (state is honest) but the fire is suppressed and counted.
-        publish(&mut registry, "load", 10.0, t(1.0));
-        evaluate_at(&mut registry, t(1.0));
-        publish(&mut registry, "load", 90.0, t(2.0));
-        assert!(evaluate_at(&mut registry, t(2.0)).is_empty());
-        let rule = registry
-            .session
-            .get(&(0, "cpu".to_string()))
-            .expect("stored");
+        publish(&mut seat, "load", 10.0, t(1.0));
+        evaluate_at(&mut seat, &mut registry, t(1.0));
+        publish(&mut seat, "load", 90.0, t(2.0));
+        assert!(evaluate_at(&mut seat, &mut registry, t(2.0)).is_empty());
+        let rule = seat.rules.get("cpu").expect("stored");
         assert!(rule.active, "the suppressed transition still latched");
         assert_eq!(rule.fires, 1);
         assert_eq!(rule.suppressed, 1);
         // Past the cooldown, the next transition fires.
-        publish(&mut registry, "load", 10.0, t(11.0));
-        evaluate_at(&mut registry, t(11.0));
-        publish(&mut registry, "load", 90.0, t(12.0));
-        assert_eq!(evaluate_at(&mut registry, t(12.0)).len(), 1);
+        publish(&mut seat, "load", 10.0, t(11.0));
+        evaluate_at(&mut seat, &mut registry, t(11.0));
+        publish(&mut seat, "load", 90.0, t(12.0));
+        assert_eq!(evaluate_at(&mut seat, &mut registry, t(12.0)).len(), 1);
     }
 
     #[test]
     fn stale_sensors_make_rules_dormant_and_unbound_rules_bind_late() {
         let macros = MacroRegistry::default();
+        let mut seat = TerminalReactive::default();
         let mut registry = ReactiveRegistry::default();
         // The rule references a sensor that does not exist yet: unbound,
         // registered, waiting.
-        set_simple(
-            &mut registry,
-            &macros,
-            "r",
-            "agent.0.tokens",
-            spec_above(5.0),
-        )
-        .expect("rules and sensors may arrive in any order");
-        assert!(evaluate_at(&mut registry, t(0.0)).is_empty());
+        set_simple(&mut seat, &macros, "r", "agent.0.tokens", spec_above(5.0))
+            .expect("rules and sensors may arrive in any order");
+        assert!(evaluate_at(&mut seat, &mut registry, t(0.0)).is_empty());
         // The sensor appears above threshold: binds and fires.
-        publish(&mut registry, "tokens", 9.0, t(1.0));
-        assert_eq!(evaluate_at(&mut registry, t(1.0)).len(), 1);
+        publish(&mut seat, "tokens", 9.0, t(1.0));
+        assert_eq!(evaluate_at(&mut seat, &mut registry, t(1.0)).len(), 1);
         // TTL expiry: dormant, never evaluating the stale value. The rule
         // stays latched (no false release either).
         let past_ttl = t(1.0 + DEFAULT_SENSOR_TTL_SECS + 1.0);
-        assert!(evaluate_at(&mut registry, past_ttl).is_empty());
-        let rule = registry.session.get(&(0, "r".to_string())).expect("rule");
+        assert!(evaluate_at(&mut seat, &mut registry, past_ttl).is_empty());
+        let rule = seat.rules.get("r").expect("rule");
         assert!(rule.active, "dormancy freezes state");
         // A fresh low sample releases; a fresh high one is a new
         // transition.
-        publish(&mut registry, "tokens", 1.0, past_ttl + t(1.0));
-        evaluate_at(&mut registry, past_ttl + t(1.0));
-        publish(&mut registry, "tokens", 9.0, past_ttl + t(2.0));
-        assert_eq!(evaluate_at(&mut registry, past_ttl + t(2.0)).len(), 1);
+        publish(&mut seat, "tokens", 1.0, past_ttl + t(1.0));
+        evaluate_at(&mut seat, &mut registry, past_ttl + t(1.0));
+        publish(&mut seat, "tokens", 9.0, past_ttl + t(2.0));
+        assert_eq!(
+            evaluate_at(&mut seat, &mut registry, past_ttl + t(2.0)).len(),
+            1
+        );
         // Removing the sensor returns the rule to unbound.
-        registry
-            .remove_wire_sensor(NS0, "tokens")
+        seat.remove_wire_sensor(NS0, "tokens")
             .expect("registry op ok");
-        assert!(evaluate_at(&mut registry, past_ttl + t(3.0)).is_empty());
+        assert!(evaluate_at(&mut seat, &mut registry, past_ttl + t(3.0)).is_empty());
     }
 
     #[test]
     fn sensor_publish_validates_and_rate_limits() {
-        let mut registry = ReactiveRegistry::default();
+        let mut seat = TerminalReactive::default();
         // Malformed names, values, TTLs.
         for (suffix, value, ttl) in [
             ("bad name", 1.0, None),
@@ -2001,50 +2092,45 @@ mod tests {
             ("ok", 1.0, Some(f32::INFINITY)),
             ("ok", 1.0, Some(0.0)),
         ] {
-            let (code, _) = registry
+            let (code, _) = seat
                 .publish_wire_sensor(NS0, suffix, value, ttl, None, t(0.0))
                 .expect_err("invalid publish");
             assert_eq!(code, codes::BAD_PAYLOAD);
         }
         let long = "x".repeat(MAX_SENSOR_SUFFIX_BYTES + 1);
-        let (code, _) = registry
+        let (code, _) = seat
             .publish_wire_sensor(NS0, &long, 1.0, None, None, t(0.0))
             .expect_err("too long");
         assert_eq!(code, codes::TOO_LARGE);
         // Stale/duplicate caller sequences reject; omitted seq increments.
-        registry
-            .publish_wire_sensor(NS0, "tokens", 1.0, None, Some(5), t(0.0))
+        seat.publish_wire_sensor(NS0, "tokens", 1.0, None, Some(5), t(0.0))
             .expect("registry op ok");
-        let (code, _) = registry
+        let (code, _) = seat
             .publish_wire_sensor(NS0, "tokens", 2.0, None, Some(5), t(0.1))
             .expect_err("duplicate seq");
         assert_eq!(code, codes::STALE_SEQ);
-        registry
-            .publish_wire_sensor(NS0, "tokens", 2.0, None, None, t(0.2))
+        seat.publish_wire_sensor(NS0, "tokens", 2.0, None, None, t(0.2))
             .expect("registry op ok");
         assert_eq!(
-            registry.sensors["agent.0.tokens"].seq, 6,
+            seat.sensors["agent.0.tokens"].seq, 6,
             "omitted seq continues the sequence"
         );
         // The namespace sensor cap (the bucket allows a burst past it).
         for index in 1..MAX_SENSORS_PER_NAMESPACE {
-            registry
-                .publish_wire_sensor(NS0, &format!("s{index}"), 1.0, None, None, t(1.0))
+            seat.publish_wire_sensor(NS0, &format!("s{index}"), 1.0, None, None, t(1.0))
                 .expect("registry op ok");
         }
-        let (code, _) = registry
+        let (code, _) = seat
             .publish_wire_sensor(NS0, "overflow", 1.0, None, None, t(1.0))
             .expect_err("at the cap");
         assert_eq!(code, codes::NAMESPACE_CAP);
         // Updates to an existing sensor are not a new slot.
-        registry
-            .publish_wire_sensor(NS0, "tokens", 3.0, None, None, t(1.1))
+        seat.publish_wire_sensor(NS0, "tokens", 3.0, None, None, t(1.1))
             .expect("registry op ok");
         // Exhausting the token bucket rate-limits.
         let mut limited = false;
         for _ in 0..(SENSOR_PUBLISH_BURST * 2) {
-            if let Err((code, _)) =
-                registry.publish_wire_sensor(NS0, "tokens", 3.0, None, None, t(1.2))
+            if let Err((code, _)) = seat.publish_wire_sensor(NS0, "tokens", 3.0, None, None, t(1.2))
             {
                 assert_eq!(code, codes::RATE_LIMITED);
                 limited = true;
@@ -2057,6 +2143,7 @@ mod tests {
     #[test]
     fn trusted_rules_survive_reset_and_are_not_wire_mutable() {
         let macros = MacroRegistry::default();
+        let mut seat = TerminalReactive::default();
         let mut registry = ReactiveRegistry::default();
         let config = TrustedRuleConfig {
             name: "cpu-alarm".to_string(),
@@ -2076,23 +2163,22 @@ mod tests {
                 IngressSource::test_boot(),
             )
             .expect("registry op ok");
-        // Wire mutation of a trusted name answers flat unknown-id.
-        let (code, _) = registry
-            .remove_rule(NS0, "cpu-alarm")
-            .expect_err("not wire-mutable");
+        // Wire mutation of a trusted name answers flat unknown-id — a
+        // trusted rule never lives in any seat's session component.
+        let (code, _) = seat.remove_rule("cpu-alarm").expect_err("not wire-mutable");
         assert_eq!(code, codes::UNKNOWN_ID);
-        let (code, _) = registry
-            .set_rule_enabled(NS0, "cpu-alarm", false)
+        let (code, _) = seat
+            .set_rule_enabled("cpu-alarm", false)
             .expect_err("not wire-mutable");
         assert_eq!(code, codes::UNKNOWN_ID);
         // A wire rule and sensor die on reset; the trusted rule survives.
-        set_simple(&mut registry, &macros, "mine", "agent.0.x", spec_above(1.0))
+        set_simple(&mut seat, &macros, "mine", "agent.0.x", spec_above(1.0))
             .expect("registry op ok");
-        publish(&mut registry, "x", 1.0, t(0.0));
-        registry.reset();
-        assert!(registry.session.is_empty(), "wire rules cleared");
+        publish(&mut seat, "x", 1.0, t(0.0));
+        seat.reset();
+        assert!(seat.rules.is_empty(), "wire rules cleared");
         assert!(
-            !registry.sensors.contains_key("agent.0.x"),
+            !seat.sensors.contains_key("agent.0.x"),
             "wire sensors cleared"
         );
         assert!(
@@ -2104,6 +2190,7 @@ mod tests {
     #[test]
     fn invalid_trusted_rules_seed_disabled_and_queryable() {
         let macros = MacroRegistry::default();
+        let mut seat = TerminalReactive::default();
         let mut registry = ReactiveRegistry::default();
         let bad = TrustedRuleConfig {
             name: "broken".to_string(),
@@ -2129,24 +2216,26 @@ mod tests {
         assert!(!rule.enabled);
         assert!(rule.invalid.is_some());
         // Projected with the invalid reason; never evaluated.
-        let rows = rules_state_items(&registry, 0, t(0.0));
+        let rows = rules_state_items(&seat, &registry, t(0.0));
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].1["scope"], "trusted");
         assert!(rows[0].1["invalid"].is_string());
         registry.publish_system_sensor("sys.cpu", 99.0, t(60.0), t(0.0));
-        assert!(evaluate_at(&mut registry, t(0.0)).is_empty());
+        assert!(evaluate_at(&mut seat, &mut registry, t(0.0)).is_empty());
     }
 
     #[test]
     fn state_projections_scope_sensors_and_report_bindings() {
         let macros = MacroRegistry::default();
+        let mut seat = TerminalReactive::default();
         let mut registry = ReactiveRegistry::default();
         registry.publish_system_sensor("sys.cpu", 42.0, t(60.0), t(0.0));
-        publish(&mut registry, "tokens", 7.0, t(0.0));
-        // A foreign wire sensor must not be listed for namespace 0. (Only
-        // one ingress exists today; the foreign record is pinned directly,
-        // like the macro scene-lock tests.)
-        registry.sensors.insert(
+        publish(&mut seat, "tokens", 7.0, t(0.0));
+        // A foreign wire sensor must not be listed for the caller — now
+        // structural: it lives on the foreign seat's own component, which
+        // the caller's projection never receives.
+        let mut foreign_seat = TerminalReactive::default();
+        foreign_seat.sensors.insert(
             "agent.5.secret".to_string(),
             SensorRecord {
                 value: 1.0,
@@ -2156,15 +2245,9 @@ mod tests {
                 source: SensorSource::Wire(5),
             },
         );
-        set_simple(
-            &mut registry,
-            &macros,
-            "r",
-            "agent.0.tokens",
-            spec_above(5.0),
-        )
-        .expect("registry op ok");
-        let rows = sensors_state_items(&registry, 0, t(1.0));
+        set_simple(&mut seat, &macros, "r", "agent.0.tokens", spec_above(5.0))
+            .expect("registry op ok");
+        let rows = sensors_state_items(&seat, &registry, t(1.0));
         let names: Vec<&str> = rows
             .iter()
             .map(|(_, row)| row["name"].as_str().expect("name"))
@@ -2174,8 +2257,15 @@ mod tests {
         assert_eq!(tokens["source"], "wire");
         assert_eq!(tokens["rules"], 1);
         assert_eq!(tokens["fresh"], true);
+        let foreign_rows = sensors_state_items(&foreign_seat, &registry, t(1.0));
+        assert!(
+            foreign_rows
+                .iter()
+                .all(|(_, row)| row["name"] != "agent.0.tokens"),
+            "a foreign seat's projection never lists another seat's sensors"
+        );
 
-        let rule_rows = rules_state_items(&registry, 0, t(1.0));
+        let rule_rows = rules_state_items(&seat, &registry, t(1.0));
         assert_eq!(rule_rows.len(), 1);
         let row = &rule_rows[0].1;
         assert_eq!(row["scope"], "session");
@@ -2187,29 +2277,26 @@ mod tests {
 
     #[test]
     fn sensor_seq_saturates_at_the_ceiling_instead_of_wrapping() {
-        let mut registry = ReactiveRegistry::default();
+        let mut seat = TerminalReactive::default();
         // The sentinel itself is rejected outright.
-        let (code, _) = registry
+        let (code, _) = seat
             .publish_wire_sensor(NS0, "x", 1.0, None, Some(u64::MAX), t(0.0))
             .expect_err("u64::MAX seq is rejected");
         assert_eq!(code, codes::BAD_PAYLOAD);
         // Parked just below the ceiling, the auto-increment path saturates
         // instead of panicking (debug) or wrapping to 0 (release).
-        registry
-            .publish_wire_sensor(NS0, "x", 1.0, None, Some(u64::MAX - 1), t(0.1))
+        seat.publish_wire_sensor(NS0, "x", 1.0, None, Some(u64::MAX - 1), t(0.1))
             .expect("registry op ok");
-        registry
-            .publish_wire_sensor(NS0, "x", 2.0, None, None, t(0.2))
+        seat.publish_wire_sensor(NS0, "x", 2.0, None, None, t(0.2))
             .expect("registry op ok");
-        registry
-            .publish_wire_sensor(NS0, "x", 3.0, None, None, t(0.3))
+        seat.publish_wire_sensor(NS0, "x", 3.0, None, None, t(0.3))
             .expect("registry op ok");
         assert_eq!(
-            registry.sensors["agent.0.x"].seq,
+            seat.sensors["agent.0.x"].seq,
             u64::MAX,
             "the sequence saturates; low sequences stay rejected"
         );
-        let (code, _) = registry
+        let (code, _) = seat
             .publish_wire_sensor(NS0, "x", 4.0, None, Some(5), t(0.4))
             .expect_err("a low explicit seq is still stale");
         assert_eq!(code, codes::STALE_SEQ);
@@ -2218,6 +2305,7 @@ mod tests {
     #[test]
     fn disable_resets_the_debounce_clock_like_dormancy() {
         let macros = MacroRegistry::default();
+        let mut seat = TerminalReactive::default();
         let mut registry = ReactiveRegistry::default();
         let spec = RuleSpec {
             above: Some(80.0),
@@ -2226,26 +2314,22 @@ mod tests {
             debounce: Some(10.0),
             cooldown: None,
         };
-        set_simple(&mut registry, &macros, "r", "agent.0.load", spec).expect("registry op ok");
+        set_simple(&mut seat, &macros, "r", "agent.0.load", spec).expect("registry op ok");
         // The raw condition starts holding at t=0…
-        publish(&mut registry, "load", 90.0, t(0.0));
-        assert!(evaluate_at(&mut registry, t(0.0)).is_empty());
+        publish(&mut seat, "load", 90.0, t(0.0));
+        assert!(evaluate_at(&mut seat, &mut registry, t(0.0)).is_empty());
         // …the rule is disabled at t=1 (the hold was only 1s observed)…
-        registry
-            .set_rule_enabled(NS0, "r", false)
-            .expect("registry op ok");
+        seat.set_rule_enabled("r", false).expect("registry op ok");
         // …and re-enabled much later with the condition still high. The
         // unobserved gap must not count as continuous hold time.
-        registry
-            .set_rule_enabled(NS0, "r", true)
-            .expect("registry op ok");
-        publish(&mut registry, "load", 95.0, t(100.0));
+        seat.set_rule_enabled("r", true).expect("registry op ok");
+        publish(&mut seat, "load", 95.0, t(100.0));
         assert!(
-            evaluate_at(&mut registry, t(100.0)).is_empty(),
+            evaluate_at(&mut seat, &mut registry, t(100.0)).is_empty(),
             "the debounce restarts after an unobserved gap"
         );
         assert!(
-            evaluate_at(&mut registry, t(110.0)).len() == 1,
+            evaluate_at(&mut seat, &mut registry, t(110.0)).len() == 1,
             "a fresh mature hold fires"
         );
     }
@@ -2470,8 +2554,9 @@ action = "flash;color=%23ff0000&duration=0.4"
         assert_eq!(fired.len(), 1, "one transition, one fire");
         assert!(fired[0].ack_token.is_none(), "fires are token-less");
         assert_eq!(fired[0].origin, CommandOrigin::Rule);
-        let registry = app.world().resource::<ReactiveRegistry>();
-        let rule = registry.session.get(&(0, "hot".to_string())).expect("rule");
+        let mut seats = app.world_mut().query::<&TerminalReactive>();
+        let seat = seats.single(app.world()).expect("one seat");
+        let rule = seat.rules.get("hot").expect("rule");
         assert_eq!(rule.fires, 1);
         assert!(rule.active);
     }
@@ -2491,13 +2576,14 @@ action = "flash;color=%23ff0000&duration=0.4"
                 seq: None,
             },
         );
-        assert!(
-            app.world()
-                .resource::<ReactiveRegistry>()
-                .sensors
-                .is_empty(),
-            "chain depth 1: rule-origin telemetry is refused"
-        );
+        {
+            let mut seats = app.world_mut().query::<&TerminalReactive>();
+            let seat = seats.single(app.world()).expect("one seat");
+            assert!(
+                seat.sensors.is_empty(),
+                "chain depth 1: rule-origin telemetry is refused"
+            );
+        }
         // A macro-origin rule.set can never mutate rules.
         send(
             &mut app,
@@ -2515,12 +2601,13 @@ action = "flash;color=%23ff0000&duration=0.4"
                 action: Box::new(think()),
             },
         );
-        assert!(
-            app.world()
-                .resource::<ReactiveRegistry>()
-                .session
-                .is_empty(),
-            "chain depth 1: non-wire rule mutation is refused"
-        );
+        {
+            let mut seats = app.world_mut().query::<&TerminalReactive>();
+            let seat = seats.single(app.world()).expect("one seat");
+            assert!(
+                seat.rules.is_empty(),
+                "chain depth 1: non-wire rule mutation is refused"
+            );
+        }
     }
 }

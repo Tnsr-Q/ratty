@@ -385,6 +385,7 @@ pub fn answer_queries(
         &crate::identity::TerminalIdentity,
         &TerminalDiagnostics,
         &crate::macros::TerminalMacros,
+        &crate::reactive::TerminalReactive,
     )>,
     presentation: Res<TerminalPresentation>,
     plane_warp: Query<&TerminalPlaneWarp>,
@@ -471,7 +472,7 @@ pub fn answer_queries(
                 // session macros), resolved by TerminalId (the stamp rule)
                 // — a query whose arrival terminal died is dropped loudly,
                 // never answered from another seat's state.
-                let Some((_, seat_diagnostics, seat_macros)) = seat_state
+                let Some((_, seat_diagnostics, seat_macros, seat_reactive)) = seat_state
                     .iter()
                     .find(|(identity, ..)| identity.id() == source.terminal())
                 else {
@@ -486,6 +487,7 @@ pub fn answer_queries(
                     inline_objects,
                     diagnostics: seat_diagnostics,
                     seat_macros,
+                    seat_reactive,
                     presentation: &presentation,
                     plane_warp,
                     plane_view: &plane_view,
@@ -579,6 +581,9 @@ struct QueryCtx<'a> {
     /// The caller's session-half macro state (its session registry and
     /// active slot); the trusted half stays in `macros`.
     seat_macros: &'a crate::macros::TerminalMacros,
+    /// The caller's session-half reactive state (its wire rules and
+    /// sensors); the trusted half stays in `reactive`.
+    seat_reactive: &'a crate::reactive::TerminalReactive,
     presentation: &'a TerminalPresentation,
     plane_warp: &'a TerminalPlaneWarp,
     plane_view: &'a TerminalPlaneView,
@@ -647,12 +652,12 @@ fn answer(
         // sensors plus the caller's own wire sensors (both paginated).
         "state.rules" => paginate(
             ctx,
-            crate::reactive::rules_state_items(ctx.reactive, source.namespace(), ctx.now),
+            crate::reactive::rules_state_items(ctx.seat_reactive, ctx.reactive, ctx.now),
             &data,
         ),
         "state.sensors" => paginate(
             ctx,
-            crate::reactive::sensors_state_items(ctx.reactive, source.namespace(), ctx.now),
+            crate::reactive::sensors_state_items(ctx.seat_reactive, ctx.reactive, ctx.now),
             &data,
         ),
         // The collaboration-presence rosters (#25), paginated: rosters
