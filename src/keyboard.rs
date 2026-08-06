@@ -1112,7 +1112,8 @@ mod tests {
     #[test]
     fn paste_without_bracketed_mode_sends_bare_bytes() {
         let config = AppConfig::default();
-        let (runtime, host) = TerminalRuntime::virtual_channel(&config);
+        let (runtime, host) =
+            TerminalRuntime::virtual_channel(&config, crate::runtime::IngressSource::test_boot());
         write_paste(&runtime, "hi\r\nthere\r");
         assert_eq!(
             host.input_rx
@@ -1125,7 +1126,8 @@ mod tests {
     #[test]
     fn paste_with_bracketed_mode_wraps_in_sentinels() {
         let config = AppConfig::default();
-        let (mut runtime, host) = TerminalRuntime::virtual_channel(&config);
+        let (mut runtime, host) =
+            TerminalRuntime::virtual_channel(&config, crate::runtime::IngressSource::test_boot());
         runtime.parser.process(b"\x1b[?2004h");
         write_paste(&runtime, "hi");
         assert_eq!(

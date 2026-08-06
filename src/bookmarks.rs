@@ -26,7 +26,7 @@ use bevy::prelude::*;
 use crate::ai::{AiCommand, CommandOrigin};
 use crate::osc::RattyAiCommand;
 use crate::query::codes;
-use crate::query_channel::{AckOutcome, AiDiagnostics, ack_commit};
+use crate::query_channel::{AckOutcome, DiagnosticsSink, ack_commit};
 use crate::runtime::IngressSource;
 use crate::scene::{TerminalPlaneWarp, TerminalPresentation, TerminalPresentationMode};
 
@@ -97,6 +97,29 @@ impl BookmarkRegistry {
     fn clear(&mut self) {
         self.entries.clear();
     }
+
+    /// Despawn sweep (#56 decision 17's corollary): drops a dead
+    /// terminal's bookmarks so the recycled namespace slot's next tenant
+    /// starts with an empty, cap-free namespace instead of inheriting the
+    /// corpse's saved views.
+    pub(crate) fn sweep_namespace(&mut self, namespace: u8) {
+        self.entries.retain(|(ns, _), _| *ns != namespace);
+    }
+
+    /// Test-only: seeds one bookmark, for the cross-module despawn-sweep
+    /// test (`insert` stays private to the applier).
+    #[cfg(test)]
+    pub(crate) fn test_insert(&mut self, namespace: u8, name: &str) {
+        self.insert(
+            namespace,
+            name.to_string(),
+            ViewBookmark {
+                v: BOOKMARK_VERSION,
+                mode: "flat",
+                warp: 0.0,
+            },
+        );
+    }
 }
 
 /// Jump commands awaiting relowering: the applier both reads and (via
@@ -105,6 +128,32 @@ impl BookmarkRegistry {
 /// normal command stream by [`drain_bookmark_jumps`] the same frame.
 #[derive(Resource, Default)]
 pub struct PendingBookmarkJumps(Vec<(IngressSource, RattyAiCommand)>);
+
+impl PendingBookmarkJumps {
+    /// Despawn sweep (#56 decision 17's corollary): drops a dead
+    /// terminal's not-yet-relowered jumps so a terminal that dies between
+    /// the applier and the drain never mutates the scene from beyond the
+    /// grave. Keyed by [`crate::identity::TerminalId`] (the stamp rule),
+    /// never the namespace.
+    pub(crate) fn sweep_terminal(&mut self, id: crate::identity::TerminalId) {
+        self.0.retain(|(source, _)| source.terminal() != id);
+    }
+
+    /// Test-only: seeds one relower-pending jump command, for the
+    /// cross-module despawn-sweep test (the buffer stays private to the
+    /// applier/drain pair).
+    #[cfg(test)]
+    pub(crate) fn test_push(&mut self, source: IngressSource) {
+        self.0
+            .push((source, RattyAiCommand::SetWarp { intensity: 0.0 }));
+    }
+
+    /// Test-only: the stamped sources still awaiting relowering.
+    #[cfg(test)]
+    pub(crate) fn test_sources(&self) -> Vec<IngressSource> {
+        self.0.iter().map(|(source, _)| *source).collect()
+    }
+}
 
 /// Registers the bookmark registry and its appliers.
 ///
@@ -145,7 +194,7 @@ pub fn apply_bookmark_commands(
     plane_warp: Query<&TerminalPlaneWarp>,
     mut pending: ResMut<PendingBookmarkJumps>,
     mut acks: MessageWriter<AckOutcome>,
-    mut diagnostics: ResMut<AiDiagnostics>,
+    mut diagnostics: DiagnosticsSink,
 ) {
     let plane_warp = match plane_warp.single() {
         Ok(plane_warp) => plane_warp,
@@ -316,11 +365,14 @@ mod tests {
         let mut app = App::new();
         app.init_resource::<BookmarkRegistry>();
         app.init_resource::<PendingBookmarkJumps>();
-        app.init_resource::<AiDiagnostics>();
         app.insert_resource(TerminalPresentation {
             mode: TerminalPresentationMode::Flat2d,
         });
-        app.world_mut().spawn(TerminalPlaneWarp::default());
+        app.world_mut().spawn((
+            TerminalPlaneWarp::default(),
+            crate::identity::TerminalIdentity::test_boot(),
+            crate::identity::terminal_session_state(),
+        ));
         app.add_message::<AiCommand>();
         app.add_message::<AckOutcome>();
         app.add_systems(
@@ -334,7 +386,7 @@ mod tests {
         app.world_mut()
             .resource_mut::<Messages<AiCommand>>()
             .write(AiCommand {
-                source: IngressSource::Local,
+                source: IngressSource::test_boot(),
                 ack_token: Some("t".to_string()),
                 origin: CommandOrigin::Wire,
                 command,
@@ -457,7 +509,7 @@ mod tests {
         app.world_mut()
             .resource_mut::<Messages<AiCommand>>()
             .write(AiCommand {
-                source: IngressSource::Local,
+                source: IngressSource::test_boot(),
                 ack_token: Some("reset-tok".to_string()),
                 origin: CommandOrigin::Wire,
                 command: RattyAiCommand::Reset,

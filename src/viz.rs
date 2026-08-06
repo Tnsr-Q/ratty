@@ -39,7 +39,7 @@ use bevy::prelude::*;
 use crate::ai::AiCommand;
 use crate::osc::{RattyAiCommand, ai_object_namespace};
 use crate::query::codes;
-use crate::query_channel::{AckOutcome, AiDiagnostics, ack_commit};
+use crate::query_channel::{AckOutcome, DiagnosticsSink, ack_commit};
 
 // The payload/item/label limits are part of the wire contract and live in
 // the shared std-only `osc` module so the `ratty-ai` collectors compile
@@ -759,6 +759,25 @@ impl VizRegistry {
         existed
     }
 
+    /// Despawn sweep (#56 decision 17's corollary): removes every
+    /// visualization whose id sits in a dead terminal's namespace,
+    /// queueing granular despawns for the render sync. Without this the
+    /// recycled slot's next tenant would OWN the corpse's visualizations
+    /// outright — the ownership check passes on namespace bits —
+    /// inheriting both cap pressure and mutation rights over stale
+    /// objects.
+    pub(crate) fn sweep_namespace(&mut self, namespace: u8) {
+        let dead: Vec<u32> = self
+            .entries
+            .keys()
+            .copied()
+            .filter(|id| ai_object_namespace(*id) == Some(namespace))
+            .collect();
+        for id in dead {
+            self.remove(id);
+        }
+    }
+
     /// Clears every visualization (the `reset` command), queueing
     /// granular despawns for all of them.
     pub(crate) fn clear_all(&mut self) {
@@ -897,7 +916,7 @@ pub fn apply_viz_commands(
     mut commands: MessageReader<AiCommand>,
     mut registry: ResMut<VizRegistry>,
     mut acks: MessageWriter<AckOutcome>,
-    mut diagnostics: ResMut<AiDiagnostics>,
+    mut diagnostics: DiagnosticsSink,
     mut redraw: Query<&mut crate::terminal::TerminalRedrawState>,
 ) {
     // Chart-family kinds carry a vello underlay inside the terminal
@@ -1496,10 +1515,12 @@ mod tests {
 
     fn test_app() -> App {
         let mut app = App::new();
-        app.world_mut()
-            .spawn(crate::terminal::TerminalRedrawState::default());
+        app.world_mut().spawn((
+            crate::terminal::TerminalRedrawState::default(),
+            crate::identity::TerminalIdentity::test_boot(),
+            crate::identity::terminal_session_state(),
+        ));
         app.init_resource::<VizRegistry>();
-        app.init_resource::<AiDiagnostics>();
         app.add_message::<AiCommand>();
         app.add_message::<AckOutcome>();
         app.add_systems(Update, apply_viz_commands);
@@ -1511,7 +1532,7 @@ mod tests {
         app.world_mut()
             .resource_mut::<Messages<AiCommand>>()
             .write(AiCommand {
-                source: IngressSource::Local,
+                source: IngressSource::test_boot(),
                 ack_token: Some("t".to_string()),
                 origin: crate::ai::CommandOrigin::Wire,
                 command,
@@ -1789,7 +1810,7 @@ mod tests {
         app.world_mut()
             .resource_mut::<Messages<AiCommand>>()
             .write(AiCommand {
-                source: IngressSource::Local,
+                source: IngressSource::test_boot(),
                 ack_token: Some("reset-tok".to_string()),
                 origin: crate::ai::CommandOrigin::Wire,
                 command: RattyAiCommand::Reset,

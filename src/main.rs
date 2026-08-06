@@ -14,6 +14,7 @@ use winit::window::Icon;
 
 use ratty::cli::Cli;
 use ratty::config::AppConfig;
+use ratty::identity::{TerminalRegistry, terminal_session_state};
 use ratty::paths::runtime_asset_root;
 use ratty::plugin::TerminalPlugin;
 use ratty::runtime::{RuntimeOptions, TerminalRuntime};
@@ -42,12 +43,20 @@ fn window_resolution(app_config: &AppConfig) -> WindowResolution {
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let app_config = AppConfig::load_from_path(cli.config_file.as_deref())?;
+    // The boot terminal's identity is the registry's FIRST allocation, so
+    // it deterministically leases TerminalId 1 / namespace 0 — every
+    // wire-visible derivation matches the single-terminal era byte for
+    // byte. Any earlier allocation would silently shift the boot
+    // namespace and change wire bytes.
+    let mut registry = TerminalRegistry::default();
+    let identity = registry.allocate()?;
     let runtime = TerminalRuntime::spawn(
         &app_config,
         &RuntimeOptions {
             command: cli.command.clone(),
             working_dir: Some(std::env::current_dir()?),
         },
+        identity.ingress(),
     )?;
     let terminal = TerminalSurface::new(&app_config)?;
     let window_title = cli.title;
@@ -102,11 +111,13 @@ fn main() -> anyhow::Result<()> {
     )
     .add_systems(Update, apply_window_icon)
     .add_plugins(TerminalPlugin);
-    // The terminal seat is born here, where the surface and runtime values
-    // are born; setup_scene finds it at Startup and dresses it with the
-    // world-derived per-terminal components. Nothing runs between this spawn
-    // and run().
-    app.world_mut().spawn((terminal, runtime));
+    // The terminal seat is born here, where the surface, runtime and
+    // identity values are born; setup_scene finds it at Startup and
+    // dresses it with the world-derived per-terminal components. Nothing
+    // runs between this spawn and run().
+    app.insert_resource(registry);
+    app.world_mut()
+        .spawn((terminal, runtime, identity, terminal_session_state()));
     app.run();
 
     Ok(())

@@ -22,6 +22,7 @@ use js_sys::{Function, Promise, Reflect};
 use wasm_bindgen::prelude::*;
 
 use crate::config::AppConfig;
+use crate::identity::TerminalRegistry;
 use crate::plugin::TerminalPlugin;
 use crate::runtime::TerminalRuntime;
 use crate::scene::{
@@ -321,7 +322,14 @@ pub fn start(canvas_selector: &str, config_toml: Option<String>) -> Result<Ratty
         None => AppConfig::default(),
     };
 
-    let (runtime, host) = TerminalRuntime::virtual_channel(&app_config);
+    // The boot terminal's identity is the registry's FIRST allocation
+    // (TerminalId 1 / namespace 0), exactly as in native main() — the wasm
+    // path must thread the same boot identity or the two targets diverge.
+    let mut registry = TerminalRegistry::default();
+    let identity = registry
+        .allocate()
+        .map_err(|error| JsValue::from_str(&format!("{error}")))?;
+    let (runtime, host) = TerminalRuntime::virtual_channel(&app_config, identity.ingress());
     let terminal = TerminalSurface::new(&app_config)
         .map_err(|error| JsValue::from_str(&format!("{error:#}")))?;
     let controls = WebControlQueue::default();
@@ -391,11 +399,17 @@ pub fn start(canvas_selector: &str, config_toml: Option<String>) -> Result<Ratty
         expire_query_promises.after(crate::query_channel::answer_queries),
     );
 
-    // The terminal seat is born here, where the surface and runtime values
-    // are born; setup_scene finds it at Startup and dresses it with the
-    // world-derived per-terminal components. Nothing runs between this spawn
-    // and run().
-    app.world_mut().spawn((terminal, runtime));
+    // The terminal seat is born here, where the surface, runtime and
+    // identity values are born; setup_scene finds it at Startup and
+    // dresses it with the world-derived per-terminal components. Nothing
+    // runs between this spawn and run().
+    app.insert_resource(registry);
+    app.world_mut().spawn((
+        terminal,
+        runtime,
+        identity,
+        crate::identity::terminal_session_state(),
+    ));
 
     // Bevy's winit runner on wasm spawns onto the browser event loop and
     // returns, so the session handle is live after this call.

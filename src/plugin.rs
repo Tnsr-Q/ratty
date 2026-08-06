@@ -199,5 +199,11 @@ impl Plugin for TerminalPlugin {
             .add_plugins(crate::sound::SoundPlugin)
             .add_plugins(DirectTerminalRenderPlugin)
             .add_plugins(TerminalPresentPlugin);
+        // THE single despawn-sweep site (#56 decision 17), registered
+        // after the organ plugins so every registry it sweeps exists. Its
+        // pool release is the only one, paired with the spawner's only
+        // allocation site — see the observer's doc for the free-is-last
+        // invariant.
+        app.add_observer(crate::scene::sweep_despawned_terminal);
     }
 }

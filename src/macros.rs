@@ -75,9 +75,10 @@ use bevy::prelude::*;
 use serde_json::{Value, json};
 
 use crate::ai::{AiCommand, CommandOrigin};
+use crate::identity::{TerminalId, TerminalIdentity};
 use crate::osc::{MacroScope, RattyAiCommand};
 use crate::query::codes;
-use crate::query_channel::{AckOutcome, AiDiagnostics, ack_commit, reject};
+use crate::query_channel::{AckOutcome, DiagnosticsSink, ack_commit, reject};
 use crate::runtime::IngressSource;
 
 /// Upper bound on stored macros per agent namespace: an honest failure
@@ -293,47 +294,213 @@ pub struct ExecutionView {
     pub scene_locked: bool,
 }
 
-/// The per-agent macro registries, slots, and the exclusive scene lock —
-/// decision 3's session store, the trusted promoted store, and (as the
-/// implementation sketch put it) the slot state plus the scene lock, all in
-/// one resource.
+/// One terminal seat's session-half macro state (#56 decision 5): the
+/// session registry plus the agent's single active slot. A component on
+/// the seat entity, born `Default`-fresh at spawn and destroyed by
+/// despawn — a recycled namespace slot's next tenant can never inherit
+/// session macros or a running slot, by construction rather than by
+/// cleanup discipline.
+#[derive(Component, Default)]
+pub struct TerminalMacros {
+    /// Session macros by name (the seat entity replaced the old namespace
+    /// key). Dies with the terminal; cleared by `reset`.
+    session: HashMap<String, Arc<Macro>>,
+    /// The agent's single active recording or playback.
+    slot: Option<SlotState>,
+}
+
+/// The trusted/config half of the macro organ plus the exclusive scene
+/// lock — the globals that survive any terminal (#56 decision 5); the
+/// session half lives on each seat as [`TerminalMacros`].
 #[derive(Resource, Default)]
 pub struct MacroRegistry {
-    /// Per-agent session macros, keyed by (namespace, name). Dies with the
-    /// session; cleared by `reset`.
-    session: HashMap<(u8, String), Arc<Macro>>,
     /// Trusted promoted macros, keyed by name. Wire-immutable and durable —
     /// only [`insert_trusted`](Self::insert_trusted) writes here, and `reset`
     /// spares them.
     trusted: HashMap<String, Arc<Macro>>,
-    /// Each agent's single active slot, keyed by namespace.
-    slots: HashMap<u8, SlotState>,
-    /// The namespace currently holding the exclusive scene lock, if any. Only
-    /// one privileged playback across all agents may hold it at a time.
-    scene_lock: Option<u8>,
+    /// The terminal currently holding the exclusive scene lock, if any —
+    /// scene-wide arbitration (#56 decision 16): only one privileged
+    /// playback across all agents may hold it at a time. Keyed by
+    /// [`TerminalId`], never the namespace (the decision-17 stamp rule's
+    /// live instance): ids never recycle, so a stale holder can never
+    /// alias a recycled slot's next tenant even if a release is missed;
+    /// the despawn sweep additionally releases a dead holder's lock so
+    /// the scene cannot wedge.
+    scene_lock: Option<TerminalId>,
 }
 
 /// A rejection: the wire code plus a human message for the `state.errors`
 /// ring. Registry methods return this; the system turns it into a `reject`.
 type MacroReject = (&'static str, String);
 
-impl MacroRegistry {
-    /// Number of session macros stored in `namespace`.
-    pub fn session_len(&self, namespace: u8) -> usize {
-        self.session
-            .keys()
-            .filter(|(entry_namespace, _)| *entry_namespace == namespace)
-            .count()
+impl TerminalMacros {
+    /// Number of session macros this terminal stores.
+    pub fn session_len(&self) -> usize {
+        self.session.len()
     }
 
-    /// Whether any agent has an active playback (the `drive_macro_playback`
-    /// run condition).
+    /// Whether this terminal's slot is an active playback (the
+    /// `drive_macro_playback` run condition, any seat).
     pub fn has_active_playback(&self) -> bool {
-        self.slots
-            .values()
-            .any(|slot| matches!(slot, SlotState::Playing(_)))
+        matches!(self.slot, Some(SlotState::Playing(_)))
     }
 
+    /// Iterates this terminal's session macros in arbitrary order.
+    pub fn iter_session(&self) -> impl Iterator<Item = (&str, &Macro)> {
+        self.session
+            .iter()
+            .map(|(name, macro_)| (name.as_str(), macro_.as_ref()))
+    }
+
+    /// A projection of this terminal's active slot, if any.
+    pub fn execution_view(&self) -> Option<ExecutionView> {
+        match self.slot.as_ref()? {
+            SlotState::Recording(rec) => Some(ExecutionView {
+                kind: "recording",
+                id: None,
+                name: rec.name.clone(),
+                privileged: rec.privileged,
+                commands: rec.steps.len(),
+                played: None,
+                instant: None,
+                rate: None,
+                scene_locked: false,
+            }),
+            SlotState::Playing(pb) => Some(ExecutionView {
+                kind: "playback",
+                id: Some(pb.execution_id.clone()),
+                name: String::new(),
+                privileged: pb.macro_.privileged,
+                commands: pb.macro_.steps.len(),
+                played: Some(pb.next_index),
+                instant: Some(pb.instant),
+                rate: Some(pb.rate),
+                scene_locked: pb.scene_locked,
+            }),
+        }
+    }
+
+    /// Starts a recording in this terminal's slot. Validates the name, the
+    /// single-slot invariant, the collision rule, and the per-terminal cap.
+    /// `source` is the arrival context (its namespace names the cap in the
+    /// rejection message, unchanged wire-visible text).
+    fn start_recording(
+        &mut self,
+        source: IngressSource,
+        name: &str,
+        replace: bool,
+        now: Duration,
+    ) -> Result<(), MacroReject> {
+        let namespace = source.namespace();
+        if name.is_empty() {
+            return Err((codes::BAD_PAYLOAD, "name= must be non-empty".to_string()));
+        }
+        if name.len() > MAX_MACRO_NAME_BYTES {
+            return Err((
+                codes::TOO_LARGE,
+                format!("name exceeds {MAX_MACRO_NAME_BYTES} bytes"),
+            ));
+        }
+        if self.slot.is_some() {
+            return Err((
+                codes::BUSY,
+                "a recording or playback is already active for this agent".to_string(),
+            ));
+        }
+        let exists = self.session.contains_key(name);
+        if exists && !replace {
+            return Err((
+                codes::ALREADY_EXISTS,
+                format!("macro '{name}' exists (pass mode=replace to overwrite it)"),
+            ));
+        }
+        if !exists && self.session_len() >= MAX_MACROS_PER_NAMESPACE {
+            return Err((
+                codes::NAMESPACE_CAP,
+                format!("namespace {namespace} is at its {MAX_MACROS_PER_NAMESPACE}-macro limit"),
+            ));
+        }
+        self.slot = Some(SlotState::Recording(ActiveRecording {
+            name: name.to_string(),
+            started: now,
+            steps: Vec::new(),
+            privileged: false,
+            rule_safe: true,
+            poisoned: None,
+        }));
+        Ok(())
+    }
+
+    /// Taps a recordable command into this terminal's active recording, if
+    /// any. Enforces the commands-per-macro and wall-clock limits by
+    /// poisoning the recording (discarded at `macro.stop`) rather than
+    /// truncating silently.
+    fn capture(&mut self, command: &RattyAiCommand, now: Duration) {
+        let Some(SlotState::Recording(rec)) = self.slot.as_mut() else {
+            return;
+        };
+        if rec.poisoned.is_some() {
+            return;
+        }
+        if rec.steps.len() >= MAX_COMMANDS_PER_MACRO {
+            rec.poisoned = Some(codes::TOO_LARGE);
+            return;
+        }
+        let offset = now.saturating_sub(rec.started).as_secs_f32();
+        if offset > MAX_RECORDING_SECS {
+            rec.poisoned = Some(codes::TOO_LARGE);
+            return;
+        }
+        if command.is_scene_global() {
+            rec.privileged = true;
+        }
+        if !command.is_rule_safe_action() {
+            rec.rule_safe = false;
+        }
+        rec.steps.push(MacroStep {
+            offset,
+            command: command.clone(),
+        });
+    }
+
+    /// Finalizes an active recording (saving it, transactionally) or
+    /// cancels an active playback. `nothing-active` when the slot is idle.
+    /// Returns whether a scene-locked playback was cancelled — the caller
+    /// ([`MacroRegistry::stop`]) releases the global lock; this component
+    /// half never touches it.
+    fn stop_slot(&mut self) -> Result<bool, MacroReject> {
+        match self.slot.take() {
+            Some(SlotState::Recording(rec)) => {
+                if let Some(code) = rec.poisoned {
+                    // The prior macro (if any) is untouched: it was never
+                    // removed, so replacement stays transactional.
+                    return Err((
+                        code,
+                        "recording exceeded a limit and was discarded".to_string(),
+                    ));
+                }
+                let name = rec.name.clone();
+                let hash = content_hash(&rec.steps, rec.privileged);
+                let macro_ = Arc::new(Macro {
+                    v: MACRO_VERSION,
+                    steps: rec.steps,
+                    privileged: rec.privileged,
+                    rule_safe: rec.rule_safe,
+                    hash,
+                });
+                self.session.insert(name, macro_);
+                Ok(false)
+            }
+            Some(SlotState::Playing(pb)) => Ok(pb.scene_locked),
+            None => Err((
+                codes::NOTHING_ACTIVE,
+                "no active recording or playback to stop".to_string(),
+            )),
+        }
+    }
+}
+
+impl MacroRegistry {
     /// Promotes a macro into the durable, wire-immutable trusted registry.
     /// This is the trusted-tier entry point (config / CLI / UI / controller);
     /// the wire can never reach it. A macro carrying any macro-control
@@ -378,47 +545,11 @@ impl MacroRegistry {
         Ok(())
     }
 
-    /// Iterates `namespace`'s session macros in arbitrary order.
-    pub fn iter_session(&self, namespace: u8) -> impl Iterator<Item = (&str, &Macro)> {
-        self.session
-            .iter()
-            .filter(move |((entry_namespace, _), _)| *entry_namespace == namespace)
-            .map(|((_, name), macro_)| (name.as_str(), macro_.as_ref()))
-    }
-
     /// Iterates the trusted macros in arbitrary order.
     pub fn iter_trusted(&self) -> impl Iterator<Item = (&str, &Macro)> {
         self.trusted
             .iter()
             .map(|(name, macro_)| (name.as_str(), macro_.as_ref()))
-    }
-
-    /// A projection of `namespace`'s active slot, if any.
-    pub fn execution_view(&self, namespace: u8) -> Option<ExecutionView> {
-        match self.slots.get(&namespace)? {
-            SlotState::Recording(rec) => Some(ExecutionView {
-                kind: "recording",
-                id: None,
-                name: rec.name.clone(),
-                privileged: rec.privileged,
-                commands: rec.steps.len(),
-                played: None,
-                instant: None,
-                rate: None,
-                scene_locked: false,
-            }),
-            SlotState::Playing(pb) => Some(ExecutionView {
-                kind: "playback",
-                id: Some(pb.execution_id.clone()),
-                name: String::new(),
-                privileged: pb.macro_.privileged,
-                commands: pb.macro_.steps.len(),
-                played: Some(pb.next_index),
-                instant: Some(pb.instant),
-                rate: Some(pb.rate),
-                scene_locked: pb.scene_locked,
-            }),
-        }
     }
 
     /// Resolves a macro by name under the given scope. `None` resolves the
@@ -427,11 +558,11 @@ impl MacroRegistry {
     /// `rule.set` (#21).
     pub(crate) fn resolve(
         &self,
-        namespace: u8,
+        seat: &TerminalMacros,
         name: &str,
         scope: Option<MacroScope>,
     ) -> Option<Arc<Macro>> {
-        let session = || self.session.get(&(namespace, name.to_string()));
+        let session = || seat.session.get(name);
         let trusted = || self.trusted.get(name);
         match scope {
             Some(MacroScope::Session) => session(),
@@ -444,139 +575,41 @@ impl MacroRegistry {
     /// Resolves a macro by its immutable content id, searching the caller's
     /// session macros then the trusted registry (never another agent's
     /// session). Shared with the reactive organ (#21).
-    pub(crate) fn resolve_by_hash(&self, namespace: u8, hash: &str) -> Option<Arc<Macro>> {
-        self.session
-            .iter()
-            .filter(|((entry_namespace, _), _)| *entry_namespace == namespace)
-            .map(|(_, macro_)| macro_)
+    pub(crate) fn resolve_by_hash(&self, seat: &TerminalMacros, hash: &str) -> Option<Arc<Macro>> {
+        seat.session
+            .values()
             .chain(self.trusted.values())
             .find(|macro_| macro_.hash == hash)
             .cloned()
     }
 
-    /// Starts a recording for `source`. Validates the name, the single-slot
-    /// invariant, the collision rule, and the per-namespace cap.
-    fn start_recording(
-        &mut self,
-        source: IngressSource,
-        name: &str,
-        replace: bool,
-        now: Duration,
-    ) -> Result<(), MacroReject> {
-        let namespace = source.namespace();
-        if name.is_empty() {
-            return Err((codes::BAD_PAYLOAD, "name= must be non-empty".to_string()));
-        }
-        if name.len() > MAX_MACRO_NAME_BYTES {
-            return Err((
-                codes::TOO_LARGE,
-                format!("name exceeds {MAX_MACRO_NAME_BYTES} bytes"),
-            ));
-        }
-        if self.slots.contains_key(&namespace) {
-            return Err((
-                codes::BUSY,
-                "a recording or playback is already active for this agent".to_string(),
-            ));
-        }
-        let exists = self.session.contains_key(&(namespace, name.to_string()));
-        if exists && !replace {
-            return Err((
-                codes::ALREADY_EXISTS,
-                format!("macro '{name}' exists (pass mode=replace to overwrite it)"),
-            ));
-        }
-        if !exists && self.session_len(namespace) >= MAX_MACROS_PER_NAMESPACE {
-            return Err((
-                codes::NAMESPACE_CAP,
-                format!("namespace {namespace} is at its {MAX_MACROS_PER_NAMESPACE}-macro limit"),
-            ));
-        }
-        self.slots.insert(
-            namespace,
-            SlotState::Recording(ActiveRecording {
-                name: name.to_string(),
-                started: now,
-                steps: Vec::new(),
-                privileged: false,
-                rule_safe: true,
-                poisoned: None,
-            }),
+    /// Releases the scene lock on behalf of `holder`. The invariant —
+    /// `scene_lock == Some(t)` iff terminal `t`'s slot is a scene-locked
+    /// playback — makes any other release a bug, surfaced in debug.
+    fn release_scene_lock(&mut self, holder: TerminalId) {
+        debug_assert_eq!(
+            self.scene_lock,
+            Some(holder),
+            "scene_lock invariant: only the holder's playback can release it"
         );
+        self.scene_lock = None;
+    }
+
+    /// Finalizes `seat`'s active recording or cancels its active playback,
+    /// releasing the scene lock when the cancelled playback held it.
+    fn stop(
+        &mut self,
+        seat: &mut TerminalMacros,
+        source: IngressSource,
+    ) -> Result<(), MacroReject> {
+        let released = seat.stop_slot()?;
+        if released {
+            self.release_scene_lock(source.terminal());
+        }
         Ok(())
     }
 
-    /// Taps a recordable command into `source`'s active recording, if any.
-    /// Enforces the commands-per-macro and wall-clock limits by poisoning the
-    /// recording (discarded at `macro.stop`) rather than truncating silently.
-    fn capture(&mut self, source: IngressSource, command: &RattyAiCommand, now: Duration) {
-        let Some(SlotState::Recording(rec)) = self.slots.get_mut(&source.namespace()) else {
-            return;
-        };
-        if rec.poisoned.is_some() {
-            return;
-        }
-        if rec.steps.len() >= MAX_COMMANDS_PER_MACRO {
-            rec.poisoned = Some(codes::TOO_LARGE);
-            return;
-        }
-        let offset = now.saturating_sub(rec.started).as_secs_f32();
-        if offset > MAX_RECORDING_SECS {
-            rec.poisoned = Some(codes::TOO_LARGE);
-            return;
-        }
-        if command.is_scene_global() {
-            rec.privileged = true;
-        }
-        if !command.is_rule_safe_action() {
-            rec.rule_safe = false;
-        }
-        rec.steps.push(MacroStep {
-            offset,
-            command: command.clone(),
-        });
-    }
-
-    /// Finalizes an active recording (saving it, transactionally) or cancels
-    /// an active playback. `nothing-active` when the slot is idle.
-    fn stop(&mut self, source: IngressSource) -> Result<(), MacroReject> {
-        let namespace = source.namespace();
-        match self.slots.remove(&namespace) {
-            Some(SlotState::Recording(rec)) => {
-                if let Some(code) = rec.poisoned {
-                    // The prior macro (if any) is untouched: it was never
-                    // removed, so replacement stays transactional.
-                    return Err((
-                        code,
-                        "recording exceeded a limit and was discarded".to_string(),
-                    ));
-                }
-                let name = rec.name.clone();
-                let hash = content_hash(&rec.steps, rec.privileged);
-                let macro_ = Arc::new(Macro {
-                    v: MACRO_VERSION,
-                    steps: rec.steps,
-                    privileged: rec.privileged,
-                    rule_safe: rec.rule_safe,
-                    hash,
-                });
-                self.session.insert((namespace, name), macro_);
-                Ok(())
-            }
-            Some(SlotState::Playing(pb)) => {
-                if pb.scene_locked {
-                    self.scene_lock = None;
-                }
-                Ok(())
-            }
-            None => Err((
-                codes::NOTHING_ACTIVE,
-                "no active recording or playback to stop".to_string(),
-            )),
-        }
-    }
-
-    /// Starts a playback for `source`. Enforces the single slot, validates
+    /// Starts a playback in `seat`'s slot. Enforces the single slot, validates
     /// the rate, resolves and pins the macro version, and acquires the
     /// exclusive scene lock for a privileged macro. On success returns the
     /// started-ack estimate; `execution_id` is the caller-minted handle
@@ -585,6 +618,7 @@ impl MacroRegistry {
     #[allow(clippy::too_many_arguments)]
     fn start_playback(
         &mut self,
+        seat: &mut TerminalMacros,
         source: IngressSource,
         origin: CommandOrigin,
         name: &str,
@@ -595,8 +629,7 @@ impl MacroRegistry {
         execution_id: String,
         now: Duration,
     ) -> Result<PlaybackEta, MacroReject> {
-        let namespace = source.namespace();
-        if self.slots.contains_key(&namespace) {
+        if seat.slot.is_some() {
             return Err((
                 codes::BUSY,
                 "a recording or playback is already active for this agent".to_string(),
@@ -610,8 +643,8 @@ impl MacroRegistry {
         }
         let rate = rate.min(MAX_PLAYBACK_RATE);
         let macro_ = match hash {
-            Some(hash) => self.resolve_by_hash(namespace, hash),
-            None => self.resolve(namespace, name, scope),
+            Some(hash) => self.resolve_by_hash(seat, hash),
+            None => self.resolve(seat, name, scope),
         };
         let Some(macro_) = macro_ else {
             return Err((
@@ -637,7 +670,10 @@ impl MacroRegistry {
                         .to_string(),
                 ));
             }
-            self.scene_lock = Some(namespace);
+            // The lock keys on the arrival TerminalId (the stamp rule) —
+            // the stamp was minted by the allocator and is the same id the
+            // applier resolved this seat by, so it cannot lie.
+            self.scene_lock = Some(source.terminal());
             true
         } else {
             false
@@ -649,41 +685,72 @@ impl MacroRegistry {
             let last_offset = macro_.steps.last().map_or(0.0, |step| step.offset);
             PlaybackEta::Millis((f64::from(last_offset / rate) * 1000.0).round() as u64)
         };
-        self.slots.insert(
-            namespace,
-            SlotState::Playing(ActivePlayback {
-                source,
-                // A rule-started playback keeps firing under the rule's
-                // causal context; everything else replays as `Macro`.
-                origin: if origin == CommandOrigin::Rule {
-                    CommandOrigin::Rule
-                } else {
-                    CommandOrigin::Macro
-                },
-                macro_,
-                rate,
-                instant,
-                started: now,
-                next_index: 0,
-                scene_locked,
-                execution_id,
-            }),
-        );
+        seat.slot = Some(SlotState::Playing(ActivePlayback {
+            source,
+            // A rule-started playback keeps firing under the rule's
+            // causal context; everything else replays as `Macro`.
+            origin: if origin == CommandOrigin::Rule {
+                CommandOrigin::Rule
+            } else {
+                CommandOrigin::Macro
+            },
+            macro_,
+            rate,
+            instant,
+            started: now,
+            next_index: 0,
+            scene_locked,
+            execution_id,
+        }));
         Ok(eta)
     }
 
-    /// Full session reset: cancel active slots, drop every session macro, and
-    /// release the scene lock. Trusted macros are durable and survive. Called
-    /// from the `reset` command's tap; that command owns its ack elsewhere.
-    fn reset(&mut self) {
-        self.session.clear();
-        self.slots.clear();
-        self.scene_lock = None;
+    /// Session reset, scoped to the ARRIVAL terminal (#56 decision 15's
+    /// arrival-runtime attach): cancel its slot, drop its session macros,
+    /// and release the scene lock iff that terminal holds it. Byte-identical
+    /// to the old global clear at N=1 (one terminal is every terminal); at
+    /// N>1 another agent's reset can no longer cancel this seat's held lock
+    /// or drop its macros — decision 12's cross-runtime-interference ban.
+    /// Trusted macros are durable and survive. Called from the `reset`
+    /// command's tap; that command owns its ack elsewhere.
+    fn reset(&mut self, seat: &mut TerminalMacros, terminal: TerminalId) {
+        seat.session.clear();
+        seat.slot = None;
+        if self.scene_lock == Some(terminal) {
+            self.scene_lock = None;
+        }
+    }
+
+    /// Despawn-sweep release (#56 decision 17's named leak): a terminal
+    /// dying mid-privileged-playback must not wedge the scene for the
+    /// recycled slot's next tenant. The sweep is liveness; the
+    /// `TerminalId` re-key is safety even under a sweep bug — a leaked id
+    /// can never equal any future terminal's, whereas a leaked namespace
+    /// aliased the slot's next tenant.
+    pub(crate) fn sweep_terminal(&mut self, terminal: TerminalId) {
+        if self.scene_lock == Some(terminal) {
+            self.scene_lock = None;
+        }
     }
 }
 
 #[cfg(test)]
 impl MacroRegistry {
+    /// Test-only: pins the scene lock to a holder, for the despawn-sweep
+    /// test outside this module (the field stays private — production
+    /// acquisition is `start_playback` alone).
+    pub(crate) fn test_hold_scene_lock(&mut self, terminal: TerminalId) {
+        self.scene_lock = Some(terminal);
+    }
+
+    /// Test-only: the current lock holder.
+    pub(crate) fn test_scene_lock(&self) -> Option<TerminalId> {
+        self.scene_lock
+    }
+}
+
+#[cfg(test)]
+impl TerminalMacros {
     /// Test-only: records and finalizes a macro from the given commands at
     /// t=0, for cross-organ tests (the reactive rule-action pinning).
     pub(crate) fn test_record(
@@ -695,9 +762,10 @@ impl MacroRegistry {
         self.start_recording(source, name, false, Duration::ZERO)
             .expect("test recording starts");
         for command in commands {
-            self.capture(source, command, Duration::ZERO);
+            self.capture(command, Duration::ZERO);
         }
-        self.stop(source).expect("test recording finalizes");
+        let released = self.stop_slot().expect("test recording finalizes");
+        assert!(!released, "a recording never holds the scene lock");
     }
 }
 
@@ -746,7 +814,9 @@ impl Plugin for MacrosPlugin {
                     .before(crate::effects::apply_ai_effect_commands)
                     .before(crate::bookmarks::apply_bookmark_commands)
                     .before(crate::avatar::apply_avatar_commands)
-                    .run_if(|registry: Res<MacroRegistry>| registry.has_active_playback()),
+                    .run_if(|seats: Query<&TerminalMacros>| {
+                        seats.iter().any(TerminalMacros::has_active_playback)
+                    }),
             );
     }
 }
@@ -758,9 +828,10 @@ pub fn apply_macro_commands(
     time: Res<Time>,
     mut commands: MessageReader<AiCommand>,
     mut registry: ResMut<MacroRegistry>,
+    mut seats: Query<(&TerminalIdentity, &mut TerminalMacros)>,
     mut session: ResMut<crate::query_channel::QuerySession>,
     mut acks: MessageWriter<AckOutcome>,
-    mut diagnostics: ResMut<AiDiagnostics>,
+    mut diagnostics: DiagnosticsSink,
 ) {
     let now = time.elapsed();
     for AiCommand {
@@ -770,6 +841,20 @@ pub fn apply_macro_commands(
         command,
     } in commands.read()
     {
+        // Arrival resolution keys on TerminalId (the stamp rule): a
+        // command whose arrival terminal died earlier this frame is
+        // dropped loudly, never rerouted — a same-frame recycled
+        // namespace cannot capture it.
+        let Some((_, mut seat)) = seats
+            .iter_mut()
+            .find(|(identity, _)| identity.id() == source.terminal())
+        else {
+            warn!(
+                "apply_macro_commands: command dropped: arrival terminal {:?} no longer exists",
+                source.terminal()
+            );
+            continue;
+        };
         macro_rules! reject {
             ($action:literal, $code:expr, $message:expr) => {
                 reject(
@@ -785,7 +870,7 @@ pub fn apply_macro_commands(
         }
         match command {
             RattyAiCommand::MacroRecord { name, replace } => {
-                match registry.start_recording(*source, name, *replace, now) {
+                match seat.start_recording(*source, name, *replace, now) {
                     Ok(()) => ack_commit(&mut acks, *source, ack_token),
                     Err((code, message)) => {
                         warn!("ratty-ai: macro.record rejected: {message}");
@@ -793,7 +878,7 @@ pub fn apply_macro_commands(
                     }
                 }
             }
-            RattyAiCommand::MacroStop => match registry.stop(*source) {
+            RattyAiCommand::MacroStop => match registry.stop(&mut seat, *source) {
                 Ok(()) => ack_commit(&mut acks, *source, ack_token),
                 Err((code, message)) => {
                     warn!("ratty-ai: macro.stop rejected: {message}");
@@ -809,6 +894,7 @@ pub fn apply_macro_commands(
             } => {
                 let execution_id = session.mint_execution_id();
                 match registry.start_playback(
+                    &mut seat,
                     *source,
                     *origin,
                     name,
@@ -864,9 +950,10 @@ pub fn apply_macro_commands(
                 );
             }
             RattyAiCommand::Reset => {
-                // Full session reset. Reset's single ack belongs to
-                // apply_ai_commands; the macro registry clears silently.
-                registry.reset();
+                // Session reset, arrival-terminal scoped. Reset's single ack
+                // belongs to apply_ai_commands; the macro state clears
+                // silently.
+                registry.reset(&mut seat, source.terminal());
             }
             other => {
                 // Recorder tap. macro.* and reset are handled above and never
@@ -883,7 +970,7 @@ pub fn apply_macro_commands(
                 {
                     continue;
                 }
-                registry.capture(*source, other, now);
+                seat.capture(other, now);
             }
         }
     }
@@ -896,13 +983,16 @@ pub fn apply_macro_commands(
 pub fn drive_macro_playback(
     time: Res<Time>,
     mut registry: ResMut<MacroRegistry>,
+    mut seats: Query<(&TerminalIdentity, &mut TerminalMacros)>,
     mut commands: MessageWriter<AiCommand>,
 ) {
     let now = time.elapsed();
+    // ONE budget across every seat (the shared per-frame ceiling); query
+    // iteration order is arbitrary, exactly as the old HashMap order was —
+    // N tests assert aggregates, never cross-terminal ordering.
     let mut spent = 0_usize;
-    let mut finished: Vec<u8> = Vec::new();
-    for (namespace, slot) in registry.slots.iter_mut() {
-        let SlotState::Playing(playback) = slot else {
+    for (identity, mut seat) in seats.iter_mut() {
+        let Some(SlotState::Playing(playback)) = seat.slot.as_mut() else {
             continue;
         };
         if spent >= MAX_PLAYBACK_COMMANDS_PER_FRAME {
@@ -921,14 +1011,11 @@ pub fn drive_macro_playback(
             });
         }
         if playback.finished() {
-            finished.push(*namespace);
-        }
-    }
-    for namespace in finished {
-        if let Some(SlotState::Playing(playback)) = registry.slots.remove(&namespace)
-            && playback.scene_locked
-        {
-            registry.scene_lock = None;
+            let scene_locked = playback.scene_locked;
+            seat.slot = None;
+            if scene_locked {
+                registry.release_scene_lock(identity.id());
+            }
         }
     }
 }
@@ -936,9 +1023,9 @@ pub fn drive_macro_playback(
 /// `state.macros`: the caller's session macros plus the trusted macros, each
 /// tagged with its scope. Deterministically ordered and paginated so a large
 /// registry never overflows a reply page.
-pub fn macros_state_items(registry: &MacroRegistry, namespace: u8) -> Vec<(u64, Value)> {
+pub fn macros_state_items(seat: &TerminalMacros, registry: &MacroRegistry) -> Vec<(u64, Value)> {
     let mut rows: Vec<(String, Value)> = Vec::new();
-    for (name, macro_) in registry.iter_session(namespace) {
+    for (name, macro_) in seat.iter_session() {
         rows.push((
             format!("session\u{0}{name}"),
             json!({
@@ -977,9 +1064,9 @@ pub fn macros_state_items(registry: &MacroRegistry, namespace: u8) -> Vec<(u64, 
 
 /// `state.executions`: the caller's own active slot (0 or 1) — executions are
 /// private per-agent, never projected to other callers.
-pub fn executions_state_value(registry: &MacroRegistry, namespace: u8) -> Value {
-    let items: Vec<Value> = registry
-        .execution_view(namespace)
+pub fn executions_state_value(seat: &TerminalMacros) -> Value {
+    let items: Vec<Value> = seat
+        .execution_view()
         .map(|view| {
             let mut value = json!({
                 "kind": view.kind,
@@ -1012,7 +1099,7 @@ mod tests {
     use super::*;
     use bevy::ecs::message::Messages;
 
-    const NS0: IngressSource = IngressSource::Local;
+    const NS0: IngressSource = IngressSource::test_boot();
 
     fn t(secs: f32) -> Duration {
         Duration::from_secs_f32(secs)
@@ -1049,15 +1136,15 @@ mod tests {
     #[test]
     fn record_capture_stop_preserves_relative_deltas() {
         let mut registry = MacroRegistry::default();
-        registry
-            .start_recording(NS0, "deploy", false, t(0.0))
+        let mut seat = TerminalMacros::default();
+        seat.start_recording(NS0, "deploy", false, t(0.0))
             .expect("record starts");
         // Two ordinary commands at t=0 and t=1.5.
-        registry.capture(NS0, &spawn(0x8000_0001), t(0.0));
-        registry.capture(NS0, &spawn(0x8000_0002), t(1.5));
-        registry.stop(NS0).expect("finalize");
+        seat.capture(&spawn(0x8000_0001), t(0.0));
+        seat.capture(&spawn(0x8000_0002), t(1.5));
+        registry.stop(&mut seat, NS0).expect("finalize");
 
-        let macro_ = registry.resolve(0, "deploy", None).expect("stored");
+        let macro_ = registry.resolve(&seat, "deploy", None).expect("stored");
         assert_eq!(macro_.step_count(), 2);
         assert!(!macro_.is_privileged(), "no scene-global command captured");
         assert_eq!(macro_.steps[0].offset, 0.0);
@@ -1069,13 +1156,13 @@ mod tests {
         // The tap is class-filtered by apply_macro_commands, but capture must
         // also never store a control-plane command if reached directly.
         let mut registry = MacroRegistry::default();
-        registry
-            .start_recording(NS0, "m", false, t(0.0))
+        let mut seat = TerminalMacros::default();
+        seat.start_recording(NS0, "m", false, t(0.0))
             .expect("registry op ok");
         // A scene-global command records and marks the macro privileged.
-        registry.capture(NS0, &mode("3d"), t(0.0));
-        registry.stop(NS0).expect("registry op ok");
-        let macro_ = registry.resolve(0, "m", None).expect("registry op ok");
+        seat.capture(&mode("3d"), t(0.0));
+        registry.stop(&mut seat, NS0).expect("registry op ok");
+        let macro_ = registry.resolve(&seat, "m", None).expect("registry op ok");
         assert_eq!(macro_.step_count(), 1);
         assert!(macro_.is_privileged(), "mode is scene-global → privileged");
     }
@@ -1086,7 +1173,8 @@ mod tests {
         // avatar.speak is ordinary choreography → recordable but not
         // rule-safe; execution control never enters a trusted macro (#18).
         let mut registry = MacroRegistry::default();
-        registry.test_record(
+        let mut seat = TerminalMacros::default();
+        seat.test_record(
             NS0,
             "scene",
             &[RattyAiCommand::AvatarSet {
@@ -1097,10 +1185,10 @@ mod tests {
                 scale: None,
             }],
         );
-        let scene = registry.resolve(0, "scene", None).expect("stored");
+        let scene = registry.resolve(&seat, "scene", None).expect("stored");
         assert!(scene.is_privileged(), "avatar.set → privileged");
 
-        registry.test_record(
+        seat.test_record(
             NS0,
             "speech",
             &[RattyAiCommand::AvatarSpeak {
@@ -1109,12 +1197,12 @@ mod tests {
                 duration: None,
             }],
         );
-        let speech = registry.resolve(0, "speech", None).expect("stored");
+        let speech = registry.resolve(&seat, "speech", None).expect("stored");
         assert!(!speech.is_privileged(), "speak is ownership-scoped");
         assert!(!speech.is_rule_safe(), "speak consumes the shared voice");
 
-        registry.test_record(NS0, "cancelier", &[RattyAiCommand::AvatarStopSpeaking]);
-        let cancelier = registry.resolve(0, "cancelier", None).expect("stored");
+        seat.test_record(NS0, "cancelier", &[RattyAiCommand::AvatarStopSpeaking]);
+        let cancelier = registry.resolve(&seat, "cancelier", None).expect("stored");
         assert_eq!(
             registry
                 .insert_trusted("t".to_string(), &cancelier)
@@ -1126,15 +1214,16 @@ mod tests {
     #[test]
     fn single_slot_rejects_busy() {
         let mut registry = MacroRegistry::default();
-        registry
-            .start_recording(NS0, "a", false, t(0.0))
+        let mut seat = TerminalMacros::default();
+        seat.start_recording(NS0, "a", false, t(0.0))
             .expect("registry op ok");
-        let (code, _) = registry
+        let (code, _) = seat
             .start_recording(NS0, "b", false, t(0.0))
             .expect_err("second op is busy");
         assert_eq!(code, codes::BUSY);
         let (code, _) = registry
             .start_playback(
+                &mut seat,
                 NS0,
                 CommandOrigin::Wire,
                 "a",
@@ -1152,36 +1241,35 @@ mod tests {
     #[test]
     fn collision_rule_and_transactional_replace() {
         let mut registry = MacroRegistry::default();
-        registry
-            .start_recording(NS0, "x", false, t(0.0))
+        let mut seat = TerminalMacros::default();
+        seat.start_recording(NS0, "x", false, t(0.0))
             .expect("registry op ok");
-        registry.capture(NS0, &spawn(0x8000_0001), t(0.0));
-        registry.stop(NS0).expect("registry op ok");
+        seat.capture(&spawn(0x8000_0001), t(0.0));
+        registry.stop(&mut seat, NS0).expect("registry op ok");
 
         // Same name without replace: rejected.
-        let (code, _) = registry
+        let (code, _) = seat
             .start_recording(NS0, "x", false, t(0.0))
             .expect_err("already exists");
         assert_eq!(code, codes::ALREADY_EXISTS);
 
         // Replace: the old macro survives until the new one finalizes.
-        registry
-            .start_recording(NS0, "x", true, t(0.0))
+        seat.start_recording(NS0, "x", true, t(0.0))
             .expect("registry op ok");
         assert_eq!(
             registry
-                .resolve(0, "x", None)
+                .resolve(&seat, "x", None)
                 .expect("registry op ok")
                 .step_count(),
             1,
             "old version is intact mid-recording"
         );
-        registry.capture(NS0, &spawn(0x8000_0002), t(0.0));
-        registry.capture(NS0, &spawn(0x8000_0003), t(0.0));
-        registry.stop(NS0).expect("registry op ok");
+        seat.capture(&spawn(0x8000_0002), t(0.0));
+        seat.capture(&spawn(0x8000_0003), t(0.0));
+        registry.stop(&mut seat, NS0).expect("registry op ok");
         assert_eq!(
             registry
-                .resolve(0, "x", None)
+                .resolve(&seat, "x", None)
                 .expect("registry op ok")
                 .step_count(),
             2,
@@ -1192,30 +1280,31 @@ mod tests {
     #[test]
     fn cancelled_replace_preserves_the_old_version() {
         let mut registry = MacroRegistry::default();
-        registry
-            .start_recording(NS0, "x", false, t(0.0))
+        let mut seat = TerminalMacros::default();
+        seat.start_recording(NS0, "x", false, t(0.0))
             .expect("registry op ok");
-        registry.capture(NS0, &spawn(0x8000_0001), t(0.0));
-        registry.stop(NS0).expect("registry op ok");
+        seat.capture(&spawn(0x8000_0001), t(0.0));
+        registry.stop(&mut seat, NS0).expect("registry op ok");
         let old_hash = registry
-            .resolve(0, "x", None)
+            .resolve(&seat, "x", None)
             .expect("registry op ok")
             .hash()
             .to_string();
 
         // A replace recording that never finalizes (poisoned) leaves the old
         // version untouched.
-        registry
-            .start_recording(NS0, "x", true, t(0.0))
+        seat.start_recording(NS0, "x", true, t(0.0))
             .expect("registry op ok");
         for index in 0..=MAX_COMMANDS_PER_MACRO as u32 {
-            registry.capture(NS0, &spawn(0x8000_0100 + index), t(0.0));
+            seat.capture(&spawn(0x8000_0100 + index), t(0.0));
         }
-        let (code, _) = registry.stop(NS0).expect_err("poisoned recording");
+        let (code, _) = registry
+            .stop(&mut seat, NS0)
+            .expect_err("poisoned recording");
         assert_eq!(code, codes::TOO_LARGE);
         assert_eq!(
             registry
-                .resolve(0, "x", None)
+                .resolve(&seat, "x", None)
                 .expect("registry op ok")
                 .hash()
                 .to_string(),
@@ -1227,30 +1316,29 @@ mod tests {
     #[test]
     fn namespace_cap_is_enforced_at_record_start() {
         let mut registry = MacroRegistry::default();
+        let mut seat = TerminalMacros::default();
         for index in 0..MAX_MACROS_PER_NAMESPACE {
-            registry
-                .start_recording(NS0, &format!("m{index}"), false, t(0.0))
+            seat.start_recording(NS0, &format!("m{index}"), false, t(0.0))
                 .expect("registry op ok");
-            registry.stop(NS0).expect("registry op ok");
+            registry.stop(&mut seat, NS0).expect("registry op ok");
         }
-        let (code, _) = registry
+        let (code, _) = seat
             .start_recording(NS0, "overflow", false, t(0.0))
             .expect_err("at the cap");
         assert_eq!(code, codes::NAMESPACE_CAP);
         // Replacing an existing name at the cap is not a new slot.
-        registry
-            .start_recording(NS0, "m0", true, t(0.0))
+        seat.start_recording(NS0, "m0", true, t(0.0))
             .expect("registry op ok");
     }
 
     #[test]
     fn name_validation() {
-        let mut registry = MacroRegistry::default();
-        let (code, _) = registry
+        let mut seat = TerminalMacros::default();
+        let (code, _) = seat
             .start_recording(NS0, "", false, t(0.0))
             .expect_err("empty");
         assert_eq!(code, codes::BAD_PAYLOAD);
-        let (code, _) = registry
+        let (code, _) = seat
             .start_recording(NS0, &"x".repeat(MAX_MACRO_NAME_BYTES + 1), false, t(0.0))
             .expect_err("too long");
         assert_eq!(code, codes::TOO_LARGE);
@@ -1259,23 +1347,25 @@ mod tests {
     #[test]
     fn stop_when_idle_is_nothing_active() {
         let mut registry = MacroRegistry::default();
-        let (code, _) = registry.stop(NS0).expect_err("nothing to stop");
+        let mut seat = TerminalMacros::default();
+        let (code, _) = registry.stop(&mut seat, NS0).expect_err("nothing to stop");
         assert_eq!(code, codes::NOTHING_ACTIVE);
     }
 
     #[test]
     fn playback_collects_due_steps_and_finishes() {
         let mut registry = MacroRegistry::default();
-        registry
-            .start_recording(NS0, "seq", false, t(0.0))
+        let mut seat = TerminalMacros::default();
+        seat.start_recording(NS0, "seq", false, t(0.0))
             .expect("registry op ok");
-        registry.capture(NS0, &spawn(0x8000_0001), t(0.0));
-        registry.capture(NS0, &spawn(0x8000_0002), t(1.0));
-        registry.capture(NS0, &spawn(0x8000_0003), t(2.0));
-        registry.stop(NS0).expect("registry op ok");
+        seat.capture(&spawn(0x8000_0001), t(0.0));
+        seat.capture(&spawn(0x8000_0002), t(1.0));
+        seat.capture(&spawn(0x8000_0003), t(2.0));
+        registry.stop(&mut seat, NS0).expect("registry op ok");
 
         registry
             .start_playback(
+                &mut seat,
                 NS0,
                 CommandOrigin::Wire,
                 "seq",
@@ -1287,7 +1377,7 @@ mod tests {
                 t(10.0),
             )
             .expect("registry op ok");
-        let SlotState::Playing(pb) = registry.slots.get_mut(&0).expect("registry op ok") else {
+        let SlotState::Playing(pb) = seat.slot.as_mut().expect("registry op ok") else {
             panic!("playing");
         };
         // At +0.0 only the first step is due.
@@ -1303,15 +1393,16 @@ mod tests {
     #[test]
     fn instant_playback_ignores_timing_but_respects_budget() {
         let mut registry = MacroRegistry::default();
-        registry
-            .start_recording(NS0, "big", false, t(0.0))
+        let mut seat = TerminalMacros::default();
+        seat.start_recording(NS0, "big", false, t(0.0))
             .expect("registry op ok");
         for index in 0..5 {
-            registry.capture(NS0, &spawn(0x8000_0001 + index), t(index as f32));
+            seat.capture(&spawn(0x8000_0001 + index), t(index as f32));
         }
-        registry.stop(NS0).expect("registry op ok");
+        registry.stop(&mut seat, NS0).expect("registry op ok");
         registry
             .start_playback(
+                &mut seat,
                 NS0,
                 CommandOrigin::Wire,
                 "big",
@@ -1323,7 +1414,7 @@ mod tests {
                 t(0.0),
             )
             .expect("registry op ok");
-        let SlotState::Playing(pb) = registry.slots.get_mut(&0).expect("registry op ok") else {
+        let SlotState::Playing(pb) = seat.slot.as_mut().expect("registry op ok") else {
             panic!("playing");
         };
         // Instant ignores offsets; a budget of 2 caps the frame's emission.
@@ -1335,13 +1426,14 @@ mod tests {
     #[test]
     fn rate_is_validated() {
         let mut registry = MacroRegistry::default();
-        registry
-            .start_recording(NS0, "m", false, t(0.0))
+        let mut seat = TerminalMacros::default();
+        seat.start_recording(NS0, "m", false, t(0.0))
             .expect("registry op ok");
-        registry.stop(NS0).expect("registry op ok");
+        registry.stop(&mut seat, NS0).expect("registry op ok");
         for bad in [0.0, -1.0, f32::NAN, f32::INFINITY] {
             let (code, _) = registry
                 .start_playback(
+                    &mut seat,
                     NS0,
                     CommandOrigin::Wire,
                     "m",
@@ -1360,13 +1452,14 @@ mod tests {
     #[test]
     fn privileged_playback_acquires_and_releases_the_scene_lock() {
         let mut registry = MacroRegistry::default();
-        registry
-            .start_recording(NS0, "warp", false, t(0.0))
+        let mut seat = TerminalMacros::default();
+        seat.start_recording(NS0, "warp", false, t(0.0))
             .expect("registry op ok");
-        registry.capture(NS0, &mode("3d"), t(0.0));
-        registry.stop(NS0).expect("registry op ok");
+        seat.capture(&mode("3d"), t(0.0));
+        registry.stop(&mut seat, NS0).expect("registry op ok");
         registry
             .start_playback(
+                &mut seat,
                 NS0,
                 CommandOrigin::Wire,
                 "warp",
@@ -1380,35 +1473,36 @@ mod tests {
             .expect("registry op ok");
         assert_eq!(
             registry.scene_lock,
-            Some(0),
-            "privileged play takes the lock"
+            Some(NS0.terminal()),
+            "privileged play takes the lock, keyed by the arrival TerminalId \
+             (the stamp rule), never the namespace"
         );
         // Cancelling the playback releases the lock for the next privileged
         // operation.
-        registry.stop(NS0).expect("registry op ok");
+        registry.stop(&mut seat, NS0).expect("registry op ok");
         assert_eq!(registry.scene_lock, None);
     }
 
     #[test]
     fn privileged_playback_rejected_while_scene_lock_held() {
         let mut registry = MacroRegistry::default();
-        registry
-            .start_recording(NS0, "warp", false, t(0.0))
+        let mut seat = TerminalMacros::default();
+        seat.start_recording(NS0, "warp", false, t(0.0))
             .expect("registry op ok");
-        registry.capture(NS0, &mode("3d"), t(0.0));
-        registry.stop(NS0).expect("registry op ok");
-        registry
-            .start_recording(NS0, "plain", false, t(0.0))
+        seat.capture(&mode("3d"), t(0.0));
+        registry.stop(&mut seat, NS0).expect("registry op ok");
+        seat.start_recording(NS0, "plain", false, t(0.0))
             .expect("registry op ok");
-        registry.capture(NS0, &spawn(0x8000_0001), t(0.0));
-        registry.stop(NS0).expect("registry op ok");
+        seat.capture(&spawn(0x8000_0001), t(0.0));
+        registry.stop(&mut seat, NS0).expect("registry op ok");
 
-        // Simulate another agent holding the exclusive scene lock. (Only one
-        // ingress source exists today, so the cross-agent contender is
-        // modelled by pinning the lock field directly.)
-        registry.scene_lock = Some(5);
+        // Simulate another terminal holding the exclusive scene lock. (The
+        // cross-agent contender is modelled by pinning the lock field
+        // directly to a foreign TerminalId.)
+        registry.scene_lock = Some(TerminalId::from_raw(5));
         let (code, _) = registry
             .start_playback(
+                &mut seat,
                 NS0,
                 CommandOrigin::Wire,
                 "warp",
@@ -1424,6 +1518,7 @@ mod tests {
         // A non-privileged macro is unaffected by the held scene lock.
         registry
             .start_playback(
+                &mut seat,
                 NS0,
                 CommandOrigin::Wire,
                 "plain",
@@ -1440,14 +1535,14 @@ mod tests {
     #[test]
     fn scope_defeats_shadowing_and_hash_addresses_directly() {
         let mut registry = MacroRegistry::default();
+        let mut seat = TerminalMacros::default();
         // A session macro and a trusted macro share the name "deploy".
-        registry
-            .start_recording(NS0, "deploy", false, t(0.0))
+        seat.start_recording(NS0, "deploy", false, t(0.0))
             .expect("registry op ok");
-        registry.capture(NS0, &spawn(0x8000_0001), t(0.0));
-        registry.stop(NS0).expect("registry op ok");
+        seat.capture(&spawn(0x8000_0001), t(0.0));
+        registry.stop(&mut seat, NS0).expect("registry op ok");
         let session_hash = registry
-            .resolve(0, "deploy", None)
+            .resolve(&seat, "deploy", None)
             .expect("registry op ok")
             .hash()
             .to_string();
@@ -1477,7 +1572,7 @@ mod tests {
         // Unqualified resolves session first.
         assert_eq!(
             registry
-                .resolve(0, "deploy", None)
+                .resolve(&seat, "deploy", None)
                 .expect("registry op ok")
                 .step_count(),
             1
@@ -1485,7 +1580,7 @@ mod tests {
         // scope=trusted defeats the shadow.
         assert_eq!(
             registry
-                .resolve(0, "deploy", Some(MacroScope::Trusted))
+                .resolve(&seat, "deploy", Some(MacroScope::Trusted))
                 .expect("registry op ok")
                 .step_count(),
             2
@@ -1493,14 +1588,14 @@ mod tests {
         // Hash addresses the exact content across registries.
         assert_eq!(
             registry
-                .resolve_by_hash(0, &trusted_hash)
+                .resolve_by_hash(&seat, &trusted_hash)
                 .expect("registry op ok")
                 .step_count(),
             2
         );
         assert_eq!(
             registry
-                .resolve_by_hash(0, &session_hash)
+                .resolve_by_hash(&seat, &session_hash)
                 .expect("registry op ok")
                 .step_count(),
             1
@@ -1510,6 +1605,7 @@ mod tests {
     #[test]
     fn trusted_rejects_macro_control_and_survives_reset() {
         let mut registry = MacroRegistry::default();
+        let mut seat = TerminalMacros::default();
         let bad = Macro {
             v: MACRO_VERSION,
             steps: vec![MacroStep {
@@ -1539,39 +1635,70 @@ mod tests {
             .insert_trusted("good".to_string(), &good)
             .expect("registry op ok");
         // A session macro to be cleared, and an active slot to be cancelled.
-        registry
-            .start_recording(NS0, "s", false, t(0.0))
+        seat.start_recording(NS0, "s", false, t(0.0))
             .expect("registry op ok");
-        registry.reset();
-        assert!(registry.resolve(0, "s", None).is_none(), "session cleared");
-        assert!(registry.slots.is_empty(), "slots cancelled");
+        registry.reset(&mut seat, NS0.terminal());
+        assert!(
+            registry.resolve(&seat, "s", None).is_none(),
+            "session cleared"
+        );
+        assert!(seat.slot.is_none(), "the slot is cancelled");
         assert!(
             registry
-                .resolve(0, "good", Some(MacroScope::Trusted))
+                .resolve(&seat, "good", Some(MacroScope::Trusted))
                 .is_some(),
             "trusted survives reset"
+        );
+    }
+
+    /// Reset is scoped to the ARRIVAL terminal (#56 decision 15's
+    /// arrival-attach, decision 12's cross-runtime-interference ban):
+    /// byte-identical to the old global clear at N=1, but at N>1 one
+    /// agent's `reset` must not release a lock a FOREIGN terminal holds.
+    /// Fails under the old unconditional `scene_lock = None`.
+    #[test]
+    fn reset_spares_a_foreign_terminals_scene_lock() {
+        let mut registry = MacroRegistry::default();
+        let mut seat = TerminalMacros::default();
+        let foreign = TerminalId::from_raw(5);
+        registry.scene_lock = Some(foreign);
+        seat.start_recording(NS0, "s", false, t(0.0))
+            .expect("registry op ok");
+        registry.reset(&mut seat, NS0.terminal());
+        assert!(seat.slot.is_none(), "the arrival seat's slot is cancelled");
+        assert_eq!(
+            registry.scene_lock,
+            Some(foreign),
+            "a foreign holder's lock survives another terminal's reset"
+        );
+        // The arrival terminal's own held lock IS released.
+        registry.scene_lock = Some(NS0.terminal());
+        registry.reset(&mut seat, NS0.terminal());
+        assert_eq!(
+            registry.scene_lock, None,
+            "the arrival terminal's own lock releases on its reset"
         );
     }
 
     #[test]
     fn state_projections_reflect_slots_and_stored_macros() {
         let mut registry = MacroRegistry::default();
+        let mut seat = TerminalMacros::default();
         // Idle: no executions.
-        let idle = executions_state_value(&registry, 0);
+        let idle = executions_state_value(&seat);
         assert_eq!(idle["items"].as_array().expect("array").len(), 0);
 
         // An active recording projects as a "recording" execution.
-        registry
-            .start_recording(NS0, "rec", false, t(0.0))
+        seat.start_recording(NS0, "rec", false, t(0.0))
             .expect("record");
-        registry.capture(NS0, &spawn(0x8000_0001), t(0.0));
-        let exec = executions_state_value(&registry, 0);
+        seat.capture(&spawn(0x8000_0001), t(0.0));
+        let exec = executions_state_value(&seat);
         assert_eq!(exec["items"][0]["kind"], "recording");
         assert_eq!(exec["items"][0]["commands"], 1);
-        registry.stop(NS0).expect("finalize");
+        registry.stop(&mut seat, NS0).expect("finalize");
 
         // The finalized macro appears in state.macros, scoped session.
-        let items = macros_state_items(&registry, 0);
+        let items = macros_state_items(&seat, &registry);
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].1["name"], "rec");
         assert_eq!(items[0].1["scope"], "session");
@@ -1581,37 +1708,40 @@ mod tests {
     #[test]
     fn rule_safety_is_sealed_at_finalize_and_gates_rule_origin_playback() {
         let mut registry = MacroRegistry::default();
+        let mut seat = TerminalMacros::default();
         // A macro of pure choreography (flash) is rule-safe.
-        registry
-            .start_recording(NS0, "soft", false, t(0.0))
+        seat.start_recording(NS0, "soft", false, t(0.0))
             .expect("registry op ok");
-        registry.capture(
-            NS0,
+        seat.capture(
             &RattyAiCommand::Flash {
                 color: "#ff0000".to_string(),
                 duration: 0.4,
             },
             t(0.0),
         );
-        registry.stop(NS0).expect("registry op ok");
-        let soft = registry.resolve(0, "soft", None).expect("registry op ok");
+        registry.stop(&mut seat, NS0).expect("registry op ok");
+        let soft = registry
+            .resolve(&seat, "soft", None)
+            .expect("registry op ok");
         assert!(soft.is_rule_safe(), "pure choreography is rule-safe");
         assert!(!soft.is_privileged());
 
         // A spawn (respawn-class) breaks rule-safety; so does anything
         // scene-global.
-        registry
-            .start_recording(NS0, "hard", false, t(0.0))
+        seat.start_recording(NS0, "hard", false, t(0.0))
             .expect("registry op ok");
-        registry.capture(NS0, &spawn(0x8000_0001), t(0.0));
-        registry.stop(NS0).expect("registry op ok");
-        let hard = registry.resolve(0, "hard", None).expect("registry op ok");
+        seat.capture(&spawn(0x8000_0001), t(0.0));
+        registry.stop(&mut seat, NS0).expect("registry op ok");
+        let hard = registry
+            .resolve(&seat, "hard", None)
+            .expect("registry op ok");
         assert!(!hard.is_rule_safe(), "spawn is not rule-safe");
 
         // A rule-fired play of the unsafe macro rejects at fire time; the
         // safe macro plays and its steps inherit the rule origin.
         let (code, _) = registry
             .start_playback(
+                &mut seat,
                 NS0,
                 CommandOrigin::Rule,
                 "hard",
@@ -1626,6 +1756,7 @@ mod tests {
         assert_eq!(code, codes::NOT_PERMITTED);
         registry
             .start_playback(
+                &mut seat,
                 NS0,
                 CommandOrigin::Rule,
                 "soft",
@@ -1637,7 +1768,7 @@ mod tests {
                 t(0.0),
             )
             .expect("registry op ok");
-        let SlotState::Playing(pb) = registry.slots.get(&0).expect("slot exists") else {
+        let SlotState::Playing(pb) = seat.slot.as_ref().expect("slot exists") else {
             panic!("playing");
         };
         assert_eq!(
@@ -1650,6 +1781,7 @@ mod tests {
     #[test]
     fn insert_trusted_recomputes_rule_safety_from_the_steps() {
         let mut registry = MacroRegistry::default();
+        let seat = TerminalMacros::default();
         let steps = vec![MacroStep {
             offset: 0.0,
             command: spawn(0x8000_0001),
@@ -1667,7 +1799,7 @@ mod tests {
             .expect("registry op ok");
         assert!(
             !registry
-                .resolve(0, "promoted", Some(MacroScope::Trusted))
+                .resolve(&seat, "promoted", Some(MacroScope::Trusted))
                 .expect("registry op ok")
                 .is_rule_safe(),
             "derived state stays derived"
@@ -1677,7 +1809,10 @@ mod tests {
     fn app_test() -> App {
         let mut app = App::new();
         app.init_resource::<MacroRegistry>();
-        app.init_resource::<AiDiagnostics>();
+        app.world_mut().spawn((
+            crate::identity::TerminalIdentity::test_boot(),
+            crate::identity::terminal_session_state(),
+        ));
         app.init_resource::<crate::query_channel::QuerySession>();
         app.init_resource::<Time>();
         app.add_message::<AiCommand>();
@@ -1686,11 +1821,20 @@ mod tests {
         app
     }
 
+    /// Resolves a session macro through the scaffold seat's component plus
+    /// the trusted registry (the component-era `resource().resolve(0, ..)`).
+    fn resolve_session(app: &mut App, name: &str) -> Option<Arc<Macro>> {
+        let world = app.world_mut();
+        let mut seats = world.query::<&TerminalMacros>();
+        let seat = seats.single(world).expect("one seat");
+        world.resource::<MacroRegistry>().resolve(seat, name, None)
+    }
+
     fn send(app: &mut App, ack: Option<&str>, command: RattyAiCommand) {
         app.world_mut()
             .resource_mut::<Messages<AiCommand>>()
             .write(AiCommand {
-                source: IngressSource::Local,
+                source: IngressSource::test_boot(),
                 ack_token: ack.map(str::to_string),
                 origin: CommandOrigin::Wire,
                 command,
@@ -1775,9 +1919,11 @@ mod tests {
     #[test]
     fn executions_projection_carries_the_playback_handle() {
         let mut registry = MacroRegistry::default();
-        registry.test_record(NS0, "seq", &[mode("3d")]);
+        let mut seat = TerminalMacros::default();
+        seat.test_record(NS0, "seq", &[mode("3d")]);
         registry
             .start_playback(
+                &mut seat,
                 NS0,
                 CommandOrigin::Wire,
                 "seq",
@@ -1789,7 +1935,7 @@ mod tests {
                 t(0.0),
             )
             .expect("playback starts");
-        let value = executions_state_value(&registry, 0);
+        let value = executions_state_value(&seat);
         assert_eq!(value["items"][0]["id"], json!("cafe-1"));
         assert_eq!(value["items"][0]["kind"], json!("playback"));
     }
@@ -1820,7 +1966,7 @@ mod tests {
         app.world_mut()
             .resource_mut::<Messages<AiCommand>>()
             .write(AiCommand {
-                source: IngressSource::Local,
+                source: IngressSource::test_boot(),
                 ack_token: None,
                 origin: CommandOrigin::Rule,
                 command: spawn(0x8000_0002),
@@ -1832,10 +1978,7 @@ mod tests {
         send(&mut app, Some("s"), RattyAiCommand::MacroStop);
         assert!(drain_acks(&mut app)[0].ok, "stop finalizes");
         assert_eq!(
-            app.world()
-                .resource::<MacroRegistry>()
-                .resolve(0, "x", None)
-                .map(|macro_| macro_.step_count()),
+            resolve_session(&mut app, "x").map(|macro_| macro_.step_count()),
             Some(1),
         );
 
@@ -1875,10 +2018,15 @@ mod tests {
         );
         // The playback drained its single step, so the slot is released.
         assert!(
-            app.world()
-                .resource::<MacroRegistry>()
-                .execution_view(0)
-                .is_none(),
+            {
+                let world = app.world_mut();
+                let mut seats = world.query::<&TerminalMacros>();
+                seats
+                    .single(world)
+                    .expect("one seat")
+                    .execution_view()
+                    .is_none()
+            },
             "a finished playback clears the slot"
         );
     }
@@ -1921,11 +2069,7 @@ mod tests {
         // An ordinary recordable command between them still captures.
         send(&mut app, None, spawn(0x8000_0001));
         send(&mut app, None, RattyAiCommand::MacroStop);
-        let macro_ = app
-            .world()
-            .resource::<MacroRegistry>()
-            .resolve(0, "m", None)
-            .expect("stored");
+        let macro_ = resolve_session(&mut app, "m").expect("stored");
         assert_eq!(
             macro_.step_count(),
             1,

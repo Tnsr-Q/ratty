@@ -114,6 +114,31 @@ pub struct AiObjectRegistry {
     used: HashSet<u32>,
 }
 
+impl AiObjectRegistry {
+    /// Despawn sweep (#56 decision 17 / the #56 rider: "recycling is safe
+    /// only while the object-id ledger dies with its terminal"): frees a
+    /// dead terminal's id space. Ids embed the namespace, so without this
+    /// the recycled slot's next tenant would inherit the corpse's
+    /// exhausted ledger — never-reuse is a per-terminal-lifetime
+    /// guarantee, not a per-slot one.
+    pub(crate) fn sweep_namespace(&mut self, namespace: u8) {
+        self.used
+            .retain(|id| crate::osc::ai_object_namespace(*id) != Some(namespace));
+    }
+
+    /// Test-only: reserves an id, for the cross-module despawn-sweep test.
+    #[cfg(test)]
+    pub(crate) fn test_reserve(&mut self, id: u32) {
+        self.used.insert(id);
+    }
+
+    /// Test-only: whether an id is reserved.
+    #[cfg(test)]
+    pub(crate) fn test_is_used(&self, id: u32) -> bool {
+        self.used.contains(&id)
+    }
+}
+
 /// Registers the AI command message and its handler systems.
 pub struct RattyAiPlugin;
 
@@ -131,7 +156,6 @@ impl Plugin for RattyAiPlugin {
             .add_message::<crate::query_channel::AckOutcome>()
             .init_resource::<AiObjectRegistry>()
             .init_resource::<crate::query_channel::QuerySession>()
-            .init_resource::<crate::query_channel::AiDiagnostics>()
             .add_systems(
                 Update,
                 apply_ai_commands
@@ -185,7 +209,7 @@ pub fn apply_ai_commands(
     mut stage_tween: ResMut<StageTween>,
     mut redraw: Query<&mut TerminalRedrawState>,
     mut acks: MessageWriter<crate::query_channel::AckOutcome>,
-    mut diagnostics: ResMut<crate::query_channel::AiDiagnostics>,
+    mut diagnostics: crate::query_channel::DiagnosticsSink,
 ) {
     use crate::query::codes;
     use crate::query_channel::{ack_commit, reject};
@@ -362,7 +386,7 @@ pub fn apply_ai_object_commands(
     app_config: Res<AppConfig>,
     mut redraw: Query<&mut TerminalRedrawState>,
     mut acks: MessageWriter<crate::query_channel::AckOutcome>,
-    mut diagnostics: ResMut<crate::query_channel::AiDiagnostics>,
+    mut diagnostics: crate::query_channel::DiagnosticsSink,
 ) {
     use crate::query::codes;
     use crate::query_channel::ack_commit;
@@ -735,10 +759,11 @@ mod tests {
         app.world_mut().spawn((
             TerminalInlineObjects::default(),
             crate::terminal::TerminalRedrawState::default(),
+            crate::identity::TerminalIdentity::test_boot(),
+            crate::identity::terminal_session_state(),
         ));
         app.init_resource::<AiObjectRegistry>();
         app.init_resource::<CursorSettings>();
-        app.init_resource::<crate::query_channel::AiDiagnostics>();
         app.init_resource::<crate::viz::VizRegistry>();
         app.init_resource::<RemovedLog>();
         app.add_message::<AiCommand>();
@@ -752,7 +777,7 @@ mod tests {
         app.world_mut()
             .resource_mut::<Messages<AiCommand>>()
             .write(AiCommand {
-                source: IngressSource::Local,
+                source: IngressSource::test_boot(),
                 ack_token: None,
                 origin: CommandOrigin::Wire,
                 command,

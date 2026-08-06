@@ -19,10 +19,13 @@ use bevy::window::PrimaryWindow;
 use bevy::camera::visibility::NoFrustumCulling;
 
 use crate::config::AppConfig;
-use crate::direct_render::{new_terminal_image, new_terminal_render_image};
+use crate::direct_render::{
+    DirectTerminalSceneExchange, new_terminal_image, new_terminal_render_image,
+};
+use crate::identity::{TerminalIdentity, TerminalRegistry};
 use crate::inline::TerminalInlineObjects;
 use crate::present::{TerminalPresentMaterial, fullscreen_quad};
-use crate::runtime::TerminalRuntime;
+use crate::runtime::{IngressSource, TerminalRuntime};
 use crate::systems::TerminalFrameDirty;
 use crate::terminal::{
     TerminalLayout, TerminalRedrawState, TerminalSurface, render_scale_for_window,
@@ -267,53 +270,95 @@ pub(crate) struct PresentationParams<'w, 's> {
     camera_3d: Query<'w, 's, &'static mut Camera, (With<TerminalPlaneCamera>, Without<Camera2d>)>,
 }
 
+/// The seat entity owning a per-terminal scene entity (the front and
+/// back planes). Pure data at M4.3: its only consumer is the despawn
+/// sweep; M4.4's organ routing joins on it. Deliberately NOT `ChildOf`
+/// parenting — the seat has no `Transform`, and
+/// [`apply_terminal_presentation`] writes plane transforms in world
+/// space, which parenting would silently make local-space.
+#[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TerminalOwner(pub Entity);
+
+/// Everything [`dress_terminal_seat`] needs, bundled so any system (the
+/// Startup constructor today, M4.5's wire loop tomorrow) can embed it.
+/// Systems register at `Plugin::build`, so per-terminal construction is a
+/// FUNCTION over this bundle, never N system instances (#58 rider).
 #[derive(SystemParam)]
-pub(crate) struct SetupSceneParams<'w, 's> {
-    commands: Commands<'w, 's>,
+pub struct TerminalSpawnParams<'w, 's> {
+    pub(crate) commands: Commands<'w, 's>,
+    terminals: ResMut<'w, TerminalRegistry>,
     app_config: Res<'w, AppConfig>,
-    meshes: ResMut<'w, Assets<Mesh>>,
+    pub(crate) meshes: ResMut<'w, Assets<Mesh>>,
     materials: ResMut<'w, Assets<StandardMaterial>>,
     images: ResMut<'w, Assets<Image>>,
-    present_materials: ResMut<'w, Assets<TerminalPresentMaterial>>,
     primary_window: Query<'w, 's, &'static Window, With<PrimaryWindow>>,
-    runtime: Query<'w, 's, &'static mut TerminalRuntime>,
-    terminal: Query<'w, 's, (Entity, &'static mut TerminalSurface)>,
 }
 
-/// Sets up the terminal presentation scene.
-///
-/// This startup system creates the 2D and 3D cameras, terminal sprite, terminal plane meshes,
-/// backing images, lighting and presentation resources used by later update systems.
+#[derive(SystemParam)]
+pub(crate) struct SetupSceneParams<'w, 's> {
+    spawn: TerminalSpawnParams<'w, 's>,
+    present_materials: ResMut<'w, Assets<TerminalPresentMaterial>>,
+    runtime: Query<'w, 's, &'static mut TerminalRuntime>,
+    terminal: Query<
+        'w,
+        's,
+        (
+            Entity,
+            &'static TerminalIdentity,
+            &'static mut TerminalSurface,
+        ),
+    >,
+}
+
+/// Sets up the terminal presentation scene: the scene-global stage once,
+/// then the boot terminal seat through the same [`dress_terminal_seat`]
+/// every spawned terminal goes through.
 pub(crate) fn setup_scene(mut params: SetupSceneParams) {
     let SetupSceneParams {
-        commands,
-        app_config,
-        meshes,
-        materials,
-        images,
+        spawn,
         present_materials,
-        primary_window,
         runtime,
         terminal,
     } = &mut params;
     // Fatal, like the primary-window expect below: setup_scene is a
     // constructor, and a world without exactly one terminal seat (spawned by
-    // main()/start() with the surface and runtime aboard) is a broken world.
-    let (host, mut terminal) = terminal.single_mut().expect("exactly one terminal seat");
+    // main()/start() with the surface, runtime and identity aboard) is a
+    // broken world.
+    let (host, identity, mut terminal) = terminal.single_mut().expect("exactly one terminal seat");
+    let identity = *identity;
     let mut runtime = runtime.single_mut().expect("exactly one terminal seat");
-    let terminal_opacity = app_config.window.opacity.clamp(0.0, 1.0);
-    let window = primary_window.single().expect("primary window");
-    let window_size = window.resolution.size().max(Vec2::ONE);
-    let render_scale = render_scale_for_window(window);
-    let layout = terminal.resize_to_fit(window_size, render_scale);
-    let pty_pixels = layout.pty_pixels();
-    runtime.resize(
-        layout.cols,
-        layout.rows,
-        pty_pixels.x as u16,
-        pty_pixels.y as u16,
-    );
 
+    setup_scene_stage(&mut spawn.commands);
+    let present_handle = dress_terminal_seat(spawn, host, identity, &mut terminal, &mut runtime);
+
+    // Present the terminal texture 1:1 with physical pixels via a fullscreen quad
+    // whose shader fetches each texel by pixel coordinate (no resampling), rather
+    // than a world-positioned sprite whose interpolated UVs resample it. The
+    // `TerminalSprite` marker is kept so the flat/3D visibility toggle applies.
+    //
+    // Exactly one quad exists (decision 12's focused-1:1 scene view), so it
+    // spawns in neither split half — bound explicitly to the BOOT seat's
+    // present texture by the handle dress returned, never "first seat a
+    // query finds". Focused rebinding is M4.4's work
+    // (`sync_terminal_materials` already rebinds the handle every dirty
+    // frame).
+    let quad = spawn.meshes.add(fullscreen_quad());
+    spawn.commands.spawn((
+        TerminalSprite,
+        Mesh2d(quad),
+        MeshMaterial2d(present_materials.add(TerminalPresentMaterial {
+            texture: present_handle,
+        })),
+        Transform::default(),
+        Visibility::Visible,
+        NoFrustumCulling,
+    ));
+}
+
+/// The scene-global half of the old `setup_scene` (#56 decision 12's
+/// screen side): the two cameras, the lights and the scene-view
+/// resources. Runs exactly once; nothing in it references any terminal.
+fn setup_scene_stage(commands: &mut Commands) {
     commands.spawn((
         Camera2d,
         Camera {
@@ -337,107 +382,6 @@ pub(crate) fn setup_scene(mut params: SetupSceneParams) {
         }),
         Transform::from_xyz(0.0, 0.0, 800.0).looking_at(Vec3::ZERO, Vec3::Y),
         Msaa::Off,
-    ));
-
-    let terminal_alpha = (terminal_opacity * 255.0).round() as u8;
-    let render_image_handle = images.add(new_terminal_render_image(
-        layout.texture_size.x,
-        layout.texture_size.y,
-        crate::config::TERMINAL_RENDER_TEXTURE_LABEL,
-    ));
-    terminal.render_image_handle = Some(render_image_handle);
-
-    let image_handle = images.add(new_terminal_image(
-        layout.texture_size.x,
-        layout.texture_size.y,
-        crate::config::TERMINAL_TEXTURE_LABEL,
-    ));
-    terminal.image_handle = Some(image_handle.clone());
-
-    let [r, g, b] = app_config.theme.background;
-    let back_image = create_terminal_image(
-        layout.texture_size.x,
-        layout.texture_size.y,
-        [
-            r.saturating_sub(13),
-            g.saturating_sub(11),
-            b.saturating_sub(3),
-            terminal_alpha,
-        ],
-    );
-    let back_image_handle = images.add(back_image);
-    terminal.back_image_handle = Some(back_image_handle.clone());
-
-    let viewport_center = Vec2::ZERO;
-
-    // Present the terminal texture 1:1 with physical pixels via a fullscreen quad
-    // whose shader fetches each texel by pixel coordinate (no resampling), rather
-    // than a world-positioned sprite whose interpolated UVs resample it. The
-    // `TerminalSprite` marker is kept so the flat/3D visibility toggle applies.
-    commands.spawn((
-        TerminalSprite,
-        Mesh2d(meshes.add(fullscreen_quad())),
-        MeshMaterial2d(present_materials.add(TerminalPresentMaterial {
-            texture: image_handle,
-        })),
-        Transform::default(),
-        Visibility::Visible,
-        NoFrustumCulling,
-    ));
-
-    let front_mesh = meshes.add(terminal_plane_mesh(32, 20));
-    let back_mesh = meshes.add(terminal_plane_mesh(32, 20));
-    // The terminal seat: main()/start() spawn the one entity with the
-    // externally-constructed surface aboard, and this constructor dresses
-    // THAT entity with the world-derived per-terminal components. Exactly
-    // one seat ever exists; the seat-count tests assert that explicitly
-    // (#54: nothing strips a second seat once the types stop being
-    // Resources).
-    commands.entity(host).insert((
-        TerminalPlaneMeshes {
-            front: front_mesh.clone(),
-            back: back_mesh.clone(),
-        },
-        TerminalFrameDirty::default(),
-        TerminalRedrawState::default(),
-        TerminalViewport {
-            size: layout.logical_size,
-            center: viewport_center,
-        },
-        TerminalPlaneWarp::default(),
-        TerminalInlineObjects::default(),
-    ));
-
-    commands.spawn((
-        TerminalPlane,
-        Mesh3d(front_mesh),
-        MeshMaterial3d(materials.add(StandardMaterial {
-            base_color: Color::srgba(1.0, 1.0, 1.0, terminal_opacity),
-            base_color_texture: terminal.image_handle.clone(),
-            alpha_mode: AlphaMode::Blend,
-            unlit: true,
-            ..default()
-        })),
-        Transform::from_scale(layout.logical_size.extend(1.0)),
-        Visibility::Hidden,
-    ));
-
-    commands.spawn((
-        TerminalPlaneBack,
-        Mesh3d(back_mesh),
-        MeshMaterial3d(materials.add(StandardMaterial {
-            base_color: Color::srgba(1.0, 1.0, 1.0, terminal_opacity),
-            base_color_texture: terminal.back_image_handle.clone(),
-            alpha_mode: AlphaMode::Blend,
-            unlit: true,
-            ..default()
-        })),
-        Transform {
-            translation: Vec3::new(0.0, 0.0, -2.0),
-            rotation: Quat::from_rotation_y(std::f32::consts::PI),
-            scale: layout.logical_size.extend(1.0),
-        },
-        Visibility::Hidden,
     ));
 
     commands.spawn((
@@ -466,6 +410,7 @@ pub(crate) fn setup_scene(mut params: SetupSceneParams) {
         },
         Transform::from_xyz(-280.0, -120.0, 700.0),
     ));
+
     commands.insert_resource(TerminalPresentation {
         mode: TerminalPresentationMode::Flat2d,
     });
@@ -475,6 +420,296 @@ pub(crate) fn setup_scene(mut params: SetupSceneParams) {
         loaded: false,
         first_frame_uploaded: false,
     });
+}
+
+/// The per-terminal half of the old `setup_scene`, callable N times: binds
+/// the seat in the registry, sizes the surface and transport to the
+/// window, creates the seat's render/present/back textures, inserts the
+/// world-derived per-terminal components, and spawns the seat's front and
+/// back plane entities stamped with [`TerminalOwner`].
+///
+/// Returns the seat's present-texture handle so callers bind scene-view
+/// materials (the 2D present quad at boot) explicitly by handle, never by
+/// "first seat the query yields" — query iteration order is unstable the
+/// moment an N=2 world exists.
+pub(crate) fn dress_terminal_seat(
+    params: &mut TerminalSpawnParams,
+    seat: Entity,
+    identity: TerminalIdentity,
+    surface: &mut TerminalSurface,
+    runtime: &mut TerminalRuntime,
+) -> Handle<Image> {
+    let TerminalSpawnParams {
+        commands,
+        terminals,
+        app_config,
+        meshes,
+        materials,
+        images,
+        primary_window,
+    } = params;
+    terminals
+        .bind(identity.id(), seat)
+        .expect("the dressed seat's identity was minted by this registry");
+
+    let terminal_opacity = app_config.window.opacity.clamp(0.0, 1.0);
+    let window = primary_window.single().expect("primary window");
+    let window_size = window.resolution.size().max(Vec2::ONE);
+    let render_scale = render_scale_for_window(window);
+    let layout = surface.resize_to_fit(window_size, render_scale);
+    let pty_pixels = layout.pty_pixels();
+    runtime.resize(
+        layout.cols,
+        layout.rows,
+        pty_pixels.x as u16,
+        pty_pixels.y as u16,
+    );
+
+    let terminal_alpha = (terminal_opacity * 255.0).round() as u8;
+    let render_image_handle = images.add(new_terminal_render_image(
+        layout.texture_size.x,
+        layout.texture_size.y,
+        crate::config::TERMINAL_RENDER_TEXTURE_LABEL,
+    ));
+    surface.render_image_handle = Some(render_image_handle);
+
+    let image_handle = images.add(new_terminal_image(
+        layout.texture_size.x,
+        layout.texture_size.y,
+        crate::config::TERMINAL_TEXTURE_LABEL,
+    ));
+    surface.image_handle = Some(image_handle.clone());
+
+    let [r, g, b] = app_config.theme.background;
+    let back_image = create_terminal_image(
+        layout.texture_size.x,
+        layout.texture_size.y,
+        [
+            r.saturating_sub(13),
+            g.saturating_sub(11),
+            b.saturating_sub(3),
+            terminal_alpha,
+        ],
+    );
+    let back_image_handle = images.add(back_image);
+    surface.back_image_handle = Some(back_image_handle.clone());
+
+    let viewport_center = Vec2::ZERO;
+
+    let front_mesh = meshes.add(terminal_plane_mesh(32, 20));
+    let back_mesh = meshes.add(terminal_plane_mesh(32, 20));
+    // The terminal seat: the caller spawns the entity with the
+    // externally-constructed surface, runtime and identity aboard, and
+    // this dresses THAT entity with the world-derived per-terminal
+    // components. The seat-count tests assert the count explicitly (#54:
+    // nothing strips a second seat once the types stop being Resources).
+    commands.entity(seat).insert((
+        TerminalPlaneMeshes {
+            front: front_mesh.clone(),
+            back: back_mesh.clone(),
+        },
+        TerminalFrameDirty::default(),
+        TerminalRedrawState::default(),
+        TerminalViewport {
+            size: layout.logical_size,
+            center: viewport_center,
+        },
+        TerminalPlaneWarp::default(),
+        TerminalInlineObjects::default(),
+        // A FRESH mailbox per seat, born with the dress — never a clone
+        // of another seat's exchange (an Arc clone shares the one slot:
+        // #54's false PASS, asserted against by the seat tests).
+        DirectTerminalSceneExchange::default(),
+    ));
+
+    commands.spawn((
+        TerminalPlane,
+        TerminalOwner(seat),
+        Mesh3d(front_mesh),
+        MeshMaterial3d(materials.add(StandardMaterial {
+            base_color: Color::srgba(1.0, 1.0, 1.0, terminal_opacity),
+            base_color_texture: surface.image_handle.clone(),
+            alpha_mode: AlphaMode::Blend,
+            unlit: true,
+            ..default()
+        })),
+        Transform::from_scale(layout.logical_size.extend(1.0)),
+        Visibility::Hidden,
+    ));
+
+    commands.spawn((
+        TerminalPlaneBack,
+        TerminalOwner(seat),
+        Mesh3d(back_mesh),
+        MeshMaterial3d(materials.add(StandardMaterial {
+            base_color: Color::srgba(1.0, 1.0, 1.0, terminal_opacity),
+            base_color_texture: surface.back_image_handle.clone(),
+            alpha_mode: AlphaMode::Blend,
+            unlit: true,
+            ..default()
+        })),
+        Transform {
+            translation: Vec3::new(0.0, 0.0, -2.0),
+            rotation: Quat::from_rotation_y(std::f32::consts::PI),
+            scale: layout.logical_size.extend(1.0),
+        },
+        Visibility::Hidden,
+    ));
+
+    image_handle
+}
+
+/// Failure modes of [`spawn_terminal`].
+#[derive(Debug)]
+pub enum SpawnTerminalError<E> {
+    /// The 128-slot namespace pool is exhausted — reported explicitly,
+    /// never masked by minting past the wire's `& 0x7F` width.
+    Alloc(crate::identity::TerminalAllocError),
+    /// Transport construction failed. The allocated lease was released
+    /// before this was returned, so a failed spawn can never leak a
+    /// namespace slot.
+    Build(E),
+}
+
+/// Spawns and dresses a fresh terminal seat: allocates its identity,
+/// builds its transport through `build`, spawns the seat with the
+/// identity aboard, and runs the same [`dress_terminal_seat`] the boot
+/// seat goes through. Returns the seat and its minted identity.
+///
+/// `build` receives ONLY the ingress stamp — #12's no-runtime-arguments
+/// is structural: `RuntimeOptions` never enters this signature, and the
+/// wire path uses config defaults. On build failure the lease is
+/// released before the error propagates, so a leaked namespace on
+/// transport failure is impossible by construction.
+///
+/// This is the dynamic entry (M4.5's wire loop, and the N=2 tests). It
+/// is a function, not a system: systems register at `Plugin::build`, so
+/// dynamic multiplicity must live in data reached from one system
+/// (#58 rider).
+///
+/// # Errors
+///
+/// [`SpawnTerminalError::Alloc`] on pool exhaustion;
+/// [`SpawnTerminalError::Build`] when `build` fails (lease restored).
+pub fn spawn_terminal<E>(
+    params: &mut TerminalSpawnParams,
+    build: impl FnOnce(IngressSource) -> Result<(TerminalSurface, TerminalRuntime), E>,
+) -> Result<(Entity, TerminalIdentity), SpawnTerminalError<E>> {
+    let identity = params
+        .terminals
+        .allocate()
+        .map_err(SpawnTerminalError::Alloc)?;
+    let (mut surface, mut runtime) = match build(identity.ingress()) {
+        Ok(parts) => parts,
+        Err(error) => {
+            params
+                .terminals
+                .release(identity.id())
+                .expect("the just-allocated lease is live");
+            return Err(SpawnTerminalError::Build(error));
+        }
+    };
+    // The seat is born carrying its identity and Default-fresh
+    // session-half state, then dressed in the same command batch — the
+    // publisher can never observe a seat without its mailbox (commands
+    // apply atomically), and a recycled namespace slot's next tenant can
+    // never inherit a prior tenant's session state.
+    let seat = params
+        .commands
+        .spawn((identity, crate::identity::terminal_session_state()))
+        .id();
+    dress_terminal_seat(params, seat, identity, &mut surface, &mut runtime);
+    params.commands.entity(seat).insert((surface, runtime));
+    Ok((seat, identity))
+}
+
+/// THE despawn sweep (#56 decision 17's corollary as one reviewable
+/// site): every scene-global structure keyed by a terminal is swept here
+/// when that terminal dies, and any future terminal-keyed scene-global
+/// state joins this body.
+///
+/// An observer on [`TerminalIdentity`] removal rather than a
+/// `despawn_terminal()` function because it fires on EVERY despawn path —
+/// the future `term.close`, a test world's `despawn()`, panic-path
+/// cleanup — it cannot be forgotten. The session halves on the seat
+/// entity need no line here: despawn destroys them with the entity.
+///
+/// The namespace returns to the pool as the LAST act. This is the only
+/// release site for a lease that ever got keyed or bound to anything
+/// ([`spawn_terminal`]'s build-failure rollback also releases, but that
+/// lease never touched a seat or a registry); a second sweeping observer
+/// would silently break the pairing. Free-is-last means a namespace is
+/// allocatable again only after this observer has swept everything keyed
+/// by it — the registry release is synchronous here, while the owned
+/// plane/object despawns above are deferred `Commands`, but observer
+/// commands drain in the same flush and target captured `Entity` ids, so
+/// no new tenant can observe or collide with the corpse entities.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn sweep_despawned_terminal(
+    remove: On<bevy::ecs::lifecycle::Remove, TerminalIdentity>,
+    identities: Query<&TerminalIdentity>,
+    owned: Query<(Entity, &TerminalOwner)>,
+    rgp_objects: Query<(Entity, &crate::inline::TerminalRgpObject)>,
+    mut commands: Commands,
+    mut terminals: ResMut<TerminalRegistry>,
+    mut macros: ResMut<crate::macros::MacroRegistry>,
+    mut presence: ResMut<crate::presence::PresenceRegistry>,
+    mut viz: ResMut<crate::viz::VizRegistry>,
+    mut avatar: ResMut<crate::avatar::AvatarState>,
+    mut sound: ResMut<crate::sound::SoundState>,
+    mut bookmarks: ResMut<crate::bookmarks::BookmarkRegistry>,
+    mut pending_jumps: ResMut<crate::bookmarks::PendingBookmarkJumps>,
+    mut object_ids: ResMut<crate::ai::AiObjectRegistry>,
+) {
+    let seat = remove.entity;
+    // During OnRemove the dying entity's components are still readable.
+    let Ok(identity) = identities.get(seat) else {
+        error!(
+            "sweep_despawned_terminal: seat {seat} lost its identity before the sweep could \
+             read it; its namespace lease and scene-global state leak"
+        );
+        return;
+    };
+    let (id, namespace) = (identity.id(), identity.namespace());
+
+    // The scene lock: liveness — a holder dying mid-privileged-playback
+    // must not wedge the scene (safety is the TerminalId re-key itself).
+    macros.sweep_terminal(id);
+    // A jump relowered between the applier and the drain must not fire
+    // as a dead terminal's scene mutation next frame.
+    pending_jumps.sweep_terminal(id);
+    // The namespace-keyed globals that lawfully remain (wire-facing
+    // address axes): rendered-is-public presence rows, viz entries whose
+    // ids embed the namespace, the avatar speech queue and its active
+    // utterance, the sound rate bucket, saved bookmarks, and the
+    // object-id ledger.
+    presence.sweep_namespace(namespace);
+    viz.sweep_namespace(namespace);
+    avatar.speech.sweep_namespace(namespace);
+    sound.sweep_namespace(namespace);
+    bookmarks.sweep_namespace(namespace);
+    object_ids.sweep_namespace(namespace);
+    // The seat's scene entities: the owned planes, and the inline render
+    // entities whose diff-sync ([`crate::systems::sync_inline_objects`])
+    // can never observe the removal because the component it diffs dies
+    // with the seat. Live AI ids partition by namespace across live
+    // terminals, so the namespace match is exact.
+    for (entity, owner) in owned.iter() {
+        if owner.0 == seat {
+            commands.entity(entity).despawn();
+        }
+    }
+    for (entity, object) in rgp_objects.iter() {
+        if crate::osc::ai_object_namespace(object.object_id) == Some(namespace) {
+            commands.entity(entity).despawn();
+        }
+    }
+
+    // LAST: return the lease. Double-free would be a broken invariant —
+    // loud, never swallowed.
+    if let Err(error) = terminals.release(id) {
+        error!("sweep_despawned_terminal: releasing {id:?} failed: {error}");
+    }
 }
 
 /// Synchronizes Bevy presentation entities to the terminal texture layout.
@@ -708,17 +943,23 @@ mod tests {
         world.init_resource::<Assets<StandardMaterial>>();
         world.init_resource::<Assets<Image>>();
         world.init_resource::<Assets<TerminalPresentMaterial>>();
-        let (runtime, _host) = TerminalRuntime::virtual_channel(&AppConfig::default());
-        // Mirror main()/start(): the seat is born pre-run with the surface
-        // and runtime aboard; setup_scene must dress THIS entity, not spawn
-        // another.
+        // Mirror main()/start(): the boot identity is the registry's FIRST
+        // allocation, and the seat is born pre-run with the surface,
+        // runtime and identity aboard; setup_scene must dress THIS entity,
+        // not spawn another.
+        let mut registry = TerminalRegistry::default();
+        let identity = registry.allocate().expect("a fresh registry has slots");
+        let (runtime, _host) =
+            TerminalRuntime::virtual_channel(&AppConfig::default(), identity.ingress());
         let seat = world
             .spawn((
                 TerminalSurface::new(&AppConfig::default())
                     .expect("surface construction is CPU-only"),
                 runtime,
+                identity,
             ))
             .id();
+        world.insert_resource(registry);
         world.spawn((Window::default(), bevy::window::PrimaryWindow));
 
         world
@@ -775,6 +1016,57 @@ mod tests {
             "exactly one seat carries the redraw flag"
         );
         assert_eq!(
+            world.query::<&TerminalIdentity>().iter(&world).count(),
+            1,
+            "exactly one seat carries the identity"
+        );
+        assert_eq!(
+            world
+                .query::<&DirectTerminalSceneExchange>()
+                .iter(&world)
+                .count(),
+            1,
+            "exactly one seat carries its frame exchange (the mailbox is \
+             born with the dress)"
+        );
+        let identity = *world
+            .query::<&TerminalIdentity>()
+            .single(&world)
+            .expect("exactly one identity");
+        assert_eq!(
+            identity.id(),
+            crate::identity::TerminalId::from_raw(1),
+            "the boot terminal is the registry's FIRST allocation — any \
+             earlier pre-world allocation shifts this and changes wire bytes"
+        );
+        assert_eq!(
+            identity.namespace(),
+            0,
+            "boot leases namespace 0, keeping every wire byte identical to \
+             the single-terminal era"
+        );
+        assert_eq!(
+            world
+                .resource::<TerminalRegistry>()
+                .entity_of(identity.id()),
+            Some(seat),
+            "dress binds the boot identity to the seat entity"
+        );
+        let owners: Vec<_> = world
+            .query::<&TerminalOwner>()
+            .iter(&world)
+            .copied()
+            .collect();
+        assert_eq!(
+            owners.len(),
+            2,
+            "exactly the seat's front and back planes carry TerminalOwner"
+        );
+        assert!(
+            owners.iter().all(|owner| owner.0 == seat),
+            "both planes are owned by the one boot seat"
+        );
+        assert_eq!(
             world
                 .query::<(
                     &TerminalSurface,
@@ -785,12 +1077,583 @@ mod tests {
                     &TerminalInlineObjects,
                     &TerminalRuntime,
                     &TerminalRedrawState,
+                    &TerminalIdentity,
+                    &DirectTerminalSceneExchange,
                 )>()
                 .iter(&world)
                 .count(),
             1,
             "the swapped components co-locate on the one seat"
         );
+    }
+
+    /// Scaffold world for the spawner-path tests. Deliberately NOT
+    /// `TerminalPlugin`: the M4.1-era `.single()` systems
+    /// (`pump_pty_output`, `sync_terminal_materials`) stay single-seat
+    /// until M4.4's loop conversion and would latch "exactly one terminal
+    /// seat" warns in an N=2 world.
+    fn spawner_world() -> World {
+        let mut world = World::new();
+        world.insert_resource(AppConfig::default());
+        world.init_resource::<Assets<Mesh>>();
+        world.init_resource::<Assets<StandardMaterial>>();
+        world.init_resource::<Assets<Image>>();
+        world.insert_resource(TerminalRegistry::default());
+        world.spawn((Window::default(), bevy::window::PrimaryWindow));
+        world
+    }
+
+    /// One real spawner call over the virtual transport, as a system so
+    /// the `TerminalSpawnParams` bundle is exercised exactly as M4.5's
+    /// wire loop will exercise it.
+    fn spawn_virtual_terminal(mut params: TerminalSpawnParams) -> (Entity, TerminalIdentity) {
+        spawn_terminal(&mut params, |source| {
+            let (runtime, _host) = TerminalRuntime::virtual_channel(&AppConfig::default(), source);
+            Ok::<_, std::convert::Infallible>((
+                TerminalSurface::new(&AppConfig::default())
+                    .expect("surface construction is CPU-only"),
+                runtime,
+            ))
+        })
+        .expect("the scaffold spawn succeeds")
+    }
+
+    /// The M4.3 exit-criteria test: two DirectTerminalSceneExchange
+    /// instances coexist — two seats through the REAL spawner, seat count
+    /// asserted explicitly (#58 rider), distinct slots (the Arc::ptr_eq
+    /// assertion alone kills the clone-shaped false PASS — do not drop it
+    /// as redundant), per-seat publish/take with no cross-talk, and each
+    /// parser stamping its own identity.
+    #[test]
+    fn two_seats_two_exchanges_no_cross_talk() {
+        use bevy::ecs::system::RunSystemOnce;
+
+        let mut world = spawner_world();
+        let (seat_a, id_a) = world
+            .run_system_once(spawn_virtual_terminal)
+            .expect("spawner system runs");
+        let (seat_b, id_b) = world
+            .run_system_once(spawn_virtual_terminal)
+            .expect("spawner system runs");
+
+        // (1) Two seats, count asserted explicitly — never assumed.
+        assert_eq!(
+            world
+                .query::<(
+                    &TerminalIdentity,
+                    &TerminalSurface,
+                    &DirectTerminalSceneExchange
+                )>()
+                .iter(&world)
+                .count(),
+            2,
+            "exactly two dressed seats coexist"
+        );
+
+        // (2) Identities: monotonic ids, never reused; lowest-free slots.
+        assert_ne!(id_a.id(), id_b.id(), "TerminalIds never repeat");
+        assert_eq!(
+            (id_a.id(), id_a.namespace(), id_b.id(), id_b.namespace()),
+            (
+                crate::identity::TerminalId::from_raw(1),
+                0,
+                crate::identity::TerminalId::from_raw(2),
+                1
+            ),
+            "the two allocations are (1, ns 0) and (2, ns 1)"
+        );
+
+        // (3) Two mailboxes, two slots: the clone-shaped false PASS —
+        // inserting a cloned exchange compiles and passes every count
+        // test while sharing ONE inner slot (#54) — dies here.
+        let exchange_a = world
+            .entity(seat_a)
+            .get::<DirectTerminalSceneExchange>()
+            .expect("seat A carries its mailbox")
+            .clone();
+        let exchange_b = world
+            .entity(seat_b)
+            .get::<DirectTerminalSceneExchange>()
+            .expect("seat B carries its mailbox")
+            .clone();
+        assert!(
+            !DirectTerminalSceneExchange::same_slot(&exchange_a, &exchange_b),
+            "each seat's exchange is a fresh slot, never a clone of another's"
+        );
+
+        // (4) Publish distinguishable frames; each take yields its OWN.
+        exchange_a.publish_test_frame(101);
+        exchange_b.publish_test_frame(202);
+        assert_eq!(
+            exchange_a.take_pending_width(),
+            Some(101),
+            "A's mailbox yields A's frame"
+        );
+        assert_eq!(
+            exchange_b.take_pending_width(),
+            Some(202),
+            "B's mailbox yields B's frame"
+        );
+
+        // (5) Single-slot semantics preserved per terminal.
+        assert_eq!(exchange_a.take_pending_width(), None);
+        assert_eq!(exchange_b.take_pending_width(), None);
+
+        // (6) Each parser stamps its own identity: real OSC 777 bytes in,
+        // stamped commands out.
+        for (seat, identity) in [(seat_a, id_a), (seat_b, id_b)] {
+            let mut runtime = world
+                .get_mut::<TerminalRuntime>(seat)
+                .expect("the seat carries its runtime");
+            runtime.parser.process(b"\x1b]777;ratty:mode;3d\x07");
+            let commands = runtime.parser.callbacks_mut().take_ai_commands();
+            assert_eq!(commands.len(), 1, "one command parsed");
+            assert_eq!(
+                commands[0].0,
+                identity.ingress(),
+                "the parser stamps the seat's OWN identity"
+            );
+        }
+
+        // Each seat also owns its pair of plane entities.
+        let owners: Vec<_> = world
+            .query::<&TerminalOwner>()
+            .iter(&world)
+            .copied()
+            .collect();
+        assert_eq!(owners.len(), 4, "two planes per seat, four total");
+        for seat in [seat_a, seat_b] {
+            assert_eq!(
+                owners.iter().filter(|owner| owner.0 == seat).count(),
+                2,
+                "front and back planes are stamped with their seat"
+            );
+        }
+    }
+
+    /// A failed transport build must release the lease (the pool is
+    /// restored) while the consumed TerminalId is skipped forever —
+    /// recycling is namespace-only.
+    #[test]
+    fn a_failed_transport_build_releases_the_namespace_lease() {
+        use bevy::ecs::system::RunSystemOnce;
+
+        let mut world = spawner_world();
+        let result = world
+            .run_system_once(|mut params: TerminalSpawnParams| {
+                spawn_terminal(&mut params, |_source| {
+                    Err::<(TerminalSurface, TerminalRuntime), &str>("transport refused")
+                })
+            })
+            .expect("spawner system runs");
+        assert!(
+            matches!(result, Err(SpawnTerminalError::Build("transport refused"))),
+            "the build error propagates untouched"
+        );
+        assert_eq!(
+            world.query::<&TerminalIdentity>().iter(&world).count(),
+            0,
+            "no seat was born from the failed spawn"
+        );
+
+        let mut registry = world.resource_mut::<TerminalRegistry>();
+        let next = registry.allocate().expect("the released slot is back");
+        assert_eq!(
+            next.namespace(),
+            0,
+            "the failed spawn's namespace lease came back to the pool"
+        );
+        assert_eq!(
+            next.id(),
+            crate::identity::TerminalId::from_raw(2),
+            "the TerminalId consumed by the failed spawn is skipped, never reissued"
+        );
+    }
+
+    /// THE despawn-sweep test (#56 decision 17, an M4.3 exit criterion):
+    /// seed every scene-global structure with the dying terminal's state,
+    /// despawn it through the plain entity path (the observer must fire on
+    /// EVERY despawn path, not a bespoke close function), and assert
+    /// nothing keyed by it survives — then spawn onto the recycled slot
+    /// and prove the next tenant inherits nothing while its TerminalId is
+    /// NOT reused.
+    #[test]
+    fn despawning_a_terminal_sweeps_scene_globals_and_recycles_the_slot_last() {
+        use bevy::ecs::system::RunSystemOnce;
+
+        let mut world = spawner_world();
+        // The sweep's registries — the scaffold world is deliberately not
+        // TerminalPlugin (see `spawner_world`), so they are added here.
+        world.init_resource::<crate::macros::MacroRegistry>();
+        world.init_resource::<crate::presence::PresenceRegistry>();
+        world.init_resource::<crate::viz::VizRegistry>();
+        world.init_resource::<crate::avatar::AvatarState>();
+        world.init_resource::<crate::sound::SoundState>();
+        world.init_resource::<crate::bookmarks::BookmarkRegistry>();
+        world.init_resource::<crate::bookmarks::PendingBookmarkJumps>();
+        world.init_resource::<crate::ai::AiObjectRegistry>();
+        world.add_observer(sweep_despawned_terminal);
+
+        let (seat_a, id_a) = world
+            .run_system_once(spawn_virtual_terminal)
+            .expect("spawner system runs");
+        let (seat_b, id_b) = world
+            .run_system_once(spawn_virtual_terminal)
+            .expect("spawner system runs");
+        assert_eq!(
+            world.query::<&TerminalIdentity>().iter(&world).count(),
+            2,
+            "exactly two seats before the despawn"
+        );
+        let ns_b = id_b.namespace();
+        // AI object ids embed the namespace in bits 24..31 above the
+        // 0x8000_0000 range bit: 0x8100_xxxx is namespace 1 (B's).
+        const B_OBJECT: u32 = 0x8100_0007;
+        const A_OBJECT: u32 = 0x8000_0001;
+
+        // Seed B-keyed state in EVERY swept structure.
+        world
+            .resource_mut::<crate::macros::MacroRegistry>()
+            .test_hold_scene_lock(id_b.id());
+        world
+            .resource_mut::<crate::presence::PresenceRegistry>()
+            .test_join(ns_b, "agent-b");
+        world.resource_mut::<crate::viz::VizRegistry>().upsert(
+            B_OBJECT,
+            crate::viz_wire::VizPayload::Ps(crate::viz_wire::PsV1 {
+                capture: crate::viz_wire::VizCapture {
+                    source: "test".to_string(),
+                    ts: "0".to_string(),
+                },
+                items: Vec::new(),
+            }),
+            None,
+        );
+        {
+            let mut avatar = world.resource_mut::<crate::avatar::AvatarState>();
+            // First admission takes the voice (active); second queues.
+            avatar.speech.test_admit(ns_b, "utter-active");
+            avatar.speech.test_admit(ns_b, "utter-queued");
+            assert_eq!(avatar.speech.test_active_namespace(), Some(ns_b));
+            assert_eq!(avatar.speech.test_pending_for(ns_b), 1);
+        }
+        world
+            .resource_mut::<crate::sound::SoundState>()
+            .test_seed_bucket(ns_b);
+        world
+            .resource_mut::<crate::bookmarks::BookmarkRegistry>()
+            .test_insert(ns_b, "spot");
+        {
+            // A jump relowered but not yet drained — stamped by TerminalId,
+            // so the sweep keys on identity, never the namespace.
+            let mut pending = world.resource_mut::<crate::bookmarks::PendingBookmarkJumps>();
+            pending.test_push(id_a.ingress());
+            pending.test_push(id_b.ingress());
+        }
+        world
+            .resource_mut::<crate::ai::AiObjectRegistry>()
+            .test_reserve(B_OBJECT);
+        // Inline render entities sync from a component that dies with the
+        // seat, so their diff can never observe the removal — the sweep
+        // must despawn B's and leave A's alone.
+        world.spawn(crate::inline::TerminalRgpObject {
+            object_id: B_OBJECT,
+        });
+        world.spawn(crate::inline::TerminalRgpObject {
+            object_id: A_OBJECT,
+        });
+        let presence_seq_before = world
+            .resource::<crate::presence::PresenceRegistry>()
+            .mutation_seq();
+
+        // The plain despawn path — no bespoke close function to remember.
+        world.despawn(seat_b);
+        world.flush();
+
+        assert_eq!(
+            world.query::<&TerminalIdentity>().iter(&world).count(),
+            1,
+            "exactly one seat survives the despawn"
+        );
+        assert_eq!(
+            world
+                .resource::<crate::macros::MacroRegistry>()
+                .test_scene_lock(),
+            None,
+            "the dying holder's scene lock is released (decision 17's named leak)"
+        );
+        let presence = world.resource::<crate::presence::PresenceRegistry>();
+        assert!(
+            !presence.test_has_namespace_rows(ns_b),
+            "B's presence rows are swept"
+        );
+        assert!(
+            presence.mutation_seq() > presence_seq_before,
+            "the sweep bumps mutation_seq so the marker sync observes it"
+        );
+        let viz = world.resource::<crate::viz::VizRegistry>();
+        assert_eq!(
+            viz.namespace_len(ns_b),
+            0,
+            "B's visualizations are swept — the recycled slot's tenant \
+             must not own the corpse's viz"
+        );
+        let avatar = world.resource::<crate::avatar::AvatarState>();
+        assert_eq!(
+            avatar.speech.test_active_namespace(),
+            None,
+            "B's ACTIVE utterance is stopped, not left to display under a \
+             namespace the next tenant could cancel"
+        );
+        assert_eq!(
+            avatar.speech.test_pending_for(ns_b),
+            0,
+            "B's queued utterances are swept"
+        );
+        assert!(
+            !world
+                .resource::<crate::sound::SoundState>()
+                .test_has_bucket(ns_b),
+            "B's drained play bucket is swept, never inherited"
+        );
+        assert!(
+            world
+                .resource::<crate::bookmarks::BookmarkRegistry>()
+                .get(ns_b, "spot")
+                .is_none(),
+            "B's bookmarks are swept"
+        );
+        assert_eq!(
+            world
+                .resource::<crate::bookmarks::PendingBookmarkJumps>()
+                .test_sources(),
+            vec![id_a.ingress()],
+            "B's relower-pending jump is swept before the drain can fire \
+             it as a dead terminal's scene mutation; A's survives"
+        );
+        assert!(
+            !world
+                .resource::<crate::ai::AiObjectRegistry>()
+                .test_is_used(B_OBJECT),
+            "B's object-id ledger entries are swept (per-terminal-lifetime \
+             never-reuse, per the #56 rider)"
+        );
+        let owners: Vec<_> = world
+            .query::<&TerminalOwner>()
+            .iter(&world)
+            .copied()
+            .collect();
+        assert_eq!(owners.len(), 2, "only A's two planes survive");
+        assert!(
+            owners.iter().all(|owner| owner.0 == seat_a),
+            "the surviving planes are A's"
+        );
+        let rgp: Vec<u32> = world
+            .query::<&crate::inline::TerminalRgpObject>()
+            .iter(&world)
+            .map(|object| object.object_id)
+            .collect();
+        assert_eq!(
+            rgp,
+            vec![A_OBJECT],
+            "B's inline render entity is despawned; A's survives"
+        );
+        {
+            let registry = world.resource::<TerminalRegistry>();
+            assert_eq!(
+                registry.entity_of(id_b.id()),
+                None,
+                "the dead TerminalId resolves None"
+            );
+            assert_eq!(
+                registry.entity_of(id_a.id()),
+                Some(seat_a),
+                "the survivor stays bound"
+            );
+        }
+
+        // Spawn onto the recycled slot: freshness is Default-at-spawn, not
+        // cleanup discipline — and the TerminalId is NOT reused.
+        let (seat_c, id_c) = world
+            .run_system_once(spawn_virtual_terminal)
+            .expect("spawner system runs");
+        assert_eq!(
+            world.query::<&TerminalIdentity>().iter(&world).count(),
+            2,
+            "exactly two seats after the respawn"
+        );
+        assert_eq!(
+            id_c.namespace(),
+            ns_b,
+            "the freed namespace slot recycles (lowest-free-first)"
+        );
+        assert_eq!(
+            id_c.id(),
+            crate::identity::TerminalId::from_raw(3),
+            "the TerminalId keeps climbing — B's id is never reissued"
+        );
+        assert_ne!(id_c.id(), id_b.id());
+        let seat_c_ref = world.entity(seat_c);
+        assert_eq!(
+            seat_c_ref
+                .get::<crate::macros::TerminalMacros>()
+                .expect("C carries its macro component")
+                .session_len(),
+            0,
+            "C's session macros are Default-fresh"
+        );
+        assert_eq!(
+            seat_c_ref
+                .get::<crate::reactive::TerminalReactive>()
+                .expect("C carries its reactive component")
+                .session_len(),
+            0,
+            "C's wire rules are Default-fresh"
+        );
+        // The recycled slot's id space is free again: C may use the very
+        // id B had spawned.
+        assert!(
+            !world
+                .resource::<crate::ai::AiObjectRegistry>()
+                .test_is_used(B_OBJECT),
+            "C's namespace starts with an empty object ledger"
+        );
+    }
+
+    /// The M4.3 exit criterion in executable form — the whole milestone in
+    /// one test world: two terminals through the REAL spawner with the
+    /// seat count asserted explicitly, two live DirectTerminalSceneExchange
+    /// instances (distinct slots, no cross-talk), distinct monotonic
+    /// TerminalIds on distinct namespace leases, session-half components
+    /// born with each seat, scene_lock keyed by TerminalId — then one
+    /// terminal dies: the sweep runs, the namespace recycles to the next
+    /// spawn, and the TerminalId is NOT reused.
+    #[test]
+    fn m4_3_two_terminals_coexist_then_one_dies_clean() {
+        use bevy::ecs::system::RunSystemOnce;
+
+        let mut world = spawner_world();
+        world.init_resource::<crate::macros::MacroRegistry>();
+        world.init_resource::<crate::presence::PresenceRegistry>();
+        world.init_resource::<crate::viz::VizRegistry>();
+        world.init_resource::<crate::avatar::AvatarState>();
+        world.init_resource::<crate::sound::SoundState>();
+        world.init_resource::<crate::bookmarks::BookmarkRegistry>();
+        world.init_resource::<crate::bookmarks::PendingBookmarkJumps>();
+        world.init_resource::<crate::ai::AiObjectRegistry>();
+        world.add_observer(sweep_despawned_terminal);
+
+        // ── Coexistence ──
+        let (seat_a, id_a) = world
+            .run_system_once(spawn_virtual_terminal)
+            .expect("spawner system runs");
+        let (seat_b, id_b) = world
+            .run_system_once(spawn_virtual_terminal)
+            .expect("spawner system runs");
+        assert_eq!(
+            world
+                .query::<(
+                    &TerminalIdentity,
+                    &TerminalSurface,
+                    &TerminalRuntime,
+                    &DirectTerminalSceneExchange,
+                    &crate::macros::TerminalMacros,
+                    &crate::reactive::TerminalReactive,
+                    &crate::query_channel::TerminalDiagnostics,
+                )>()
+                .iter(&world)
+                .count(),
+            2,
+            "exactly two seats, each carrying identity, surface, runtime, \
+             its own exchange, and every session-half component"
+        );
+        assert_eq!(
+            (id_a.id(), id_a.namespace(), id_b.id(), id_b.namespace()),
+            (
+                crate::identity::TerminalId::from_raw(1),
+                0,
+                crate::identity::TerminalId::from_raw(2),
+                1
+            ),
+            "monotonic ids on lowest-free namespace leases"
+        );
+        let exchange_a = world
+            .entity(seat_a)
+            .get::<DirectTerminalSceneExchange>()
+            .expect("A's mailbox")
+            .clone();
+        let exchange_b = world
+            .entity(seat_b)
+            .get::<DirectTerminalSceneExchange>()
+            .expect("B's mailbox")
+            .clone();
+        assert!(
+            !DirectTerminalSceneExchange::same_slot(&exchange_a, &exchange_b),
+            "two exchanges, two slots — never a shared Arc (#54's false PASS)"
+        );
+        exchange_a.publish_test_frame(11);
+        exchange_b.publish_test_frame(22);
+        assert_eq!(exchange_a.take_pending_width(), Some(11));
+        assert_eq!(exchange_b.take_pending_width(), Some(22));
+
+        // ── The stamp rule live: B holds the scene lock by TerminalId ──
+        world
+            .resource_mut::<crate::macros::MacroRegistry>()
+            .test_hold_scene_lock(id_b.id());
+
+        // ── One terminal dies ──
+        world.despawn(seat_b);
+        world.flush();
+        assert_eq!(
+            world.query::<&TerminalIdentity>().iter(&world).count(),
+            1,
+            "exactly one seat survives"
+        );
+        assert_eq!(
+            world
+                .resource::<crate::macros::MacroRegistry>()
+                .test_scene_lock(),
+            None,
+            "the sweep released the dead holder's lock"
+        );
+        assert_eq!(
+            world.resource::<TerminalRegistry>().entity_of(id_b.id()),
+            None,
+            "the dead TerminalId resolves None forever"
+        );
+
+        // ── The recycled slot's next tenant ──
+        let (seat_c, id_c) = world
+            .run_system_once(spawn_virtual_terminal)
+            .expect("spawner system runs");
+        assert_eq!(
+            world
+                .query::<(&TerminalIdentity, &DirectTerminalSceneExchange)>()
+                .iter(&world)
+                .count(),
+            2,
+            "exactly two seats again after the respawn"
+        );
+        assert_eq!(id_c.namespace(), 1, "B's namespace lease recycled to C");
+        assert_eq!(
+            id_c.id(),
+            crate::identity::TerminalId::from_raw(3),
+            "C's TerminalId is fresh — B's is never reissued"
+        );
+        let exchange_c = world
+            .entity(seat_c)
+            .get::<DirectTerminalSceneExchange>()
+            .expect("C's mailbox")
+            .clone();
+        assert!(
+            !DirectTerminalSceneExchange::same_slot(&exchange_a, &exchange_c),
+            "C's exchange is a fresh slot, not an inherited one"
+        );
+        // A was untouched throughout: its mailbox still works and its
+        // single-slot semantics held.
+        exchange_a.publish_test_frame(33);
+        assert_eq!(exchange_a.take_pending_width(), Some(33));
+        assert_eq!(exchange_a.take_pending_width(), None);
     }
 
     fn fixtures() -> (TerminalPresentation, TerminalPlaneView, MobiusTransition) {

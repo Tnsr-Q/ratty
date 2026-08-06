@@ -21,6 +21,7 @@ use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 use vt100::{Callbacks, Parser, Screen};
 
 use crate::config::AppConfig;
+use crate::identity::{TerminalId, TerminalIdentity};
 use crate::osc::{RattyAiCommand, parse_osc_control};
 use crate::query::{QueryEnvelope, Wire778, WireErrorReply, codes, parse_778};
 
@@ -41,12 +42,17 @@ pub struct RuntimeOptions {
 /// effective principal: ratty cannot tell which process wrote individual
 /// bytes. Future transports (relays, bridges) authenticate writers before
 /// ingress and are assigned their own variants here, out-of-band.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+///
+/// The variant payload is the arrival terminal's identity, minted only by
+/// [`crate::identity::TerminalRegistry::allocate`] and stamped into the
+/// parser once at construction — so every persisted stamp carries the
+/// [`TerminalId`] the stamp rule (#56 decision 17) keys on, and derived
+/// equality can never match a recycled namespace's next tenant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IngressSource {
     /// The local session transport: the spawned PTY on native builds, the
     /// virtual byte channel on wasm.
-    #[default]
-    Local,
+    Local(TerminalIdentity),
 }
 
 impl IngressSource {
@@ -54,13 +60,28 @@ impl IngressSource {
     /// id range (see [`crate::osc::ai_object_namespace`]).
     pub fn namespace(self) -> u8 {
         match self {
-            IngressSource::Local => 0,
+            IngressSource::Local(terminal) => terminal.namespace(),
         }
+    }
+
+    /// The arrival terminal's persistent id — what persisted stamps key
+    /// on (#56 decision 17), never the namespace.
+    pub fn terminal(self) -> TerminalId {
+        match self {
+            IngressSource::Local(terminal) => terminal.id(),
+        }
+    }
+
+    /// Test-only boot ingress: the boot terminal's identity
+    /// (`TerminalId` 1, namespace 0), exactly what the first
+    /// [`crate::identity::TerminalRegistry::allocate`] mints.
+    #[cfg(test)]
+    pub(crate) const fn test_boot() -> Self {
+        Self::Local(TerminalIdentity::test_boot())
     }
 }
 
 /// Callback state for unhandled parser sequences.
-#[derive(Default)]
 pub struct TerminalParserCallbacks {
     seen_csi: HashSet<String>,
     seen_escape: HashSet<String>,
@@ -70,13 +91,32 @@ pub struct TerminalParserCallbacks {
     pending_wire_errors: Vec<(IngressSource, WireErrorReply)>,
     kitty_keyboard_flags: u8,
     modify_other_keys: Option<u8>,
-    // The ingress context stamped onto every parsed AI command. Survives
-    // `resize` because the whole callbacks value is moved into the new
-    // parser (`std::mem::take`).
+    // The ingress context stamped onto every parsed AI command. Set once
+    // at construction, immutable for the runtime's life; survives `resize`
+    // because the whole callbacks value moves into the new parser.
     source: IngressSource,
 }
 
 impl TerminalParserCallbacks {
+    /// Creates callback state stamping every parsed command with `source`.
+    ///
+    /// There is no `Default`: an unstamped parser has no honest value —
+    /// every queued command must carry the ingress context of the
+    /// terminal whose transport delivered it.
+    pub fn new(source: IngressSource) -> Self {
+        Self {
+            seen_csi: HashSet::new(),
+            seen_escape: HashSet::new(),
+            pending_replies: Vec::new(),
+            pending_ai: Vec::new(),
+            pending_queries: Vec::new(),
+            pending_wire_errors: Vec::new(),
+            kitty_keyboard_flags: 0,
+            modify_other_keys: None,
+            source,
+        }
+    }
+
     /// Drains any terminal replies queued by parser callbacks.
     pub fn take_replies(&mut self) -> Vec<Vec<u8>> {
         std::mem::take(&mut self.pending_replies)
@@ -427,7 +467,10 @@ impl TerminalRuntime {
     /// `feed_tx` and drains terminal input from `input_rx`. Channels are
     /// unbounded so producing never blocks — a blocking send would hang a
     /// single-threaded (e.g. wasm) embedder permanently.
-    pub fn virtual_channel(config: &AppConfig) -> (Self, VirtualTerminalHost) {
+    pub fn virtual_channel(
+        config: &AppConfig,
+        source: IngressSource,
+    ) -> (Self, VirtualTerminalHost) {
         let cols = config.terminal.default_cols;
         let rows = config.terminal.default_rows;
         let (feed_tx, rx) = mpsc::channel::<Vec<u8>>();
@@ -448,7 +491,7 @@ impl TerminalRuntime {
                 rows,
                 cols,
                 config.terminal.scrollback,
-                TerminalParserCallbacks::default(),
+                TerminalParserCallbacks::new(source),
             ),
             scrollback_len: config.terminal.scrollback,
             pty_disconnected: false,
@@ -463,7 +506,11 @@ impl TerminalRuntime {
     ///
     /// Returns an error if the PTY cannot be created or the shell cannot be spawned.
     #[cfg(not(target_arch = "wasm32"))]
-    pub fn spawn(config: &AppConfig, options: &RuntimeOptions) -> anyhow::Result<Self> {
+    pub fn spawn(
+        config: &AppConfig,
+        options: &RuntimeOptions,
+        source: IngressSource,
+    ) -> anyhow::Result<Self> {
         let cols = config.terminal.default_cols;
         let rows = config.terminal.default_rows;
         let pty_system = native_pty_system();
@@ -549,7 +596,7 @@ impl TerminalRuntime {
                 rows,
                 cols,
                 config.terminal.scrollback,
-                TerminalParserCallbacks::default(),
+                TerminalParserCallbacks::new(source),
             ),
             scrollback_len: config.terminal.scrollback,
             pty_disconnected: false,
@@ -601,7 +648,14 @@ impl TerminalRuntime {
         }
 
         let state = self.parser.screen().state_formatted();
-        let callbacks = std::mem::take(self.parser.callbacks_mut());
+        // The whole callbacks value moves into the new parser so the
+        // ingress stamp survives; the placeholder is stamped with the same
+        // source (there is no honest unstamped value to `take`).
+        let source = self.parser.callbacks().source;
+        let callbacks = std::mem::replace(
+            self.parser.callbacks_mut(),
+            TerminalParserCallbacks::new(source),
+        );
         self.parser = Parser::new_with_callbacks(rows, cols, self.scrollback_len, callbacks);
         self.parser.process(&state);
     }
@@ -665,7 +719,8 @@ mod tests {
     #[test]
     fn virtual_channel_round_trips_output_and_input() {
         let config = AppConfig::default();
-        let (mut runtime, host) = TerminalRuntime::virtual_channel(&config);
+        let (mut runtime, host) =
+            TerminalRuntime::virtual_channel(&config, IngressSource::test_boot());
 
         host.feed_tx
             .send(b"hello".to_vec())
@@ -688,7 +743,8 @@ mod tests {
     #[test]
     fn virtual_channel_feed_never_blocks() {
         let config = AppConfig::default();
-        let (_runtime, host) = TerminalRuntime::virtual_channel(&config);
+        let (_runtime, host) =
+            TerminalRuntime::virtual_channel(&config, IngressSource::test_boot());
         // Far beyond the old sync_channel(16) bound: must not block or fail.
         for _ in 0..1000 {
             host.feed_tx
@@ -700,7 +756,8 @@ mod tests {
     #[test]
     fn virtual_channel_resize_updates_parser() {
         let config = AppConfig::default();
-        let (mut runtime, _host) = TerminalRuntime::virtual_channel(&config);
+        let (mut runtime, _host) =
+            TerminalRuntime::virtual_channel(&config, IngressSource::test_boot());
         runtime.resize(80, 24, 0, 0);
         assert_eq!(runtime.parser.screen().size(), (24, 80));
     }
@@ -710,7 +767,12 @@ mod tests {
         // Drive real OSC 777 bytes through vt100 and confirm the
         // unhandled_osc hook parsed and queued the command. BEL-terminated,
         // exactly what the ratty-ai CLI emits.
-        let mut parser = Parser::new_with_callbacks(24, 80, 0, TerminalParserCallbacks::default());
+        let mut parser = Parser::new_with_callbacks(
+            24,
+            80,
+            0,
+            TerminalParserCallbacks::new(IngressSource::test_boot()),
+        );
         parser.process(b"\x1b]777;ratty:mode;3d\x07");
         parser.process(b"\x1b]777;ratty:warp;intensity=0.5\x07");
         let commands = parser.callbacks_mut().take_ai_commands();
@@ -718,14 +780,14 @@ mod tests {
             commands,
             vec![
                 (
-                    IngressSource::Local,
+                    IngressSource::test_boot(),
                     None,
                     RattyAiCommand::SetMode {
                         mode: "3d".to_string()
                     }
                 ),
                 (
-                    IngressSource::Local,
+                    IngressSource::test_boot(),
                     None,
                     RattyAiCommand::SetWarp { intensity: 0.5 }
                 ),
@@ -739,13 +801,18 @@ mod tests {
     fn osc_778_bytes_reach_the_query_queue() {
         // Drive a real ST-terminated OSC 778 query through vt100 and
         // confirm the ingress hook classified and queued it.
-        let mut parser = Parser::new_with_callbacks(24, 80, 0, TerminalParserCallbacks::default());
+        let mut parser = Parser::new_with_callbacks(
+            24,
+            80,
+            0,
+            TerminalParserCallbacks::new(IngressSource::test_boot()),
+        );
         parser.process(crate::query::query_sequence("tok1", "state.scene", None).as_bytes());
         let queries = parser.callbacks_mut().take_queries();
         assert_eq!(
             queries,
             vec![(
-                IngressSource::Local,
+                IngressSource::test_boot(),
                 QueryEnvelope {
                     token: "tok1".into(),
                     op: "state.scene".into(),
@@ -759,7 +826,12 @@ mod tests {
 
     #[test]
     fn malformed_778_owes_an_error_reply_and_replies_are_swallowed() {
-        let mut parser = Parser::new_with_callbacks(24, 80, 0, TerminalParserCallbacks::default());
+        let mut parser = Parser::new_with_callbacks(
+            24,
+            80,
+            0,
+            TerminalParserCallbacks::new(IngressSource::test_boot()),
+        );
         // Wrong version, recoverable token: owes bad-version.
         parser.process(b"\x1b]778;v=9;t=q;id=tok2;op=caps\x1b\\");
         // A reply echoed back through the output stream: swallowed.
@@ -770,7 +842,7 @@ mod tests {
         assert_eq!(
             errors,
             vec![(
-                IngressSource::Local,
+                IngressSource::test_boot(),
                 WireErrorReply {
                     token: "tok2".into(),
                     code: codes::BAD_VERSION,
@@ -783,13 +855,18 @@ mod tests {
 
     #[test]
     fn tokened_777_commands_and_parse_failures_carry_the_token() {
-        let mut parser = Parser::new_with_callbacks(24, 80, 0, TerminalParserCallbacks::default());
+        let mut parser = Parser::new_with_callbacks(
+            24,
+            80,
+            0,
+            TerminalParserCallbacks::new(IngressSource::test_boot()),
+        );
         parser.process(b"\x1b]777;ratty:reset;tok=t1\x07");
         parser.process(b"\x1b]777;ratty:teleport;tok=t2\x07");
         assert_eq!(
             parser.callbacks_mut().take_ai_commands(),
             vec![(
-                IngressSource::Local,
+                IngressSource::test_boot(),
                 Some("t1".into()),
                 RattyAiCommand::Reset
             )]
@@ -797,7 +874,7 @@ mod tests {
         assert_eq!(
             parser.callbacks_mut().take_wire_errors(),
             vec![(
-                IngressSource::Local,
+                IngressSource::test_boot(),
                 WireErrorReply {
                     token: "t2".into(),
                     code: codes::BAD_COMMAND,
@@ -811,7 +888,12 @@ mod tests {
     fn unrelated_osc_is_ignored_by_the_ai_hook() {
         // A window-title OSC (handled natively) and a foreign OSC 777 must
         // not produce ratty-ai commands.
-        let mut parser = Parser::new_with_callbacks(24, 80, 0, TerminalParserCallbacks::default());
+        let mut parser = Parser::new_with_callbacks(
+            24,
+            80,
+            0,
+            TerminalParserCallbacks::new(IngressSource::test_boot()),
+        );
         parser.process(b"\x1b]0;my title\x07");
         parser.process(b"\x1b]777;other:thing;x=1\x07");
         assert!(parser.callbacks_mut().take_ai_commands().is_empty());

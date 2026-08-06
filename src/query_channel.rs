@@ -42,7 +42,8 @@ use crate::sound::SoundState;
 /// are dropped, mirroring the bounded-resource posture of the object caps).
 pub const MAX_DIAGNOSTICS_PER_NAMESPACE: usize = 32;
 
-/// Byte cap on one stored diagnostic message (see [`AiDiagnostics::record`]).
+/// Byte cap on one stored diagnostic message (see
+/// [`TerminalDiagnostics::record`]).
 pub const MAX_DIAGNOSTIC_MESSAGE_BYTES: usize = 256;
 
 /// JSON payload budget per reply, chosen so the framed, base64url-expanded
@@ -172,24 +173,28 @@ struct DiagRecord {
     message: String,
 }
 
-/// Bounded per-namespace rejection diagnostics, populated at the same
-/// sites as the existing rejection `warn!`s and read back through
-/// `state.errors` (callers see their own namespace only).
-#[derive(Resource, Default)]
-pub struct AiDiagnostics {
+/// One terminal seat's bounded rejection diagnostics, populated at the
+/// same sites as the existing rejection `warn!`s and read back through
+/// `state.errors` (callers see their own ring only).
+///
+/// A component, not a resource: the diagnostics registry is wholly
+/// session-half (#56 decision 5 names it), so the ring lives on the seat
+/// and dies with it — a recycled namespace slot's next tenant starts with
+/// `Default`, never the corpse's error ring. The ring capacity is still
+/// [`MAX_DIAGNOSTICS_PER_NAMESPACE`] and the `caps` limit key keeps its
+/// wire name `errors_per_namespace` — it still truthfully means per-caller
+/// ring capacity, and renaming it would be wire surface.
+#[derive(Component, Default)]
+pub struct TerminalDiagnostics {
+    /// Monotone per-terminal record sequence. Byte-identical to the old
+    /// global counter at N=1 (only the boot terminal ever recorded).
     seq: u64,
-    rings: HashMap<u8, VecDeque<DiagRecord>>,
+    ring: VecDeque<DiagRecord>,
 }
 
-impl AiDiagnostics {
-    /// Records a rejection for the given namespace.
-    pub fn record(
-        &mut self,
-        namespace: u8,
-        action: &'static str,
-        code: &'static str,
-        mut message: String,
-    ) {
+impl TerminalDiagnostics {
+    /// Records a rejection into this terminal's ring.
+    pub fn record(&mut self, action: &'static str, code: &'static str, mut message: String) {
         // Messages can embed wire-controlled strings (a bad mode tag, a
         // bad asset name) that arrive with no length cap of their own.
         // Truncating at the storage boundary bounds ring memory and
@@ -204,16 +209,59 @@ impl AiDiagnostics {
             message.push('…');
         }
         self.seq += 1;
-        let ring = self.rings.entry(namespace).or_default();
-        if ring.len() >= MAX_DIAGNOSTICS_PER_NAMESPACE {
-            ring.pop_front();
+        if self.ring.len() >= MAX_DIAGNOSTICS_PER_NAMESPACE {
+            self.ring.pop_front();
         }
-        ring.push_back(DiagRecord {
+        self.ring.push_back(DiagRecord {
             seq: self.seq,
             action,
             code,
             message,
         });
+    }
+}
+
+/// The write half of the per-terminal diagnostics: resolves a stamped
+/// [`IngressSource`] to its arrival seat's [`TerminalDiagnostics`] ring.
+///
+/// Resolution keys on [`crate::identity::TerminalId`] (the stamp rule,
+/// #56 decision 17), so a recycled namespace can never capture a dead
+/// terminal's in-flight rejections; a record whose arrival terminal no
+/// longer exists is dropped with a `warn!`, never rerouted.
+#[derive(SystemParam)]
+pub struct DiagnosticsSink<'w, 's> {
+    seats: Query<
+        'w,
+        's,
+        (
+            &'static crate::identity::TerminalIdentity,
+            &'static mut TerminalDiagnostics,
+        ),
+    >,
+}
+
+impl DiagnosticsSink<'_, '_> {
+    /// Records a rejection into the arrival terminal's ring.
+    pub(crate) fn record(
+        &mut self,
+        source: IngressSource,
+        action: &'static str,
+        code: &'static str,
+        message: String,
+    ) {
+        let terminal = source.terminal();
+        let Some((_, mut diagnostics)) = self
+            .seats
+            .iter_mut()
+            .find(|(identity, _)| identity.id() == terminal)
+        else {
+            warn!(
+                "ratty-query: {action} diagnostic dropped: arrival terminal \
+                 {terminal:?} no longer exists"
+            );
+            return;
+        };
+        diagnostics.record(action, code, message);
     }
 }
 
@@ -283,7 +331,7 @@ pub(crate) fn ack_commit_long_running(
 /// `tok=`, writes the matching error ack. Call this beside the existing
 /// rejection `warn!`s — it supplements them, it never replaces them.
 pub(crate) fn reject(
-    diagnostics: &mut AiDiagnostics,
+    diagnostics: &mut DiagnosticsSink,
     acks: &mut MessageWriter<AckOutcome>,
     source: IngressSource,
     ack_token: &Option<String>,
@@ -291,7 +339,7 @@ pub(crate) fn reject(
     code: &'static str,
     message: String,
 ) {
-    diagnostics.record(source.namespace(), action, code, message);
+    diagnostics.record(source, action, code, message);
     if let Some(token) = ack_token {
         acks.write(AckOutcome {
             source,
@@ -333,7 +381,12 @@ pub fn answer_queries(
     runtime: Query<&TerminalRuntime>,
     session: Res<QuerySession>,
     inline_objects: Query<&TerminalInlineObjects>,
-    diagnostics: Res<AiDiagnostics>,
+    seat_state: Query<(
+        &crate::identity::TerminalIdentity,
+        &TerminalDiagnostics,
+        &crate::macros::TerminalMacros,
+        &crate::reactive::TerminalReactive,
+    )>,
     presentation: Res<TerminalPresentation>,
     plane_warp: Query<&TerminalPlaneWarp>,
     plane_view: Res<TerminalPlaneView>,
@@ -415,10 +468,26 @@ pub fn answer_queries(
                 );
             }
             QueryItem::Query(envelope) => {
+                // The caller's own session-half state (diagnostics ring,
+                // session macros), resolved by TerminalId (the stamp rule)
+                // — a query whose arrival terminal died is dropped loudly,
+                // never answered from another seat's state.
+                let Some((_, seat_diagnostics, seat_macros, seat_reactive)) = seat_state
+                    .iter()
+                    .find(|(identity, ..)| identity.id() == source.terminal())
+                else {
+                    warn!(
+                        "answer_queries: query dropped: arrival terminal {:?} no longer exists",
+                        source.terminal()
+                    );
+                    continue;
+                };
                 let ctx = QueryCtx {
                     session: &session,
                     inline_objects,
-                    diagnostics: &diagnostics,
+                    diagnostics: seat_diagnostics,
+                    seat_macros,
+                    seat_reactive,
                     presentation: &presentation,
                     plane_warp,
                     plane_view: &plane_view,
@@ -500,7 +569,7 @@ fn send_reply(
     // One transport per runtime today; the match keeps routing keyed to
     // the stamped ingress source so future transports cannot broadcast.
     match source {
-        IngressSource::Local => runtime.write_input(&bytes),
+        IngressSource::Local(_) => runtime.write_input(&bytes),
     }
 }
 
@@ -508,7 +577,13 @@ fn send_reply(
 struct QueryCtx<'a> {
     session: &'a QuerySession,
     inline_objects: &'a TerminalInlineObjects,
-    diagnostics: &'a AiDiagnostics,
+    diagnostics: &'a TerminalDiagnostics,
+    /// The caller's session-half macro state (its session registry and
+    /// active slot); the trusted half stays in `macros`.
+    seat_macros: &'a crate::macros::TerminalMacros,
+    /// The caller's session-half reactive state (its wire rules and
+    /// sensors); the trusted half stays in `reactive`.
+    seat_reactive: &'a crate::reactive::TerminalReactive,
     presentation: &'a TerminalPresentation,
     plane_warp: &'a TerminalPlaneWarp,
     plane_view: &'a TerminalPlaneView,
@@ -553,14 +628,14 @@ fn answer(
         // and the caller's own active recording/playback.
         "state.macros" => paginate(
             ctx,
-            crate::macros::macros_state_items(ctx.macros, source.namespace()),
+            crate::macros::macros_state_items(ctx.seat_macros, ctx.macros),
             &data,
         ),
         // The caller's own executions: the macro slot plus the caller's
         // avatar utterances (own active and own queued). Private
         // per-agent; absence of a handle is the completion signal (#18).
         "state.executions" => {
-            let mut value = crate::macros::executions_state_value(ctx.macros, source.namespace());
+            let mut value = crate::macros::executions_state_value(ctx.seat_macros);
             if let Some(items) = value["items"].as_array_mut() {
                 items.extend(
                     ctx.avatar
@@ -577,12 +652,12 @@ fn answer(
         // sensors plus the caller's own wire sensors (both paginated).
         "state.rules" => paginate(
             ctx,
-            crate::reactive::rules_state_items(ctx.reactive, source.namespace(), ctx.now),
+            crate::reactive::rules_state_items(ctx.seat_reactive, ctx.reactive, ctx.now),
             &data,
         ),
         "state.sensors" => paginate(
             ctx,
-            crate::reactive::sensors_state_items(ctx.reactive, source.namespace(), ctx.now),
+            crate::reactive::sensors_state_items(ctx.seat_reactive, ctx.reactive, ctx.now),
             &data,
         ),
         // The collaboration-presence rosters (#25), paginated: rosters
@@ -977,27 +1052,25 @@ fn namespaces(ctx: &QueryCtx<'_>) -> Value {
 
 /// `state.errors`: the caller's own rejection diagnostics, oldest first.
 /// Sorted by sequence number; paginated.
-fn errors(ctx: &QueryCtx<'_>, source: IngressSource, data: &Value) -> Result<Value, &'static str> {
+fn errors(ctx: &QueryCtx<'_>, _source: IngressSource, data: &Value) -> Result<Value, &'static str> {
+    // `ctx.diagnostics` IS the caller's own ring: it was resolved from the
+    // arrival terminal's seat, so no namespace lookup exists to get wrong.
     let items: Vec<(u64, Value)> = ctx
         .diagnostics
-        .rings
-        .get(&source.namespace())
-        .map(|ring| {
-            ring.iter()
-                .map(|record| {
-                    (
-                        record.seq,
-                        json!({
-                            "seq": record.seq,
-                            "action": record.action,
-                            "code": record.code,
-                            "message": record.message,
-                        }),
-                    )
-                })
-                .collect()
+        .ring
+        .iter()
+        .map(|record| {
+            (
+                record.seq,
+                json!({
+                    "seq": record.seq,
+                    "action": record.action,
+                    "code": record.code,
+                    "message": record.message,
+                }),
+            )
         })
-        .unwrap_or_default();
+        .collect();
     paginate(ctx, items, data)
 }
 
@@ -1165,7 +1238,7 @@ mod tests {
     /// chained so one `update()` is one closed loop.
     fn test_app() -> (App, VirtualTerminalHost) {
         let config = AppConfig::default();
-        let (runtime, host) = TerminalRuntime::virtual_channel(&config);
+        let (runtime, host) = TerminalRuntime::virtual_channel(&config, IngressSource::test_boot());
         let mut app = App::new();
         app.insert_resource(config);
         // The terminal seat, mirroring main()/setup_scene's spawns for the
@@ -1175,10 +1248,11 @@ mod tests {
             TerminalPlaneWarp::default(),
             TerminalRedrawState::default(),
             runtime,
+            crate::identity::TerminalIdentity::test_boot(),
+            crate::identity::terminal_session_state(),
         ));
         app.init_resource::<AiObjectRegistry>();
         app.init_resource::<CursorSettings>();
-        app.init_resource::<AiDiagnostics>();
         app.init_resource::<QuerySession>();
         app.init_resource::<AiEffects>();
         app.init_resource::<crate::viz::VizRegistry>();
@@ -1619,12 +1693,14 @@ mod tests {
         // apply_ai_commands, which this test app does not register, so
         // record the rejection directly at the storage boundary.)
         let junk = "x".repeat(4096);
-        app.world_mut().resource_mut::<AiDiagnostics>().record(
-            0,
-            "mode",
-            codes::BAD_MODE,
-            format!("unknown mode '{junk}'"),
-        );
+        {
+            let world = app.world_mut();
+            let mut seats = world.query::<&mut TerminalDiagnostics>();
+            seats
+                .single_mut(world)
+                .expect("the scaffold seat carries its diagnostics ring")
+                .record("mode", codes::BAD_MODE, format!("unknown mode '{junk}'"));
+        }
         let reply = run_query(&mut app, &host, "q1", "state.errors", None);
         assert!(reply.ok, "the errors op survives an oversized message");
         let page = payload(&reply);

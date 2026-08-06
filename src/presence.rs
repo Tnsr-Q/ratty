@@ -106,7 +106,7 @@ use crate::ai::{AiCommand, CommandOrigin};
 use crate::config::CURSOR_DEPTH;
 use crate::osc::RattyAiCommand;
 use crate::query::codes;
-use crate::query_channel::{AckOutcome, AiDiagnostics, ack_commit, reject};
+use crate::query_channel::{AckOutcome, DiagnosticsSink, ack_commit, reject};
 use crate::scene::{
     MobiusTransition, TerminalPlane, TerminalPlaneWarp, TerminalPresentation,
     TerminalPresentationMode, TerminalViewport,
@@ -219,6 +219,20 @@ impl PresenceRegistry {
     /// The change-detection sequence: bumped on any successful mutation.
     pub fn mutation_seq(&self) -> u64 {
         self.mutation_seq
+    }
+
+    /// Despawn sweep (#56 decision 17's corollary): drops every row keyed
+    /// by a dead terminal's namespace, bumping `mutation_seq` so the
+    /// expiry-redraw and marker sync observe the removal. Namespace keying
+    /// stays lawful here — it is the public identity axis — precisely
+    /// because this sweep makes the rows die with their terminal.
+    pub(crate) fn sweep_namespace(&mut self, namespace: u8) {
+        let before = self.participants.len() + self.notes.len();
+        self.participants.retain(|(ns, _), _| *ns != namespace);
+        self.notes.retain(|(ns, _), _| *ns != namespace);
+        if self.participants.len() + self.notes.len() != before {
+            self.mutation_seq += 1;
+        }
     }
 
     /// Whether the registry holds no rows at all (the render systems'
@@ -447,6 +461,29 @@ impl PresenceRegistry {
                     format!("no note '{id}' in the caller's namespace"),
                 )
             })
+    }
+
+    /// Test-only: seeds one participant row, for the cross-module
+    /// despawn-sweep test (`join` stays private to the applier).
+    #[cfg(test)]
+    pub(crate) fn test_join(&mut self, namespace: u8, id: &str) {
+        self.join(
+            namespace,
+            id,
+            "Test",
+            "#ffffff",
+            None,
+            false,
+            std::time::Duration::ZERO,
+        )
+        .expect("test participant joins");
+    }
+
+    /// Test-only: whether any row (participant or note) is keyed by
+    /// `namespace`.
+    #[cfg(test)]
+    pub(crate) fn test_has_namespace_rows(&self, namespace: u8) -> bool {
+        self.participant_count(namespace) + self.note_count(namespace) > 0
     }
 
     /// Full session reset: clear every roster. Presence is wire-tier
@@ -1229,7 +1266,7 @@ pub fn apply_presence_commands(
     mut registry: ResMut<PresenceRegistry>,
     mut redraw: Query<&mut TerminalRedrawState>,
     mut acks: MessageWriter<AckOutcome>,
-    mut diagnostics: ResMut<AiDiagnostics>,
+    mut diagnostics: DiagnosticsSink,
 ) {
     let mut redraw = match redraw.single_mut() {
         Ok(redraw) => redraw,
@@ -2047,9 +2084,12 @@ mod tests {
 
     fn app_test() -> App {
         let mut app = App::new();
-        app.world_mut().spawn(TerminalRedrawState::default());
+        app.world_mut().spawn((
+            TerminalRedrawState::default(),
+            crate::identity::TerminalIdentity::test_boot(),
+            crate::identity::terminal_session_state(),
+        ));
         app.init_resource::<PresenceRegistry>();
-        app.init_resource::<AiDiagnostics>();
         app.init_resource::<Time>();
         app.add_message::<AiCommand>();
         app.add_message::<AckOutcome>();
@@ -2071,7 +2111,7 @@ mod tests {
         app.world_mut()
             .resource_mut::<Messages<AiCommand>>()
             .write(AiCommand {
-                source: IngressSource::Local,
+                source: IngressSource::test_boot(),
                 ack_token: ack.map(str::to_string),
                 origin,
                 command,
