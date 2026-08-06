@@ -274,6 +274,11 @@ pub enum BindingAction {
     /// Resets the font size.
     #[serde(rename = "ResetFontSize")]
     ResetFontSize,
+    /// Focuses the least-recently-focused terminal (#56 decision 10's
+    /// rider: the keybinding is what makes N reachable before 3D cell
+    /// picking exists).
+    #[serde(rename = "FocusCycle")]
+    FocusCycle,
 }
 
 /// Font configuration.

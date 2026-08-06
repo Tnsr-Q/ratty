@@ -11,6 +11,8 @@ use bevy::window::{PrimaryWindow, Window};
 use arboard::Clipboard;
 
 use crate::config::{AppConfig, BindingAction, FontConfig, KeyBindingConfig};
+use crate::focus::{FocusOrigin, FocusRequest, FocusedTerminal};
+use crate::identity::{TerminalId, TerminalIdentity};
 use crate::mouse::{TerminalSelection, encode_mouse_wheel};
 use crate::runtime::TerminalRuntime;
 use crate::scene::{
@@ -214,6 +216,18 @@ impl FromWorld for TerminalKeyBindings {
                 },
                 BindingAction::ResetFontSize,
             ),
+            // The N-gate (#56 decision 10's rider): without this chord the
+            // first N=2 has no way to focus terminal #2 at all — 3D cell
+            // picking is M4.6, deliberately off the critical path.
+            KeyBinding::new(
+                KeyCode::Tab,
+                BindingModifiers {
+                    control: true,
+                    alt: true,
+                    ..default()
+                },
+                BindingAction::FocusCycle,
+            ),
         ];
 
         for binding in &app_config.bindings.keys {
@@ -336,13 +350,16 @@ pub struct KeyboardSystemParams<'w, 's> {
     stage_tween: ResMut<'w, StageTween>,
     clipboard: NonSendMut<'w, TerminalClipboard>,
     runtime: Query<'w, 's, &'static mut TerminalRuntime>,
-    terminal: Query<'w, 's, (Entity, &'static mut TerminalSurface)>,
+    terminal: Query<'w, 's, &'static mut TerminalSurface>,
     primary_window: Query<'w, 's, &'static Window, With<PrimaryWindow>>,
     viewport: Query<'w, 's, &'static mut TerminalViewport>,
     plane_query: TerminalPlaneLayoutQuery<'w, 's>,
     plane_back_query: TerminalPlaneBackLayoutQuery<'w, 's>,
     bindings: Res<'w, TerminalKeyBindings>,
     redraw: Query<'w, 's, &'static mut TerminalRedrawState>,
+    focus: Res<'w, FocusedTerminal>,
+    focus_requests: MessageWriter<'w, FocusRequest>,
+    seats: Query<'w, 's, (Entity, &'static TerminalIdentity)>,
     _marker: std::marker::PhantomData<&'s ()>,
 }
 
@@ -352,38 +369,14 @@ pub fn handle_keyboard_input(
     mut keyboard: Local<TerminalKeyboard>,
     mut params: KeyboardSystemParams,
 ) {
-    let (seat, mut terminal) = match params.terminal.single_mut() {
-        Ok(terminal) => terminal,
-        Err(err) => {
-            // Latched once per process: the surface lives on THE terminal
-            // seat, and the miss must name its system (#54's silent-.single()
-            // finding).
-            warn_once!("handle_keyboard_input: the surface needs exactly one terminal seat: {err}");
-            return;
-        }
-    };
-    let mut runtime = match params.runtime.single_mut() {
-        Ok(runtime) => runtime,
-        Err(err) => {
-            // Latched once per process: the runtime lives on THE terminal
-            // seat, and the miss must name its system (#54's silent-.single()
-            // finding).
-            warn_once!("handle_keyboard_input: the runtime needs exactly one terminal seat: {err}");
-            return;
-        }
-    };
-    let mut redraw = match params.redraw.single_mut() {
-        Ok(redraw) => redraw,
-        Err(err) => {
-            // Latched once per process: the redraw flag lives on THE terminal
-            // seat, and the miss must name its system (#54's silent-.single()
-            // finding).
-            warn_once!(
-                "handle_keyboard_input: the redraw flag needs exactly one terminal seat: {err}"
-            );
-            return;
-        }
-    };
+    // The routing split (#56 decision 7, invariant 4): terminal chords and
+    // the byte path aim at the FOCUSED seat; scene chords write
+    // scene-global state and keep working with zero terminals focused.
+    // With no focus, byte input drops — there is nowhere honest to send
+    // it, and no fallback-to-terminal-#1 resurrects the singleton
+    // (invariant 8).
+    let focused = params.focus.get();
+
     for event in keyboard_events.read() {
         let binding_key_code = navigation_key_code(&event.logical_key).unwrap_or(event.key_code);
         let modifiers = current_modifiers(&params.keys).union(keyboard.modifiers());
@@ -416,7 +409,10 @@ pub fn handle_keyboard_input(
                         params.stage_tween.stop();
                     }
                     params.selection.clear();
-                    redraw.request();
+                    // A mode flip restyles every seat's texture cursor.
+                    for mut redraw in params.redraw.iter_mut() {
+                        redraw.request();
+                    }
                     continue;
                 }
                 BindingAction::ToggleMobiusMode => {
@@ -440,15 +436,24 @@ pub fn handle_keyboard_input(
                             .begin_enter(previous_mode, &params.plane_view);
                     }
                     params.selection.clear();
-                    redraw.request();
+                    for mut redraw in params.redraw.iter_mut() {
+                        redraw.request();
+                    }
                     continue;
                 }
                 BindingAction::ScrollPageUp
                 | BindingAction::ScrollPageDown
                 | BindingAction::ScrollUp
                 | BindingAction::ScrollDown => {
+                    // A terminal chord: no focus, no-op.
+                    let Some(focused) = focused else {
+                        continue;
+                    };
                     let amount = match action {
                         BindingAction::ScrollPageUp | BindingAction::ScrollPageDown => {
+                            let Ok(terminal) = params.terminal.get_mut(focused) else {
+                                continue;
+                            };
                             usize::from(terminal.rows.saturating_sub(1).max(1))
                         }
                         BindingAction::ScrollUp | BindingAction::ScrollDown => 1,
@@ -460,6 +465,9 @@ pub fn handle_keyboard_input(
                         _ => unreachable!(),
                     };
 
+                    let Ok(mut runtime) = params.runtime.get_mut(focused) else {
+                        continue;
+                    };
                     let mouse_mode = runtime.parser.screen().mouse_protocol_mode();
                     if params.presentation.mode == TerminalPresentationMode::Flat2d
                         && mouse_mode != vt100::MouseProtocolMode::None
@@ -484,11 +492,19 @@ pub fn handle_keyboard_input(
                         };
                         screen.set_scrollback(next);
                         params.selection.clear();
-                        redraw.request();
+                        if let Ok(mut redraw) = params.redraw.get_mut(focused) {
+                            redraw.request();
+                        }
                     }
                     continue;
                 }
                 BindingAction::IncreaseWarp | BindingAction::DecreaseWarp => {
+                    // Warp is the focused seat's surface shape (#52's
+                    // per-terminal half): user input aimed at the terminal
+                    // the user is addressing.
+                    let Some(focused) = focused else {
+                        continue;
+                    };
                     let delta = if action == BindingAction::IncreaseWarp {
                         0.08
                     } else {
@@ -497,40 +513,51 @@ pub fn handle_keyboard_input(
                     if params.stage_tween.active {
                         params.stage_tween.stop();
                     }
-                    let mut plane_warp = match params.plane_warp.single_mut() {
-                        Ok(plane_warp) => plane_warp,
-                        Err(err) => {
-                            // Latched once per process: the warp lives on THE
-                            // terminal seat, and the miss must name its system
-                            // (#54's silent-.single() finding).
-                            warn_once!(
-                                "handle_keyboard_input: the plane warp needs exactly one terminal seat: {err}"
-                            );
-                            continue;
-                        }
+                    let Ok(mut plane_warp) = params.plane_warp.get_mut(focused) else {
+                        continue;
                     };
                     plane_warp.adjust(delta);
-                    redraw.request();
+                    if let Ok(mut redraw) = params.redraw.get_mut(focused) {
+                        redraw.request();
+                    }
                     continue;
                 }
                 BindingAction::Copy => {
+                    // Copy reads the FOCUSED terminal's selection against
+                    // its own screen; one clipboard.
+                    let Some(focused) = focused else {
+                        continue;
+                    };
+                    let Ok(runtime) = params.runtime.get_mut(focused) else {
+                        continue;
+                    };
                     if let Some(text) = params.selection.selected_text(runtime.parser.screen())
                         && !text.is_empty()
                     {
                         params.clipboard.copy(&text);
                     }
-                    if params.selection.clear() {
+                    if params.selection.clear()
+                        && let Ok(mut redraw) = params.redraw.get_mut(focused)
+                    {
                         redraw.request();
                     }
                     continue;
                 }
                 BindingAction::Paste => {
+                    let Some(focused) = focused else {
+                        continue;
+                    };
+                    let Ok(runtime) = params.runtime.get_mut(focused) else {
+                        continue;
+                    };
                     if let Some(text) = params.clipboard.paste() {
                         write_paste(&runtime, &text);
                     } else {
                         warn!("failed to read clipboard contents for paste");
                     }
-                    if params.selection.clear() {
+                    if params.selection.clear()
+                        && let Ok(mut redraw) = params.redraw.get_mut(focused)
+                    {
                         redraw.request();
                     }
                     continue;
@@ -538,6 +565,12 @@ pub fn handle_keyboard_input(
                 BindingAction::IncreaseFontSize
                 | BindingAction::DecreaseFontSize
                 | BindingAction::ResetFontSize => {
+                    let Some(focused) = focused else {
+                        continue;
+                    };
+                    let Ok(mut terminal) = params.terminal.get_mut(focused) else {
+                        continue;
+                    };
                     let resized = match action {
                         BindingAction::IncreaseFontSize => terminal.adjust_font_size(1),
                         BindingAction::DecreaseFontSize => terminal.adjust_font_size(-1),
@@ -557,55 +590,92 @@ pub fn handle_keyboard_input(
                             render_scale_for_window(window),
                         );
                         let pty_pixels = layout.pty_pixels();
+                        let Ok(mut runtime) = params.runtime.get_mut(focused) else {
+                            continue;
+                        };
                         runtime.resize(
                             layout.cols,
                             layout.rows,
                             pty_pixels.x as u16,
                             pty_pixels.y as u16,
                         );
-                        let mut viewport = match params.viewport.single_mut() {
-                            Ok(viewport) => viewport,
-                            Err(err) => {
-                                // Latched once per process: the viewport lives
-                                // on THE terminal seat, and the miss must name
-                                // its system (#54's silent-.single() finding).
-                                warn_once!(
-                                    "handle_keyboard_input: the viewport needs exactly one terminal seat: {err}"
-                                );
-                                continue;
-                            }
+                        let Ok(mut viewport) = params.viewport.get_mut(focused) else {
+                            continue;
                         };
                         sync_terminal_layout(
-                            seat,
+                            focused,
                             layout,
                             &mut viewport,
                             &mut params.plane_query,
                             &mut params.plane_back_query,
                         );
-                        redraw.request();
+                        if let Ok(mut redraw) = params.redraw.get_mut(focused) {
+                            redraw.request();
+                        }
+                    }
+                    continue;
+                }
+                BindingAction::FocusCycle => {
+                    // The N-gate (#56 decision 10's rider): a user-class
+                    // request at the least-recently-focused live seat.
+                    // With one terminal (or none) the target is None and
+                    // the chord is a no-op.
+                    let live: Vec<(Entity, TerminalId)> = params
+                        .seats
+                        .iter()
+                        .map(|(entity, identity)| (entity, identity.id()))
+                        .collect();
+                    if let Some(target) = params.focus.cycle_target(&live) {
+                        params.focus_requests.write(FocusRequest {
+                            target: Some(target),
+                            origin: FocusOrigin::Keybinding,
+                        });
                     }
                     continue;
                 }
             }
         }
 
-        if event.state == ButtonState::Pressed
+        // Typing clears the FOCUSED terminal's selection only; with no
+        // focus nothing receives the keystroke, so nothing clears.
+        if let Some(focused) = focused
+            && event.state == ButtonState::Pressed
             && !is_modifier_key(binding_key_code)
             && params.selection.clear()
+            && let Ok(mut redraw) = params.redraw.get_mut(focused)
         {
             redraw.request();
         }
 
+        // Translation always runs — the Local's physical modifier state
+        // (invariant 6) must never desync while no terminal is focused —
+        // but the produced bytes only travel when a focused runtime
+        // exists to receive them.
+        let modes = focused.and_then(|focused| {
+            params.runtime.get_mut(focused).ok().map(|runtime| {
+                (
+                    runtime.parser.screen().application_cursor(),
+                    runtime.kitty_keyboard_flags(),
+                    runtime.modify_other_keys(),
+                )
+            })
+        });
+        let (application_cursor, kitty_flags, modify_other_keys) =
+            modes.unwrap_or((false, 0, None));
         if let Some(input) = keyboard.handle_event_with_modes(
             event,
-            runtime.parser.screen().application_cursor(),
-            runtime.kitty_keyboard_flags(),
-            runtime.modify_other_keys(),
-        ) {
+            application_cursor,
+            kitty_flags,
+            modify_other_keys,
+        ) && let Some(focused) = focused
+            && let Ok(mut runtime) = params.runtime.get_mut(focused)
+        {
             let screen = runtime.parser.screen_mut();
             if screen.scrollback() != 0 {
                 screen.set_scrollback(0);
-                redraw.request();
+                if let Ok(mut redraw) = params.redraw.get_mut(focused) {
+                    redraw.request();
+                }
             }
             runtime.write_input(&input);
         }
@@ -1136,6 +1206,201 @@ mod tests {
                 .try_recv()
                 .expect("paste should reach the host"),
             b"\x1b[200~hi\x1b[201~".to_vec()
+        );
+    }
+}
+
+#[cfg(test)]
+mod routing_tests {
+    use bevy::ecs::message::Messages;
+    use bevy::ecs::system::RunSystemOnce;
+    use bevy::input::keyboard::Key;
+
+    use super::*;
+    use crate::focus::{FocusGained, FocusLost, drain_focus_requests};
+    use crate::identity::TerminalRegistry;
+    use crate::runtime::VirtualTerminalHost;
+    use crate::scene::TerminalPresentation;
+
+    /// A world with everything `handle_keyboard_input` and the focus
+    /// drain need, plus two virtual terminal seats. Seats deliberately
+    /// carry no surface/viewport/warp — the typing, cycle and scene-chord
+    /// paths under test never touch them.
+    fn routing_world() -> (
+        World,
+        (Entity, VirtualTerminalHost),
+        (Entity, VirtualTerminalHost),
+    ) {
+        let mut world = World::new();
+        world.insert_resource(AppConfig::default());
+        let bindings = TerminalKeyBindings::from_world(&mut world);
+        world.insert_resource(bindings);
+        let clipboard = TerminalClipboard::from_world(&mut world);
+        world.insert_non_send(clipboard);
+        world.init_resource::<TerminalSelection>();
+        world.init_resource::<ButtonInput<KeyCode>>();
+        world.insert_resource(TerminalPresentation {
+            mode: TerminalPresentationMode::Flat2d,
+        });
+        world.insert_resource(TerminalPlaneView::default());
+        world.insert_resource(MobiusTransition::default());
+        world.insert_resource(StageTween::default());
+        world.init_resource::<FocusedTerminal>();
+        world.init_resource::<Messages<KeyboardInput>>();
+        world.init_resource::<Messages<FocusRequest>>();
+        world.init_resource::<Messages<FocusGained>>();
+        world.init_resource::<Messages<FocusLost>>();
+
+        let mut registry = TerminalRegistry::default();
+        let seat = |world: &mut World, registry: &mut TerminalRegistry| {
+            let identity = registry.allocate().expect("test lease");
+            let (runtime, host) =
+                TerminalRuntime::virtual_channel(&AppConfig::default(), identity.ingress());
+            let entity = world
+                .spawn((identity, runtime, TerminalRedrawState::default()))
+                .id();
+            (entity, host)
+        };
+        let seat_a = seat(&mut world, &mut registry);
+        let seat_b = seat(&mut world, &mut registry);
+        (world, seat_a, seat_b)
+    }
+
+    fn focus(world: &mut World, target: Entity) {
+        world
+            .resource_mut::<Messages<FocusRequest>>()
+            .write(FocusRequest {
+                target: Some(target),
+                origin: FocusOrigin::SpawnPolicy,
+            });
+        world
+            .run_system_once(drain_focus_requests)
+            .expect("drain runs");
+        // run_system_once never advances message buffers; drop the applied
+        // request so later assertions see only new emissions.
+        world.resource_mut::<Messages<FocusRequest>>().clear();
+    }
+
+    fn type_key(world: &mut World, key_code: KeyCode, logical_key: Key, text: Option<&str>) {
+        world
+            .resource_mut::<Messages<KeyboardInput>>()
+            .write(KeyboardInput {
+                key_code,
+                logical_key,
+                state: ButtonState::Pressed,
+                text: text.map(Into::into),
+                repeat: false,
+                window: Entity::PLACEHOLDER,
+            });
+        world
+            .run_system_once(handle_keyboard_input)
+            .expect("keyboard handler runs");
+        // run_system_once never advances message buffers; drop the consumed
+        // event so the next call cannot re-read it.
+        world.resource_mut::<Messages<KeyboardInput>>().clear();
+    }
+
+    #[test]
+    fn typing_follows_focus() {
+        let (mut world, (seat_a, host_a), (seat_b, host_b)) = routing_world();
+        assert_eq!(
+            world.query::<&TerminalIdentity>().iter(&world).count(),
+            2,
+            "seat count asserted (#58 rider)"
+        );
+
+        focus(&mut world, seat_a);
+        type_key(
+            &mut world,
+            KeyCode::KeyA,
+            Key::Character("a".into()),
+            Some("a"),
+        );
+        assert_eq!(
+            host_a.input_rx.try_recv().expect("A receives its byte"),
+            b"a".to_vec()
+        );
+        assert!(
+            host_b.input_rx.try_recv().is_err(),
+            "typing into A must not reach B"
+        );
+
+        focus(&mut world, seat_b);
+        type_key(
+            &mut world,
+            KeyCode::KeyB,
+            Key::Character("b".into()),
+            Some("b"),
+        );
+        assert_eq!(
+            host_b.input_rx.try_recv().expect("B receives its byte"),
+            b"b".to_vec()
+        );
+        assert!(
+            host_a.input_rx.try_recv().is_err(),
+            "the byte path re-targets with focus"
+        );
+    }
+
+    #[test]
+    fn the_focus_cycle_chord_requests_the_lru_seat_and_sends_no_bytes() {
+        let (mut world, (seat_a, host_a), (seat_b, host_b)) = routing_world();
+        focus(&mut world, seat_a);
+
+        // Hold Ctrl+Alt physically, press Tab.
+        {
+            let mut keys = world.resource_mut::<ButtonInput<KeyCode>>();
+            keys.press(KeyCode::ControlLeft);
+            keys.press(KeyCode::AltLeft);
+        }
+        type_key(&mut world, KeyCode::Tab, Key::Tab, None);
+
+        let requests: Vec<FocusRequest> = world
+            .resource_mut::<Messages<FocusRequest>>()
+            .drain()
+            .collect();
+        assert_eq!(
+            requests,
+            vec![FocusRequest {
+                target: Some(seat_b),
+                origin: FocusOrigin::Keybinding,
+            }],
+            "the chord emits one user-class request at the LRU seat"
+        );
+        assert!(
+            host_a.input_rx.try_recv().is_err() && host_b.input_rx.try_recv().is_err(),
+            "a consumed chord never leaks bytes to any terminal"
+        );
+    }
+
+    #[test]
+    fn no_focus_drops_bytes_but_scene_chords_still_work() {
+        let (mut world, (_, host_a), (_, host_b)) = routing_world();
+
+        // Invariant 8: nothing is focused at this point, deliberately.
+        type_key(
+            &mut world,
+            KeyCode::KeyX,
+            Key::Character("x".into()),
+            Some("x"),
+        );
+        assert!(
+            host_a.input_rx.try_recv().is_err() && host_b.input_rx.try_recv().is_err(),
+            "with no focus, byte input drops — no fallback-to-terminal-#1"
+        );
+
+        // Scene chords are user input into scene-global state and keep
+        // working with zero terminals focused: Ctrl+Alt+Enter toggles 3D.
+        {
+            let mut keys = world.resource_mut::<ButtonInput<KeyCode>>();
+            keys.press(KeyCode::ControlLeft);
+            keys.press(KeyCode::AltLeft);
+        }
+        type_key(&mut world, KeyCode::Enter, Key::Enter, None);
+        assert_eq!(
+            world.resource::<TerminalPresentation>().mode,
+            TerminalPresentationMode::Plane3d,
+            "scene chords survive zero focus"
         );
     }
 }

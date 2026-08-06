@@ -54,6 +54,8 @@ pub enum FocusOrigin {
     /// user-initiated spawn focuses its child. Wire spawns never emit
     /// this. User class.
     SpawnPolicy,
+    /// The focus-cycle chord (#56 decision 10's rider). User class.
+    Keybinding,
     /// Most-recently-focused succession after the focused terminal dies.
     /// Synthesized by the drain itself — no external emitter.
     Fallback,
@@ -64,7 +66,10 @@ impl FocusOrigin {
     /// class).
     fn is_user_class(self) -> bool {
         match self {
-            FocusOrigin::PointerPress | FocusOrigin::JsControl | FocusOrigin::SpawnPolicy => true,
+            FocusOrigin::PointerPress
+            | FocusOrigin::JsControl
+            | FocusOrigin::SpawnPolicy
+            | FocusOrigin::Keybinding => true,
             FocusOrigin::WireVerb | FocusOrigin::Fallback => false,
         }
     }
