@@ -191,23 +191,11 @@ pub fn apply_bookmark_commands(
     mut commands: MessageReader<AiCommand>,
     mut registry: ResMut<BookmarkRegistry>,
     presentation: Res<TerminalPresentation>,
-    plane_warp: Query<&TerminalPlaneWarp>,
+    seats: Query<(&crate::identity::TerminalIdentity, &TerminalPlaneWarp)>,
     mut pending: ResMut<PendingBookmarkJumps>,
     mut acks: MessageWriter<AckOutcome>,
     mut diagnostics: DiagnosticsSink,
 ) {
-    let plane_warp = match plane_warp.single() {
-        Ok(plane_warp) => plane_warp,
-        Err(err) => {
-            // Latched once per process: the warp lives on THE terminal
-            // seat, and the miss must name its system (#54's silent-.single()
-            // finding).
-            warn_once!(
-                "apply_bookmark_commands: the plane warp needs exactly one terminal seat: {err}"
-            );
-            return;
-        }
-    };
     for AiCommand {
         source,
         ack_token,
@@ -277,7 +265,14 @@ pub fn apply_bookmark_commands(
                     ViewBookmark {
                         v: BOOKMARK_VERSION,
                         mode: mode_wire_name(presentation.mode),
-                        warp: plane_warp.amount.clamp(0.0, 1.0),
+                        // The ARRIVAL terminal's own warp: a bookmark
+                        // records the scene as its author's terminal
+                        // shapes it (arrival is the address).
+                        warp: seats
+                            .iter()
+                            .find(|(identity, _)| identity.id() == source.terminal())
+                            .map(|(_, plane_warp)| plane_warp.amount.clamp(0.0, 1.0))
+                            .unwrap_or(0.0),
                     },
                 );
                 ack_commit(&mut acks, *source, ack_token);

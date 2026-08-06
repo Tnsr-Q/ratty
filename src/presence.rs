@@ -221,6 +221,14 @@ impl PresenceRegistry {
         self.mutation_seq
     }
 
+    /// Whether any participant or note row lives under `namespace` — the
+    /// expiry-redraw's per-seat gate (a seat that never carried presence
+    /// has nothing presence-shaped to erase from its texture).
+    pub(crate) fn has_rows_in(&self, namespace: u8) -> bool {
+        self.participants.keys().any(|(ns, _)| *ns == namespace)
+            || self.notes.keys().any(|(ns, _)| *ns == namespace)
+    }
+
     /// Despawn sweep (#56 decision 17's corollary): drops every row keyed
     /// by a dead terminal's namespace, bumping `mutation_seq` so the
     /// expiry-redraw and marker sync observe the removal. Namespace keying
@@ -730,14 +738,18 @@ fn hex_rgb(color: &str) -> Option<[u8; 3]> {
     Some([channel(1)?, channel(3)?, channel(5)?])
 }
 
-/// The presence underlays for one frame: fresh note panels first, then
-/// fresh participants' name labels, each batch (namespace, id)-sorted so
-/// overlaps stack deterministically (the viz ascending-id posture).
-/// Rendered = public, so every namespace draws. Coordinates are physical
-/// texture pixels, computed where the cell metrics live
+/// The presence underlays for one terminal's frame: fresh note panels
+/// first, then fresh participants' name labels, each batch
+/// (namespace, id)-sorted so overlaps stack deterministically (the viz
+/// ascending-id posture). Rendered = public, but presence rides its
+/// carrying stream (#25): rows draw into the terminal whose namespace
+/// carried them — `namespace` scopes the draw to that seat's texture,
+/// never a neighbor's. Coordinates are physical texture pixels, computed
+/// where the cell metrics live
 /// ([`crate::terminal::TerminalSurface::sync_image`]).
 pub(crate) fn presence_underlays(
     registry: &PresenceRegistry,
+    namespace: u8,
     now: Duration,
     cols: u16,
     rows: u16,
@@ -751,7 +763,7 @@ pub(crate) fn presence_underlays(
     let mut notes: Vec<(&(u8, String), &NoteRecord)> = registry
         .notes
         .iter()
-        .filter(|(_, record)| record.fresh(now))
+        .filter(|((row_namespace, _), record)| *row_namespace == namespace && record.fresh(now))
         .collect();
     notes.sort_by(|a, b| a.0.cmp(b.0));
     for (_, record) in notes {
@@ -760,11 +772,14 @@ pub(crate) fn presence_underlays(
     let mut labeled: Vec<LabeledParticipant<'_>> = registry
         .participants
         .iter()
-        .filter_map(|((namespace, id), record)| {
+        .filter_map(|((row_namespace, id), record)| {
+            if *row_namespace != namespace {
+                return None;
+            }
             let cursor = record.cursor?;
             record
                 .fresh(now)
-                .then_some(((*namespace, id.as_str()), record, cursor))
+                .then_some(((*row_namespace, id.as_str()), record, cursor))
         })
         .collect();
     labeled.sort_by(|a, b| a.0.cmp(&b.0));
@@ -961,12 +976,26 @@ pub(crate) struct PresenceMarkerParams<'w, 's> {
     commands: Commands<'w, 's>,
     time: Res<'w, Time>,
     registry: Res<'w, PresenceRegistry>,
-    terminal: Query<'w, 's, &'static TerminalSurface>,
-    viewport: Query<'w, 's, &'static TerminalViewport>,
+    focus: Res<'w, crate::focus::FocusedTerminal>,
+    #[allow(clippy::type_complexity)]
+    seats: Query<
+        'w,
+        's,
+        (
+            &'static crate::identity::TerminalIdentity,
+            &'static TerminalSurface,
+            &'static TerminalViewport,
+            &'static TerminalPlaneWarp,
+        ),
+    >,
     presentation: Res<'w, TerminalPresentation>,
     mobius_transition: Res<'w, MobiusTransition>,
-    plane_warp: Query<'w, 's, &'static TerminalPlaneWarp>,
-    plane_query: Query<'w, 's, &'static Transform, With<TerminalPlane>>,
+    plane_query: Query<
+        'w,
+        's,
+        (&'static Transform, &'static crate::scene::TerminalOwner),
+        With<TerminalPlane>,
+    >,
     markers: PresenceMarkerQuery<'w, 's>,
     meshes: ResMut<'w, Assets<Mesh>>,
     materials: ResMut<'w, Assets<StandardMaterial>>,
@@ -987,91 +1016,71 @@ pub(crate) fn sync_presence_cursor_markers(mut params: PresenceMarkerParams) {
         commands,
         time,
         registry,
-        terminal,
-        viewport,
+        focus,
+        seats,
         presentation,
         mobius_transition,
-        plane_warp,
         plane_query,
         markers,
         meshes,
         materials,
         marker_mesh,
     } = &mut params;
-    let terminal = match terminal.single() {
-        Ok(terminal) => terminal,
-        Err(err) => {
-            // Latched once per process: the surface lives on THE terminal
-            // seat, and the miss must name its system (#54's silent-.single()
-            // finding).
-            warn_once!(
-                "sync_presence_cursor_markers: the surface needs exactly one terminal seat: {err}"
-            );
-            return;
-        }
-    };
-    let viewport = match viewport.single() {
-        Ok(viewport) => viewport,
-        Err(err) => {
-            // Latched once per process: the viewport lives on THE terminal
-            // seat, and the miss must name its system (#54's silent-.single()
-            // finding).
-            warn_once!(
-                "sync_presence_cursor_markers: the viewport needs exactly one terminal seat: {err}"
-            );
-            return;
-        }
-    };
-    let plane_warp = match plane_warp.single() {
-        Ok(plane_warp) => plane_warp,
-        Err(err) => {
-            // Latched once per process: the warp lives on THE terminal
-            // seat, and the miss must name its system (#54's silent-.single()
-            // finding).
-            warn_once!(
-                "sync_presence_cursor_markers: the plane warp needs exactly one terminal seat: {err}"
-            );
-            return;
-        }
-    };
+    // Markers pin to the surface they annotate, and this milestone only
+    // the FOCUSED seat's surface is on the stage (focused-1:1): the
+    // focused seat anchors the geometry, and only its namespace's rows
+    // materialize. An unfocused seat's markers despawn with the claim
+    // pass below and respawn on refocus — the registry rows are the
+    // truth, the markers are projection. Zero focused (legal) despawns
+    // them all the same way.
+    let focused_seat = focus.get().and_then(|focused| {
+        seats
+            .get(focused)
+            .ok()
+            .map(|seat_parts| (focused, seat_parts))
+    });
     let now = time.elapsed();
     let elapsed_secs = time.elapsed_secs();
-    let cols = terminal.cols;
-    let rows = terminal.rows;
-    let cell_width = viewport.size.x / f32::from(cols.max(1));
-    let cell_height = viewport.size.y / f32::from(rows.max(1));
-    let scale = Vec3::new(
-        cell_width * MARKER_WIDTH_FRACTION,
-        cell_height * MARKER_HEIGHT_FRACTION,
-        cell_width * MARKER_WIDTH_FRACTION,
-    );
-    let mobius_progress = active_mobius_progress(presentation.mode, mobius_transition);
-    let plane_transform = match plane_query.single() {
-        Ok(plane_transform) => Some(plane_transform),
-        Err(err) => {
-            // Latched once per process: the 3D projections need THE plane;
-            // markers hide there until it is back (Flat2d poses never
-            // consult it).
-            warn_once!(
-                "sync_presence_cursor_markers: presence markers need exactly one terminal plane: {err}"
-            );
-            None
-        }
-    };
+    let mut desired: Vec<LabeledParticipant<'_>> = Vec::new();
+    let mut geometry = None;
+    if let Some((focused, (identity, terminal, viewport, plane_warp))) = focused_seat {
+        let cols = terminal.cols;
+        let rows = terminal.rows;
+        let cell_width = viewport.size.x / f32::from(cols.max(1));
+        let cell_height = viewport.size.y / f32::from(rows.max(1));
+        let scale = Vec3::new(
+            cell_width * MARKER_WIDTH_FRACTION,
+            cell_height * MARKER_HEIGHT_FRACTION,
+            cell_width * MARKER_WIDTH_FRACTION,
+        );
+        // The focused seat's OWN plane anchors the 3D projections
+        // (TerminalOwner join); markers hide in 3D while it is missing
+        // (Flat2d poses never consult it).
+        let plane_transform = plane_query
+            .iter()
+            .find(|(_, owner)| owner.0 == focused)
+            .map(|(transform, _)| transform);
+        geometry = Some((cols, rows, viewport, plane_warp, scale, plane_transform));
 
-    // The desired marker set: fresh participants with a reported cursor.
-    // A Vec + linear claim keeps this allocation-light — the roster is
-    // 16-capped per namespace and this runs every presence-active frame.
-    let mut desired: Vec<LabeledParticipant<'_>> = registry
-        .participants
-        .iter()
-        .filter_map(|((namespace, id), record)| {
-            let cursor = record.cursor?;
-            record
-                .fresh(now)
-                .then_some(((*namespace, id.as_str()), record, cursor))
-        })
-        .collect();
+        // The desired marker set: the focused namespace's fresh
+        // participants with a reported cursor. A Vec + linear claim keeps
+        // this allocation-light — the roster is 16-capped per namespace
+        // and this runs every presence-active frame.
+        desired = registry
+            .participants
+            .iter()
+            .filter_map(|((namespace, id), record)| {
+                if *namespace != identity.namespace() {
+                    return None;
+                }
+                let cursor = record.cursor?;
+                record
+                    .fresh(now)
+                    .then_some(((*namespace, id.as_str()), record, cursor))
+            })
+            .collect();
+    }
+    let mobius_progress = active_mobius_progress(presentation.mode, mobius_transition);
 
     for (entity, mut marker, mut transform, mut visibility, material_handle) in markers.iter_mut() {
         let claimed = desired
@@ -1080,6 +1089,10 @@ pub(crate) fn sync_presence_cursor_markers(mut params: PresenceMarkerParams) {
             .map(|index| desired.swap_remove(index));
         let Some((_, record, cursor)) = claimed else {
             commands.entity(entity).despawn();
+            continue;
+        };
+        // A claim implies a focused seat: `desired` is empty without one.
+        let Some((cols, rows, viewport, plane_warp, scale, plane_transform)) = geometry else {
             continue;
         };
         match marker_pose(
@@ -1119,6 +1132,10 @@ pub(crate) fn sync_presence_cursor_markers(mut params: PresenceMarkerParams) {
     // (the claim pass swap-removes, which shuffles the survivors).
     desired.sort_by(|a, b| a.0.cmp(&b.0));
     for ((namespace, id), record, cursor) in desired {
+        // Newcomers exist only when a focused seat filled `desired`.
+        let Some((cols, rows, viewport, plane_warp, scale, plane_transform)) = geometry else {
+            continue;
+        };
         let Some(rgb) = hex_rgb(&record.color) else {
             continue; // Unreachable: colors are validated at apply.
         };
@@ -1186,27 +1203,22 @@ fn presence_texture_stamp(registry: &PresenceRegistry, now: Duration) -> (u64, u
 pub(crate) fn request_presence_expiry_redraw(
     time: Res<Time>,
     registry: Res<PresenceRegistry>,
-    mut redraw: Query<&mut TerminalRedrawState>,
+    mut seats: Query<(&crate::identity::TerminalIdentity, &mut TerminalRedrawState)>,
     mut drawn_stamp: Local<Option<(u64, usize)>>,
 ) {
-    let mut redraw = match redraw.single_mut() {
-        Ok(redraw) => redraw,
-        Err(err) => {
-            // Latched once per process: the redraw flag lives on THE terminal
-            // seat, and the miss must name its system (#54's silent-.single()
-            // finding).
-            warn_once!(
-                "request_presence_expiry_redraw: the redraw flag needs exactly one terminal seat: {err}"
-            );
-            return;
-        }
-    };
     let stamp = presence_texture_stamp(&registry, time.elapsed());
     if *drawn_stamp == Some(stamp) {
         return;
     }
     *drawn_stamp = Some(stamp);
-    redraw.request();
+    // The stamp is one process-wide freshness fingerprint; the repaint
+    // goes to every seat whose namespace holds rows — a seat that never
+    // carried presence has nothing presence-shaped to erase.
+    for (identity, mut redraw) in seats.iter_mut() {
+        if registry.has_rows_in(identity.namespace()) {
+            redraw.request();
+        }
+    }
 }
 
 /// Registers the presence registry, its applier, and the render side.
@@ -1264,22 +1276,10 @@ pub fn apply_presence_commands(
     time: Res<Time>,
     mut commands: MessageReader<AiCommand>,
     mut registry: ResMut<PresenceRegistry>,
-    mut redraw: Query<&mut TerminalRedrawState>,
+    mut seats: Query<(&crate::identity::TerminalIdentity, &mut TerminalRedrawState)>,
     mut acks: MessageWriter<AckOutcome>,
     mut diagnostics: DiagnosticsSink,
 ) {
-    let mut redraw = match redraw.single_mut() {
-        Ok(redraw) => redraw,
-        Err(err) => {
-            // Latched once per process: the redraw flag lives on THE terminal
-            // seat, and the miss must name its system (#54's silent-.single()
-            // finding).
-            warn_once!(
-                "apply_presence_commands: the redraw flag needs exactly one terminal seat: {err}"
-            );
-            return;
-        }
-    };
     let now = time.elapsed();
     for AiCommand {
         source,
@@ -1321,7 +1321,16 @@ pub fn apply_presence_commands(
             ($action:literal, $result:expr) => {
                 match $result {
                     Ok(()) => {
-                        redraw.request();
+                        // The row rides its carrying stream (#25): the
+                        // repaint belongs to the ARRIVAL terminal's texture
+                        // alone. A dead arrival terminal has no texture to
+                        // repaint; the registry row was still committed.
+                        if let Some((_, mut redraw)) = seats
+                            .iter_mut()
+                            .find(|(identity, _)| identity.id() == source.terminal())
+                        {
+                            redraw.request();
+                        }
                         ack_commit(&mut acks, *source, ack_token);
                     }
                     Err((code, message)) => reject!($action, code, message),
@@ -1381,8 +1390,13 @@ pub fn apply_presence_commands(
             RattyAiCommand::Reset => {
                 // Full session reset. Reset's single ack belongs to
                 // apply_ai_commands; the presence registry clears its
-                // rosters silently (there is no trusted tier here).
+                // rosters silently (there is no trusted tier here). Every
+                // seat's texture may have carried rows, so every seat
+                // repaints.
                 registry.reset();
+                for (_, mut redraw) in seats.iter_mut() {
+                    redraw.request();
+                }
             }
             _ => {}
         }
@@ -1813,7 +1827,7 @@ mod tests {
         registry
             .set_cursor(0, "alice", 5, 2, t(0.0))
             .expect("registry op ok");
-        let underlays = presence_underlays(&registry, t(0.0), 80, 24, 10.0, 20.0);
+        let underlays = presence_underlays(&registry, 0, t(0.0), 80, 24, 10.0, 20.0);
         assert_eq!(underlays.len(), 2, "one note panel, one name label");
 
         // The note panel anchors at its cell, one cell tall, sized by
@@ -1922,7 +1936,7 @@ mod tests {
         registry
             .set_cursor(0, "alice", 79, 0, t(0.0))
             .expect("registry op ok");
-        let underlays = presence_underlays(&registry, t(0.0), 80, 24, 10.0, 20.0);
+        let underlays = presence_underlays(&registry, 0, t(0.0), 80, 24, 10.0, 20.0);
         // The note clamps to the bottom-right cell and its panel
         // truncates at the grid's right edge instead of overflowing.
         let (rect, _) = &underlays[0];
@@ -1980,19 +1994,23 @@ mod tests {
         registry
             .set_cursor(0, "m", 3, 3, t(0.0))
             .expect("registry op ok");
-        let texts: Vec<String> = presence_underlays(&registry, t(50.0), 80, 24, 10.0, 20.0)
-            .iter()
-            .filter_map(|(_, ops)| {
-                ops.iter().find_map(|op| match op {
-                    VizDrawOp::Text { text, .. } => Some(text.clone()),
-                    _ => None,
+        let texts = |namespace: u8| -> Vec<String> {
+            presence_underlays(&registry, namespace, t(50.0), 80, 24, 10.0, 20.0)
+                .iter()
+                .filter_map(|(_, ops)| {
+                    ops.iter().find_map(|op| match op {
+                        VizDrawOp::Text { text, .. } => Some(text.clone()),
+                        _ => None,
+                    })
                 })
-            })
-            .collect();
-        // Note panels first ((ns, id)-sorted), then labels ((ns,
-        // id)-sorted); the expired note, the expired cursor, and the
-        // cursor-less participant render nothing.
-        assert_eq!(texts, vec!["Z", "B", "M", "A"]);
+                .collect()
+        };
+        // Per carrying namespace (#25): note panels first, then labels,
+        // each id-sorted; the expired note, the expired cursor, and the
+        // cursor-less participant render nothing — and neither namespace
+        // ever draws into the other's texture.
+        assert_eq!(texts(0), vec!["Z", "M"]);
+        assert_eq!(texts(1), vec!["B", "A"]);
     }
 
     #[test]
@@ -2254,7 +2272,10 @@ mod tests {
     #[test]
     fn expiry_flips_redraw_an_otherwise_idle_terminal() {
         let mut app = App::new();
-        app.world_mut().spawn(TerminalRedrawState::default());
+        app.world_mut().spawn((
+            TerminalRedrawState::default(),
+            crate::identity::TerminalIdentity::test_boot(),
+        ));
         app.init_resource::<PresenceRegistry>();
         app.init_resource::<Time>();
         app.add_systems(Update, request_presence_expiry_redraw);
@@ -2286,100 +2307,95 @@ mod tests {
         );
     }
 
-    /// Runs `f` with a thread-local WARN-capturing subscriber installed and
-    /// returns the captured messages. Sound only because the system under
-    /// test runs inline on this thread via `run_system_once` — an
-    /// `app.update()` could run systems on task-pool threads this
-    /// subscriber cannot see.
-    fn capture_warns(f: impl FnOnce()) -> Vec<String> {
-        use bevy::log::tracing::field::{Field, Visit};
-        use bevy::log::tracing::{Event, Level, Metadata, Subscriber, span};
-        use std::sync::{Arc, Mutex};
-
-        struct WarnCollector(Arc<Mutex<Vec<String>>>);
-
-        impl Subscriber for WarnCollector {
-            fn enabled(&self, metadata: &Metadata<'_>) -> bool {
-                *metadata.level() == Level::WARN
-            }
-            fn new_span(&self, _span: &span::Attributes<'_>) -> span::Id {
-                span::Id::from_u64(1)
-            }
-            fn record(&self, _span: &span::Id, _values: &span::Record<'_>) {}
-            fn record_follows_from(&self, _span: &span::Id, _follows: &span::Id) {}
-            fn event(&self, event: &Event<'_>) {
-                struct MessageVisitor<'a>(&'a mut String);
-                impl Visit for MessageVisitor<'_> {
-                    fn record_debug(&mut self, field: &Field, value: &dyn core::fmt::Debug) {
-                        if field.name() == "message" {
-                            *self.0 = format!("{value:?}");
-                        }
-                    }
-                }
-                let mut message = String::new();
-                event.record(&mut MessageVisitor(&mut message));
-                if let Ok(mut messages) = self.0.lock() {
-                    messages.push(message);
-                }
-            }
-            fn enter(&self, _span: &span::Id) {}
-            fn exit(&self, _span: &span::Id) {}
-        }
-
-        let messages = Arc::new(Mutex::new(Vec::new()));
-        let collector = WarnCollector(Arc::clone(&messages));
-        bevy::log::tracing::subscriber::with_default(collector, f);
-        messages
-            .lock()
-            .expect("the warn collector lock should not be poisoned")
-            .clone()
-    }
-
     #[test]
-    fn marker_sync_warns_once_when_the_plane_anchor_is_not_unique() {
+    fn markers_materialize_for_the_focused_namespace_and_follow_focus() {
         use crate::config::AppConfig;
         use bevy::ecs::system::RunSystemOnce;
 
-        // Only this test may assert this site's warn: the warn_once latch
-        // is process-global, so a second test driving this system into the
-        // wrong-plane-count state would race it.
         let mut world = World::new();
         world.init_resource::<Time>();
-        // The plane resolution runs before the roster loop, so an empty
-        // registry reaches it (run_system_once also bypasses the run_if).
         world.init_resource::<PresenceRegistry>();
-        world.spawn((
-            TerminalSurface::new(&AppConfig::default()).expect("surface construction is CPU-only"),
-            TerminalViewport {
-                size: Vec2::new(800.0, 480.0),
-                center: Vec2::ZERO,
-            },
-            TerminalPlaneWarp::default(),
-        ));
+        world.init_resource::<crate::focus::FocusedTerminal>();
         world.insert_resource(TerminalPresentation {
-            mode: TerminalPresentationMode::Plane3d,
+            mode: TerminalPresentationMode::Flat2d,
         });
         world.init_resource::<MobiusTransition>();
         world.init_resource::<Assets<Mesh>>();
         world.init_resource::<Assets<StandardMaterial>>();
-        world.spawn((TerminalPlane, Transform::default()));
-        world.spawn((TerminalPlane, Transform::default()));
 
-        let warns = capture_warns(|| {
+        let mut registry = crate::identity::TerminalRegistry::default();
+        let seat = |world: &mut World, registry: &mut crate::identity::TerminalRegistry| {
+            let identity = registry.allocate().expect("test lease");
             world
-                .run_system_once(sync_presence_cursor_markers)
-                .expect("the system should run");
-            world
-                .run_system_once(sync_presence_cursor_markers)
-                .expect("the system should run");
-        });
+                .spawn((
+                    identity,
+                    TerminalSurface::new(&AppConfig::default())
+                        .expect("surface construction is CPU-only"),
+                    TerminalViewport {
+                        size: Vec2::new(800.0, 480.0),
+                        center: Vec2::ZERO,
+                    },
+                    TerminalPlaneWarp::default(),
+                ))
+                .id()
+        };
+        let seat_a = seat(&mut world, &mut registry);
+        let seat_b = seat(&mut world, &mut registry);
+
+        // One fresh cursor-bearing participant per namespace.
+        {
+            let mut presence = world.resource_mut::<PresenceRegistry>();
+            for (ns, id) in [(0, "alice"), (1, "bob")] {
+                presence
+                    .join(ns, id, id, "#00ff00", None, false, Duration::ZERO)
+                    .expect("registry op ok");
+                presence
+                    .set_cursor(ns, id, 1, 1, Duration::ZERO)
+                    .expect("registry op ok");
+            }
+        }
+
+        let marker_namespaces = |world: &mut World| -> Vec<u8> {
+            let mut namespaces: Vec<u8> = world
+                .query::<&PresenceCursorMarker>()
+                .iter(world)
+                .map(|marker| marker.namespace)
+                .collect();
+            namespaces.sort_unstable();
+            namespaces
+        };
+
+        // Zero focused (legal): nothing materializes.
+        world
+            .run_system_once(sync_presence_cursor_markers)
+            .expect("the system should run");
+        world.flush();
         assert_eq!(
-            warns
-                .iter()
-                .filter(|warn| warn.contains("sync_presence_cursor_markers"))
-                .count(),
-            1,
-            "two wrong-plane frames must produce exactly one latched warn: {warns:?}"
+            marker_namespaces(&mut world),
+            Vec::<u8>::new(),
+            "no focused seat, no markers"
         );
+
+        // Focus A: only A's namespace materializes; the rows are the
+        // truth, the markers are projection.
+        world
+            .resource_mut::<crate::focus::FocusedTerminal>()
+            .set_for_test(Some(seat_a));
+        world
+            .run_system_once(sync_presence_cursor_markers)
+            .expect("the system should run");
+        world.flush();
+        assert_eq!(marker_namespaces(&mut world), vec![0]);
+
+        // Focus B: A's marker despawns through the claim pass, B's
+        // spawns — the registry never changed.
+        world
+            .resource_mut::<crate::focus::FocusedTerminal>()
+            .set_for_test(Some(seat_b));
+        world
+            .run_system_once(sync_presence_cursor_markers)
+            .expect("the system should run");
+        world.flush();
+        assert_eq!(marker_namespaces(&mut world), vec![1]);
     }
 }

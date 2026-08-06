@@ -372,15 +372,21 @@ pub struct OrganRegistries<'w> {
 /// Ordered after `pump_pty_output` and every command-applying system so a
 /// same-chunk "write then read" observes the write, and the ack for a
 /// command precedes the reply to a query that followed it. Replies exit
-/// through [`TerminalRuntime::write_input`], routed by the request's
-/// stamped [`IngressSource`] — never broadcast.
+/// through the ARRIVAL terminal's own [`TerminalRuntime::write_input`],
+/// resolved by `TerminalId` from the request's stamped [`IngressSource`]
+/// (the stamp rule) — never broadcast, never another seat's transport. An
+/// ack or reply whose arrival terminal died is dropped with a warn.
 #[allow(clippy::too_many_arguments)]
 pub fn answer_queries(
     mut queries: MessageReader<QueryRequest>,
     mut acks: MessageReader<AckOutcome>,
-    runtime: Query<&TerminalRuntime>,
+    transports: Query<(
+        &crate::identity::TerminalIdentity,
+        &TerminalRuntime,
+        &TerminalPlaneWarp,
+        &TerminalInlineObjects,
+    )>,
     session: Res<QuerySession>,
-    inline_objects: Query<&TerminalInlineObjects>,
     seat_state: Query<(
         &crate::identity::TerminalIdentity,
         &TerminalDiagnostics,
@@ -389,23 +395,17 @@ pub fn answer_queries(
         &AiEffects,
     )>,
     presentation: Res<TerminalPresentation>,
-    plane_warp: Query<&TerminalPlaneWarp>,
     plane_view: Res<TerminalPlaneView>,
     stage_tween: Res<StageTween>,
     cursor: Res<CursorSettings>,
     organs: OrganRegistries,
 ) {
-    // The reply transport itself: without the runtime no ack or reply can
-    // leave the terminal, so it resolves before everything else.
-    let runtime = match runtime.single() {
-        Ok(runtime) => runtime,
-        Err(err) => {
-            // Latched once per process: the runtime lives on THE terminal
-            // seat, and the miss must name its system (#54's silent-.single()
-            // finding).
-            warn_once!("answer_queries: the runtime needs exactly one terminal seat: {err}");
-            return;
-        }
+    // The reply transport is the arrival terminal's own runtime, resolved
+    // per message by TerminalId (the stamp rule, #56 decision 17).
+    let transport_of = |terminal: crate::identity::TerminalId| {
+        transports
+            .iter()
+            .find(|(identity, ..)| identity.id() == terminal)
     };
 
     // Acks first: a same-chunk "command with tok= then query" reads its
@@ -418,6 +418,13 @@ pub fn answer_queries(
         payload,
     } in acks.read()
     {
+        let Some((_, runtime, ..)) = transport_of(source.terminal()) else {
+            warn!(
+                "answer_queries: ack dropped: arrival terminal {:?} no longer exists",
+                source.terminal()
+            );
+            continue;
+        };
         let json = payload.as_ref().map(serde_json::Value::to_string);
         send_reply(
             runtime,
@@ -430,31 +437,14 @@ pub fn answer_queries(
         );
     }
 
-    // Resolved after the ack relay: the ack path needs only the runtime
-    // (resolved above), so acks drain before a warp/inline miss aborts the
-    // reply loop.
-    let plane_warp = match plane_warp.single() {
-        Ok(plane_warp) => plane_warp,
-        Err(err) => {
-            // Latched once per process: the warp lives on THE terminal
-            // seat, and the miss must name its system (#54's silent-.single()
-            // finding).
-            warn_once!("answer_queries: the plane warp needs exactly one terminal seat: {err}");
-            return;
-        }
-    };
-    let inline_objects = match inline_objects.single() {
-        Ok(inline_objects) => inline_objects,
-        Err(err) => {
-            // Latched once per process: the inline registry lives on THE
-            // terminal seat, and the miss must name its system (#54's
-            // silent-.single() finding).
-            warn_once!("answer_queries: inline objects need exactly one terminal seat: {err}");
-            return;
-        }
-    };
-
     for QueryRequest { source, item } in queries.read() {
+        let Some((_, runtime, plane_warp, inline_objects)) = transport_of(source.terminal()) else {
+            warn!(
+                "answer_queries: query dropped: arrival terminal {:?} no longer exists",
+                source.terminal()
+            );
+            continue;
+        };
         match item {
             QueryItem::Error(error) => {
                 send_reply(
@@ -1340,6 +1330,75 @@ mod tests {
     }
 
     const ID: u32 = 0x8000_0001;
+
+    /// The M4.4 reply-routing criterion (declared in PR #91): at N=2,
+    /// acks and replies exit over the ARRIVAL terminal's own transport,
+    /// resolved by TerminalId — never the other seat's, never broadcast.
+    #[test]
+    fn replies_route_over_the_arrival_terminals_transport_at_n2() {
+        let (mut app, host_a) = test_app();
+        let mut registry = crate::identity::TerminalRegistry::default();
+        let _boot = registry.allocate().expect("boot lease");
+        let id_b = registry.allocate().expect("second lease");
+        let (runtime_b, host_b) =
+            TerminalRuntime::virtual_channel(&crate::config::AppConfig::default(), id_b.ingress());
+        app.world_mut().spawn((
+            TerminalInlineObjects::default(),
+            TerminalPlaneWarp::default(),
+            TerminalRedrawState::default(),
+            runtime_b,
+            id_b,
+            crate::identity::terminal_session_state(),
+        ));
+        assert_eq!(
+            app.world_mut()
+                .query::<&crate::identity::TerminalIdentity>()
+                .iter(app.world())
+                .count(),
+            2,
+            "seat count asserted (#58 rider)"
+        );
+
+        // The closed loop over B: a tok='d effect command plus a query in
+        // one chunk — B's transport carries B's ack and reply, A's stays
+        // silent.
+        let chunk = format!(
+            "\x1b]777;ratty:think;state=start&tok=tb\x07{}",
+            query_sequence("qb", "state.scene", None)
+        );
+        host_b
+            .feed_tx
+            .send(chunk.into_bytes())
+            .expect("virtual feed accepts bytes");
+        app.update();
+        let replies_b = drain_replies(&host_b);
+        assert_eq!(replies_b.len(), 2, "B gets its ack and its reply");
+        assert!(replies_b[0].ack && replies_b[0].ok, "the think committed");
+        assert_eq!(replies_b[1].token, "qb");
+        assert_eq!(
+            payload(&replies_b[1])["effects"]["thinking"],
+            json!(true),
+            "state.scene projects the ARRIVAL terminal's own effects"
+        );
+        assert!(
+            drain_replies(&host_a).is_empty(),
+            "A's transport carries none of B's traffic"
+        );
+
+        // Symmetric: A's query answers over A, and A's own effects are
+        // untouched by B's think.
+        let reply_a = run_query(&mut app, &host_a, "qa", "state.scene", None);
+        assert!(reply_a.ok);
+        assert_eq!(
+            payload(&reply_a)["effects"]["thinking"],
+            json!(false),
+            "A's projection is A's state, not B's"
+        );
+        assert!(
+            drain_replies(&host_b).is_empty(),
+            "B's transport carries none of A's traffic"
+        );
+    }
 
     #[test]
     fn closed_loop_write_over_777_read_back_over_778() {

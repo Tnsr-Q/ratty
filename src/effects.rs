@@ -393,6 +393,17 @@ pub(crate) fn apply_ai_effect_commands(
         ..
     } in commands.read()
     {
+        // Full session reset is scene-wide by contract (the object ledger
+        // and presence reset globally too): every seat's effects clear
+        // and every seat repaints. Reset's single ack belongs to
+        // `apply_ai_commands`.
+        if matches!(command, RattyAiCommand::Reset) {
+            for (_, mut effects, mut redraw) in seats.iter_mut() {
+                effects.clear();
+                redraw.request();
+            }
+            continue;
+        }
         // Foreign command families fall through without a seat lookup.
         if !matches!(
             command,
@@ -402,7 +413,6 @@ pub(crate) fn apply_ai_effect_commands(
                 | RattyAiCommand::Think { .. }
                 | RattyAiCommand::Confidence { .. }
                 | RattyAiCommand::Mood { .. }
-                | RattyAiCommand::Reset
         ) {
             continue;
         }
@@ -440,11 +450,6 @@ pub(crate) fn apply_ai_effect_commands(
             }
             RattyAiCommand::Mood { mood } => {
                 effects.mood = Mood::parse(mood);
-            }
-            RattyAiCommand::Reset => {
-                effects.clear();
-                redraw.request();
-                continue;
             }
             _ => unreachable!("filtered to effect commands above"),
         }

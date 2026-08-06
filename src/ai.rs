@@ -203,37 +203,19 @@ impl Plugin for RattyAiPlugin {
 pub fn apply_ai_commands(
     mut commands: MessageReader<AiCommand>,
     mut presentation: ResMut<TerminalPresentation>,
-    mut plane_warp: Query<&mut TerminalPlaneWarp>,
+    mut seats: Query<(
+        &crate::identity::TerminalIdentity,
+        &mut TerminalPlaneWarp,
+        &mut TerminalRedrawState,
+    )>,
     mut plane_view: ResMut<TerminalPlaneView>,
     mut mobius: ResMut<MobiusTransition>,
     mut stage_tween: ResMut<StageTween>,
-    mut redraw: Query<&mut TerminalRedrawState>,
     mut acks: MessageWriter<crate::query_channel::AckOutcome>,
     mut diagnostics: crate::query_channel::DiagnosticsSink,
 ) {
     use crate::query::codes;
     use crate::query_channel::{ack_commit, reject};
-
-    let mut plane_warp = match plane_warp.single_mut() {
-        Ok(plane_warp) => plane_warp,
-        Err(err) => {
-            // Latched once per process: the warp lives on THE terminal
-            // seat, and the miss must name its system (#54's silent-.single()
-            // finding).
-            warn_once!("apply_ai_commands: the plane warp needs exactly one terminal seat: {err}");
-            return;
-        }
-    };
-    let mut redraw = match redraw.single_mut() {
-        Ok(redraw) => redraw,
-        Err(err) => {
-            // Latched once per process: the redraw flag lives on THE terminal
-            // seat, and the miss must name its system (#54's silent-.single()
-            // finding).
-            warn_once!("apply_ai_commands: the redraw flag needs exactly one terminal seat: {err}");
-            return;
-        }
-    };
 
     for AiCommand {
         source,
@@ -258,27 +240,45 @@ pub fn apply_ai_commands(
                     continue;
                 };
                 // Requesting the already-active mode is an idempotent
-                // commit, so it acks ok either way.
+                // commit, so it acks ok either way. A mode flip is
+                // scene-global: every seat's texture cursor restyles.
                 if apply_stage_mode_change(target, &mut presentation, &plane_view, &mut mobius) {
                     stage_tween.stop();
-                    redraw.request();
+                    for (_, _, mut redraw) in seats.iter_mut() {
+                        redraw.request();
+                    }
                 }
                 ack_commit(&mut acks, *source, ack_token);
             }
             RattyAiCommand::SetWarp { intensity } => {
                 // An explicit warp command wins over a running camera tween.
+                // Warp is the ARRIVAL terminal's own surface shape (#52's
+                // per-terminal half, arrival-is-the-address): the command
+                // morphs its own plane, never a neighbor's.
                 stage_tween.stop();
+                let Some((_, mut plane_warp, mut redraw)) = seats
+                    .iter_mut()
+                    .find(|(identity, ..)| identity.id() == source.terminal())
+                else {
+                    warn!("apply_ai_commands: warp dropped: its arrival terminal is gone");
+                    continue;
+                };
                 plane_warp.amount = intensity.clamp(0.0, 1.0);
                 redraw.request();
                 ack_commit(&mut acks, *source, ack_token);
             }
             RattyAiCommand::Reset => {
+                // Full session reset, scene-wide by contract (the object
+                // ledger and presence reset globally too): every seat's
+                // warp flattens and every seat repaints.
                 presentation.mode = TerminalPresentationMode::Flat2d;
                 *plane_view = TerminalPlaneView::default();
-                plane_warp.amount = 0.0;
                 mobius.stop();
                 stage_tween.stop();
-                redraw.request();
+                for (_, mut plane_warp, mut redraw) in seats.iter_mut() {
+                    plane_warp.amount = 0.0;
+                    redraw.request();
+                }
                 // Reset is handled by three systems; this one owns its
                 // single ack (objects and effects reset silently).
                 ack_commit(&mut acks, *source, ack_token);
@@ -379,42 +379,20 @@ pub fn apply_ai_commands(
 #[allow(clippy::too_many_arguments)]
 pub fn apply_ai_object_commands(
     mut commands: MessageReader<AiCommand>,
-    mut inline_objects: Query<&mut TerminalInlineObjects>,
+    mut seats: Query<(
+        &crate::identity::TerminalIdentity,
+        &mut TerminalInlineObjects,
+        &mut TerminalRedrawState,
+    )>,
     mut registry: ResMut<AiObjectRegistry>,
     mut removals: MessageWriter<AiObjectRemoved>,
     mut cursor: ResMut<CursorSettings>,
     app_config: Res<AppConfig>,
-    mut redraw: Query<&mut TerminalRedrawState>,
     mut acks: MessageWriter<crate::query_channel::AckOutcome>,
     mut diagnostics: crate::query_channel::DiagnosticsSink,
 ) {
     use crate::query::codes;
     use crate::query_channel::ack_commit;
-
-    let mut inline_objects = match inline_objects.single_mut() {
-        Ok(inline_objects) => inline_objects,
-        Err(err) => {
-            // Latched once per process: the inline registry lives on THE
-            // terminal seat, and the miss must name its system (#54's
-            // silent-.single() finding).
-            warn_once!(
-                "apply_ai_object_commands: inline objects need exactly one terminal seat: {err}"
-            );
-            return;
-        }
-    };
-    let mut redraw = match redraw.single_mut() {
-        Ok(redraw) => redraw,
-        Err(err) => {
-            // Latched once per process: the redraw flag lives on THE terminal
-            // seat, and the miss must name its system (#54's silent-.single()
-            // finding).
-            warn_once!(
-                "apply_ai_object_commands: the redraw flag needs exactly one terminal seat: {err}"
-            );
-            return;
-        }
-    };
 
     for AiCommand {
         source,
@@ -439,6 +417,27 @@ pub fn apply_ai_object_commands(
                 )
             };
         }
+        // Object commands operate on the ARRIVAL terminal's inline
+        // registry (arrival is the address); a command whose arrival
+        // terminal died is dropped with a warn, never rerouted.
+        macro_rules! arrival_seat {
+            ($action:literal) => {
+                match seats
+                    .iter_mut()
+                    .find(|(identity, ..)| identity.id() == source.terminal())
+                {
+                    Some((_, inline_objects, redraw)) => (inline_objects, redraw),
+                    None => {
+                        warn!(concat!(
+                            "ratty-ai: ",
+                            $action,
+                            " dropped: its arrival terminal is gone"
+                        ));
+                        continue;
+                    }
+                }
+            };
+        }
         match command {
             RattyAiCommand::SpawnObject {
                 id,
@@ -451,6 +450,7 @@ pub fn apply_ai_object_commands(
                 replace,
             } => {
                 let id = *id;
+                let (mut inline_objects, mut redraw) = arrival_seat!("object.add");
                 if ai_object_namespace(id) != Some(source.namespace()) {
                     warn!(
                         "ratty-ai: object.add rejected: id {id:#010x} is outside the caller's \
@@ -559,6 +559,7 @@ pub fn apply_ai_object_commands(
                 brightness,
             } => {
                 let id = *id;
+                let (mut inline_objects, mut redraw) = arrival_seat!("object.update");
                 if ai_object_namespace(id) != Some(source.namespace()) {
                     warn!(
                         "ratty-ai: object.update rejected: id {id:#010x} is outside the \
@@ -602,6 +603,7 @@ pub fn apply_ai_object_commands(
             }
             RattyAiCommand::RemoveObject { id } => {
                 let id = *id;
+                let (mut inline_objects, mut redraw) = arrival_seat!("object.remove");
                 if ai_object_namespace(id) != Some(source.namespace()) {
                     warn!(
                         "ratty-ai: object.remove rejected: id {id:#010x} is outside the \
@@ -632,6 +634,7 @@ pub fn apply_ai_object_commands(
             RattyAiCommand::ClearObjects => {
                 // Scoped to the caller's namespace and idempotent; full-scene
                 // destruction is exclusively reset's job.
+                let (mut inline_objects, mut redraw) = arrival_seat!("object.clear");
                 let removed = inline_objects.ai_clear_namespace(source.namespace());
                 if !removed.is_empty() {
                     for id in removed {
@@ -694,21 +697,23 @@ pub fn apply_ai_object_commands(
                 if let Some(visible) = visible {
                     cursor.visible = *visible;
                 }
+                let (_inline_objects, mut redraw) = arrival_seat!("cursor");
                 redraw.request();
                 ack_commit(&mut acks, *source, ack_token);
             }
             RattyAiCommand::Reset => {
                 // Full-scene destruction of AI-owned objects across every
-                // namespace; used ids stay reserved (the session continues).
-                // Reset's single ack belongs to apply_ai_commands.
-                let removed = inline_objects.ai_clear_all();
-                if !removed.is_empty() {
+                // namespace and every seat; used ids stay reserved (the
+                // session continues). Reset's single ack belongs to
+                // apply_ai_commands.
+                for (_, mut inline_objects, mut redraw) in seats.iter_mut() {
+                    let removed = inline_objects.ai_clear_all();
                     for id in removed {
                         removals.write(AiObjectRemoved { id });
                     }
+                    redraw.request();
                 }
                 cursor.reset_to_config(&app_config);
-                redraw.request();
             }
             _ => {}
         }

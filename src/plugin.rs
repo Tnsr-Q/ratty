@@ -94,16 +94,10 @@ impl Plugin for TerminalPlugin {
                     .after(pump_pty_output)
                     .after(handle_keyboard_input)
                     .after(handle_mouse_input)
-                    .run_if(|objects: Query<&TerminalInlineObjects>| match objects.single() {
-                        Ok(objects) => objects.has_pending_stage(),
-                        Err(err) => {
-                            // Latched once per process: a missing seat must
-                            // be loud, not a silent never-runs (#54).
-                            warn_once!(
-                                "apply_rgp_stage run condition: inline objects need exactly one terminal seat: {err}"
-                            );
-                            false
-                        }
+                    .run_if(|objects: Query<&TerminalInlineObjects>| {
+                        // Any seat with pending stage moves wakes the
+                        // applier; it drains per seat.
+                        objects.iter().any(|objects| objects.has_pending_stage())
                     }),
             )
             .add_systems(
@@ -178,19 +172,15 @@ impl Plugin for TerminalPlugin {
             )
             .add_systems(
                 Update,
-                apply_rgp_restyle
-                    .after(sync_inline_objects)
-                    .run_if(|objects: Query<&TerminalInlineObjects>| match objects.single() {
-                        Ok(objects) => objects.has_restyle_objects(),
-                        Err(err) => {
-                            // Latched once per process: a missing seat must
-                            // be loud, not a silent never-runs (#54).
-                            warn_once!(
-                                "apply_rgp_restyle run condition: inline objects need exactly one terminal seat: {err}"
-                            );
-                            false
-                        }
-                    }),
+                apply_rgp_restyle.after(sync_inline_objects).run_if(
+                    |objects: Query<&TerminalInlineObjects>| {
+                        // Any seat with a queued restyle wakes the applier;
+                        // it drains the focused seat (an unfocused seat's
+                        // restyles are subsumed by the resync a focus flip
+                        // triggers).
+                        objects.iter().any(|objects| objects.has_restyle_objects())
+                    },
+                ),
             )
             .add_systems(
                 Update,

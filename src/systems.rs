@@ -106,8 +106,6 @@ struct CursorPoseContext<'a> {
 #[derive(Component)]
 pub struct BrightnessAdjusted;
 
-type PlaneTransformQuery<'w, 's> =
-    Query<'w, 's, &'static Transform, (With<TerminalPlane>, Without<TerminalRgpObject>)>;
 type CursorTransformQuery<'w, 's> = Query<
     'w,
     's,
@@ -632,6 +630,7 @@ pub(crate) struct RenderWidgetParams<'w, 's> {
         's,
         (
             Entity,
+            &'static crate::identity::TerminalIdentity,
             &'static mut TerminalSurface,
             &'static mut TerminalRedrawState,
             &'static mut TerminalFrameDirty,
@@ -683,7 +682,9 @@ pub(crate) fn render_terminal_widget(mut params: RenderWidgetParams) {
     // presence is asserted by the seat-count tests, not warned about here
     // (a latched warn inside a loop would fire once for one seat and
     // never again).
-    for (seat, mut terminal, mut redraw, mut frame_dirty, runtime, exchange) in seats.iter_mut() {
+    for (seat, identity, mut terminal, mut redraw, mut frame_dirty, runtime, exchange) in
+        seats.iter_mut()
+    {
         let is_focused = focus.is_focused(seat);
         let needs_redraw = redraw.take();
         // Focused-only blink (#51's spine answer, ratified in #56):
@@ -727,6 +728,7 @@ pub(crate) fn render_terminal_widget(mut params: RenderWidgetParams) {
         let _ = terminal.sync_image(
             images,
             exchange,
+            identity.namespace(),
             time.elapsed_secs(),
             viz_registry,
             presence,
@@ -973,13 +975,31 @@ pub(crate) fn respawn_cursor_model(mut params: RespawnCursorParams) {
 #[derive(SystemParam)]
 pub(crate) struct SyncInlineParams<'w, 's> {
     commands: Commands<'w, 's>,
-    inline_objects: Query<'w, 's, &'static mut TerminalInlineObjects>,
-    terminal: Query<'w, 's, &'static TerminalSurface>,
-    viewport: Query<'w, 's, &'static TerminalViewport>,
+    focus: Res<'w, crate::focus::FocusedTerminal>,
+    #[allow(clippy::type_complexity)]
+    seats: Query<
+        'w,
+        's,
+        (
+            &'static TerminalSurface,
+            &'static TerminalViewport,
+            &'static TerminalPlaneWarp,
+            &'static mut TerminalInlineObjects,
+        ),
+    >,
     presentation: Res<'w, TerminalPresentation>,
-    plane_warp: Query<'w, 's, &'static TerminalPlaneWarp>,
     time: Res<'w, Time>,
-    plane_query: Query<'w, 's, (Entity, &'static Transform), With<TerminalPlane>>,
+    #[allow(clippy::type_complexity)]
+    plane_query: Query<
+        'w,
+        's,
+        (
+            Entity,
+            &'static Transform,
+            &'static crate::scene::TerminalOwner,
+        ),
+        With<TerminalPlane>,
+    >,
     sprite_query: Query<'w, 's, Entity, With<TerminalInlineObjectSprite>>,
     plane_image_query: Query<'w, 's, Entity, With<TerminalInlineObjectPlane>>,
     rgp_query: Query<'w, 's, (Entity, &'static TerminalRgpObject)>,
@@ -1001,11 +1021,9 @@ pub(crate) struct SyncInlineParams<'w, 's> {
 pub(crate) fn sync_inline_objects(mut params: SyncInlineParams) {
     let SyncInlineParams {
         commands,
-        inline_objects,
-        terminal,
-        viewport,
+        focus,
+        seats,
         presentation,
-        plane_warp,
         time,
         plane_query,
         sprite_query,
@@ -1016,47 +1034,28 @@ pub(crate) fn sync_inline_objects(mut params: SyncInlineParams) {
         images,
         meshes,
     } = &mut params;
-    let terminal = match terminal.single() {
-        Ok(terminal) => terminal,
-        Err(err) => {
-            // Latched once per process: the surface lives on THE terminal
-            // seat, and the miss must name its system (#54's silent-.single()
-            // finding).
-            warn_once!("sync_inline_objects: the surface needs exactly one terminal seat: {err}");
-            return;
+    // Inline objects render on the FOCUSED seat's surface (focused-1:1):
+    // its grid places them, its plane parents them. With zero focused
+    // (legal) every inline entity despawns below and the registries wait
+    // untouched. A focus flip re-syncs against the new seat's registry —
+    // the seat components are the truth, the entities are projection.
+    let Some(focused) = focus.get() else {
+        for entity in sprite_query.iter() {
+            commands.entity(entity).despawn();
         }
+        for entity in plane_image_query.iter() {
+            commands.entity(entity).despawn();
+        }
+        for (entity, _) in rgp_query.iter() {
+            commands.entity(entity).despawn();
+        }
+        return;
     };
-    let viewport = match viewport.single() {
-        Ok(viewport) => viewport,
-        Err(err) => {
-            // Latched once per process: the viewport lives on THE terminal
-            // seat, and the miss must name its system (#54's silent-.single()
-            // finding).
-            warn_once!("sync_inline_objects: the viewport needs exactly one terminal seat: {err}");
-            return;
-        }
-    };
-    let plane_warp = match plane_warp.single() {
-        Ok(plane_warp) => plane_warp,
-        Err(err) => {
-            // Latched once per process: the warp lives on THE terminal
-            // seat, and the miss must name its system (#54's silent-.single()
-            // finding).
-            warn_once!(
-                "sync_inline_objects: the plane warp needs exactly one terminal seat: {err}"
-            );
-            return;
-        }
-    };
-    let mut inline_objects = match inline_objects.single_mut() {
-        Ok(inline_objects) => inline_objects,
-        Err(err) => {
-            // Latched once per process: the inline registry lives on THE
-            // terminal seat, and the miss must name its system (#54's
-            // silent-.single() finding).
-            warn_once!("sync_inline_objects: inline objects need exactly one terminal seat: {err}");
-            return;
-        }
+    let Ok((terminal, viewport, plane_warp, mut inline_objects)) = seats.get_mut(focused) else {
+        // Latched once per process: a focused entity without the seat
+        // bundle is a broken dress (#54's silent-miss finding).
+        warn_once!("sync_inline_objects: the focused entity is not a dressed terminal seat");
+        return;
     };
     // Per-object rebuilds (queued by `depth` updates and glTF restyles) only
     // run when no full rebuild is due; a full rebuild subsumes them.
@@ -1092,17 +1091,14 @@ pub(crate) fn sync_inline_objects(mut params: SyncInlineParams) {
         }
     }
 
-    let (plane_entity, _plane_transform) = match plane_query.single() {
-        Ok(plane) => plane,
-        Err(err) => {
-            // Latched once per process: inline objects parent to THE terminal
-            // plane, and the miss must name its system (#54's silent-.single()
-            // finding).
-            warn_once!(
-                "sync_inline_objects: inline objects need exactly one terminal plane: {err}"
-            );
-            return;
-        }
+    let Some((plane_entity, _plane_transform, _)) =
+        plane_query.iter().find(|(_, _, owner)| owner.0 == focused)
+    else {
+        // Latched once per process: inline objects parent to the focused
+        // seat's OWN plane, and a dressed seat without one is a broken
+        // dress (#54's silent-miss finding).
+        warn_once!("sync_inline_objects: the focused terminal has no owned plane anchor");
+        return;
     };
 
     let cell_width = viewport.size.x / terminal.cols.max(1) as f32;
@@ -1404,22 +1400,17 @@ fn write_kitty_plane_positions(
 /// warp is active, instead of rebuilding inline entities every frame.
 pub(crate) fn animate_inline_kitty_planes(
     presentation: Res<TerminalPresentation>,
+    focus: Res<crate::focus::FocusedTerminal>,
     warp: Query<&TerminalPlaneWarp>,
     time: Res<Time>,
     query: Query<(&InlineKittyPlaneLayout, &Mesh3d), With<TerminalInlineObjectPlane>>,
     mut meshes: ResMut<Assets<Mesh>>,
 ) {
-    let warp = match warp.single() {
-        Ok(warp) => warp,
-        Err(err) => {
-            // Latched once per process: the warp lives on THE terminal
-            // seat, and the miss must name its system (#54's silent-.single()
-            // finding).
-            warn_once!(
-                "animate_inline_kitty_planes: the plane warp needs exactly one terminal seat: {err}"
-            );
-            return;
-        }
+    // The kitty planes on stage belong to the FOCUSED seat
+    // (`sync_inline_objects` spawns them from its registry alone), so its
+    // warp drives them; zero focused means zero planes to animate.
+    let Some(warp) = focus.get().and_then(|focused| warp.get(focused).ok()) else {
+        return;
     };
     if !matches!(
         presentation.mode,
@@ -1603,14 +1594,28 @@ fn apply_brightness(material: &mut StandardMaterial, brightness: f32) {
 #[derive(SystemParam)]
 pub(crate) struct RgpSyncParams<'w, 's> {
     app_config: Res<'w, AppConfig>,
-    terminal: Query<'w, 's, &'static TerminalSurface>,
-    viewport: Query<'w, 's, &'static TerminalViewport>,
+    focus: Res<'w, crate::focus::FocusedTerminal>,
+    #[allow(clippy::type_complexity)]
+    seats: Query<
+        'w,
+        's,
+        (
+            &'static TerminalSurface,
+            &'static TerminalViewport,
+            &'static TerminalPlaneWarp,
+            &'static TerminalInlineObjects,
+        ),
+    >,
     presentation: Res<'w, TerminalPresentation>,
     mobius_transition: Res<'w, MobiusTransition>,
-    plane_warp: Query<'w, 's, &'static TerminalPlaneWarp>,
     time: Res<'w, Time>,
-    plane_query: PlaneTransformQuery<'w, 's>,
-    inline_objects: Query<'w, 's, &'static TerminalInlineObjects>,
+    #[allow(clippy::type_complexity)]
+    plane_query: Query<
+        'w,
+        's,
+        (&'static Transform, &'static crate::scene::TerminalOwner),
+        (With<TerminalPlane>, Without<TerminalRgpObject>),
+    >,
     query: Query<
         'w,
         's,
@@ -1634,56 +1639,33 @@ pub(crate) struct RgpSyncParams<'w, 's> {
 pub(crate) fn sync_rgp_objects(mut params: RgpSyncParams) {
     let RgpSyncParams {
         app_config,
-        terminal,
-        viewport,
+        focus,
+        seats,
         presentation,
         mobius_transition,
-        plane_warp,
         time,
         plane_query,
-        inline_objects,
         query,
     } = &mut params;
-    let terminal = match terminal.single() {
-        Ok(terminal) => terminal,
-        Err(err) => {
-            // Latched once per process: the surface lives on THE terminal
-            // seat, and the miss must name its system (#54's silent-.single()
-            // finding).
-            warn_once!("sync_rgp_objects: the surface needs exactly one terminal seat: {err}");
-            return;
+    // RGP roots on stage belong to the FOCUSED seat (`sync_inline_objects`
+    // spawns them from its registry alone); its grid places them and its
+    // own plane projects them. Zero focused: everything hides.
+    let Some(focused) = focus.get() else {
+        for (_, _, mut visibility, _) in query.iter_mut() {
+            *visibility = Visibility::Hidden;
         }
+        return;
     };
-    let viewport = match viewport.single() {
-        Ok(viewport) => viewport,
-        Err(err) => {
-            // Latched once per process: the viewport lives on THE terminal
-            // seat, and the miss must name its system (#54's silent-.single()
-            // finding).
-            warn_once!("sync_rgp_objects: the viewport needs exactly one terminal seat: {err}");
-            return;
-        }
+    let Ok((terminal, viewport, plane_warp, inline_objects)) = seats.get(focused) else {
+        // Latched once per process: a focused entity without the seat
+        // bundle is a broken dress (#54's silent-miss finding).
+        warn_once!("sync_rgp_objects: the focused entity is not a dressed terminal seat");
+        return;
     };
-    let plane_warp = match plane_warp.single() {
-        Ok(plane_warp) => plane_warp,
-        Err(err) => {
-            // Latched once per process: the warp lives on THE terminal
-            // seat, and the miss must name its system (#54's silent-.single()
-            // finding).
-            warn_once!("sync_rgp_objects: the plane warp needs exactly one terminal seat: {err}");
-            return;
-        }
-    };
-    let inline_objects = match inline_objects.single() {
-        Ok(inline_objects) => inline_objects,
-        Err(err) => {
-            // Latched once per process: the inline registry lives on THE
-            // terminal seat, and the miss must name its system (#54's
-            // silent-.single() finding).
-            warn_once!("sync_rgp_objects: inline objects need exactly one terminal seat: {err}");
-            return;
-        }
-    };
+    let focused_plane = plane_query
+        .iter()
+        .find(|(_, owner)| owner.0 == focused)
+        .map(|(transform, _)| transform);
     let cell_width = viewport.size.x / terminal.cols.max(1) as f32;
     let cell_height = viewport.size.y / terminal.rows.max(1) as f32;
     let elapsed_secs = time.elapsed_secs();
@@ -1741,15 +1723,13 @@ pub(crate) fn sync_rgp_objects(mut params: RgpSyncParams) {
                 *visibility = Visibility::Visible;
             }
             TerminalPresentationMode::Plane3d | TerminalPresentationMode::Mobius3d => {
-                let plane_transform = match plane_query.single() {
-                    Ok(plane_transform) => plane_transform,
-                    Err(err) => {
-                        warn_once!(
-                            "sync_rgp_objects: RGP projection needs exactly one terminal plane: {err}"
-                        );
-                        *visibility = Visibility::Hidden;
-                        continue;
-                    }
+                let Some(plane_transform) = focused_plane else {
+                    // Latched once per process: a dressed focused seat
+                    // without an owned front plane is a broken dress
+                    // (#54's silent-miss finding).
+                    warn_once!("sync_rgp_objects: the focused terminal has no owned plane anchor");
+                    *visibility = Visibility::Hidden;
+                    continue;
                 };
                 let local_position = plane_surface_point(
                     presentation.mode,
@@ -1916,6 +1896,7 @@ mod rgp_animation_tests {
 /// Restyle application parameters.
 #[derive(SystemParam)]
 pub(crate) struct RgpRestyleParams<'w, 's> {
+    focus: Res<'w, crate::focus::FocusedTerminal>,
     inline_objects: Query<'w, 's, &'static mut TerminalInlineObjects>,
     rgp_roots: Query<'w, 's, (Entity, &'static TerminalRgpObject)>,
     parent_query: Query<'w, 's, &'static ChildOf>,
@@ -1945,6 +1926,7 @@ pub(crate) struct RgpRestyleParams<'w, 's> {
 /// untouched, so the pose stays continuous.
 pub(crate) fn apply_rgp_restyle(mut params: RgpRestyleParams) {
     let RgpRestyleParams {
+        focus,
         inline_objects,
         rgp_roots,
         parent_query,
@@ -1952,15 +1934,14 @@ pub(crate) fn apply_rgp_restyle(mut params: RgpRestyleParams) {
         materials,
         commands,
     } = &mut params;
-    let mut inline_objects = match inline_objects.single_mut() {
-        Ok(inline_objects) => inline_objects,
-        Err(err) => {
-            // Latched once per process: the inline registry lives on THE
-            // terminal seat, and the miss must name its system (#54's
-            // silent-.single() finding).
-            warn_once!("apply_rgp_restyle: inline objects need exactly one terminal seat: {err}");
-            return;
-        }
+    // Restyles rewrite materials on the roots on stage, which belong to
+    // the FOCUSED seat; an unfocused seat's pending restyles wait in its
+    // registry and are subsumed by the full resync a focus flip triggers.
+    let Some(mut inline_objects) = focus
+        .get()
+        .and_then(|focused| inline_objects.get_mut(focused).ok())
+    else {
+        return;
     };
     let restyle = inline_objects.take_restyle_objects();
     if restyle.is_empty() {
@@ -2010,6 +1991,7 @@ pub(crate) fn apply_rgp_restyle(mut params: RgpRestyleParams) {
 #[derive(SystemParam)]
 pub(crate) struct BrightnessParams<'w, 's> {
     cursor_settings: Res<'w, CursorSettings>,
+    focus: Res<'w, crate::focus::FocusedTerminal>,
     inline_objects: Query<'w, 's, &'static TerminalInlineObjects>,
     rgp_roots: Query<'w, 's, (Entity, &'static TerminalRgpObject)>,
     cursor_roots: Query<'w, 's, Entity, With<CursorModel>>,
@@ -2040,6 +2022,7 @@ pub(crate) struct BrightnessParams<'w, 's> {
 pub(crate) fn apply_instance_brightness(mut params: BrightnessParams) {
     let BrightnessParams {
         cursor_settings,
+        focus,
         inline_objects,
         rgp_roots,
         cursor_roots,
@@ -2048,17 +2031,14 @@ pub(crate) fn apply_instance_brightness(mut params: BrightnessParams) {
         materials,
         commands,
     } = &mut params;
-    let inline_objects = match inline_objects.single() {
-        Ok(inline_objects) => inline_objects,
-        Err(err) => {
-            // Latched once per process: the inline registry lives on THE
-            // terminal seat, and the miss must name its system (#54's
-            // silent-.single() finding).
-            warn_once!(
-                "apply_instance_brightness: inline objects need exactly one terminal seat: {err}"
-            );
-            return;
-        }
+    // The freshly spawned descendants being brightened belong to the
+    // FOCUSED seat's roots (and the one cursor model); zero focused means
+    // no roots spawned this frame.
+    let Some(inline_objects) = focus
+        .get()
+        .and_then(|focused| inline_objects.get(focused).ok())
+    else {
+        return;
     };
     if material_query.is_empty() {
         return;
@@ -2603,8 +2583,12 @@ fn viz_root_anchor(registry: &VizRegistry, viz_id: u32) -> Option<InlineAnchor> 
 }
 
 /// The terminal plane transform, disjoint from viz roots.
-type VizPlaneQuery<'w, 's> =
-    Query<'w, 's, &'static Transform, (With<TerminalPlane>, Without<VizObjectRoot>)>;
+type VizPlaneQuery<'w, 's> = Query<
+    'w,
+    's,
+    (&'static Transform, &'static crate::scene::TerminalOwner),
+    (With<TerminalPlane>, Without<VizObjectRoot>),
+>;
 
 /// One running keyed-effect animation with everything the animator needs.
 type VizAnimatedQuery<'w, 's> = Query<
@@ -2624,11 +2608,20 @@ type VizAnimatedQuery<'w, 's> = Query<
 #[derive(SystemParam)]
 pub(crate) struct VizSyncParams<'w, 's> {
     registry: Res<'w, VizRegistry>,
-    terminal: Query<'w, 's, &'static TerminalSurface>,
-    viewport: Query<'w, 's, &'static TerminalViewport>,
+    focus: Res<'w, crate::focus::FocusedTerminal>,
+    #[allow(clippy::type_complexity)]
+    seats: Query<
+        'w,
+        's,
+        (
+            &'static crate::identity::TerminalIdentity,
+            &'static TerminalSurface,
+            &'static TerminalViewport,
+            &'static TerminalPlaneWarp,
+        ),
+    >,
     presentation: Res<'w, TerminalPresentation>,
     mobius_transition: Res<'w, MobiusTransition>,
-    plane_warp: Query<'w, 's, &'static TerminalPlaneWarp>,
     time: Res<'w, Time>,
     plane_query: VizPlaneQuery<'w, 's>,
     roots: Query<
@@ -2655,51 +2648,40 @@ pub(crate) struct VizSyncParams<'w, 's> {
 pub(crate) fn sync_viz_objects(mut params: VizSyncParams) {
     let VizSyncParams {
         registry,
-        terminal,
-        viewport,
+        focus,
+        seats,
         presentation,
         mobius_transition,
-        plane_warp,
         time,
         plane_query,
         roots,
     } = &mut params;
-    let terminal = match terminal.single() {
-        Ok(terminal) => terminal,
-        Err(err) => {
-            // Latched once per process: the surface lives on THE terminal
-            // seat, and the miss must name its system (#54's silent-.single()
-            // finding).
-            warn_once!("sync_viz_objects: the surface needs exactly one terminal seat: {err}");
-            return;
+    // Viz roots are namespace-owned; on the focused-1:1 stage only the
+    // FOCUSED seat's namespace materializes, anchored to that seat's own
+    // grid and plane. Zero focused hides everything (registry intact).
+    let Some((focused, (identity, terminal, viewport, plane_warp))) = focus
+        .get()
+        .and_then(|focused| seats.get(focused).ok().map(|parts| (focused, parts)))
+    else {
+        for (_, _, mut visibility) in roots.iter_mut() {
+            *visibility = Visibility::Hidden;
         }
+        return;
     };
-    let viewport = match viewport.single() {
-        Ok(viewport) => viewport,
-        Err(err) => {
-            // Latched once per process: the viewport lives on THE terminal
-            // seat, and the miss must name its system (#54's silent-.single()
-            // finding).
-            warn_once!("sync_viz_objects: the viewport needs exactly one terminal seat: {err}");
-            return;
-        }
-    };
-    let plane_warp = match plane_warp.single() {
-        Ok(plane_warp) => plane_warp,
-        Err(err) => {
-            // Latched once per process: the warp lives on THE terminal
-            // seat, and the miss must name its system (#54's silent-.single()
-            // finding).
-            warn_once!("sync_viz_objects: the plane warp needs exactly one terminal seat: {err}");
-            return;
-        }
-    };
+    let focused_plane = plane_query
+        .iter()
+        .find(|(_, owner)| owner.0 == focused)
+        .map(|(transform, _)| transform);
     let cell_width = viewport.size.x / terminal.cols.max(1) as f32;
     let cell_height = viewport.size.y / terminal.rows.max(1) as f32;
     let elapsed_secs = time.elapsed_secs();
     let mobius_progress = active_mobius_progress(presentation.mode, mobius_transition);
 
     for (root, mut transform, mut visibility) in roots.iter_mut() {
+        if crate::osc::ai_object_namespace(root.viz_id) != Some(identity.namespace()) {
+            *visibility = Visibility::Hidden;
+            continue;
+        }
         let Some(anchor) = viz_root_anchor(registry, root.viz_id) else {
             *visibility = Visibility::Hidden;
             continue;
@@ -2718,15 +2700,13 @@ pub(crate) fn sync_viz_objects(mut params: VizSyncParams) {
                 *visibility = Visibility::Visible;
             }
             TerminalPresentationMode::Plane3d | TerminalPresentationMode::Mobius3d => {
-                let plane_transform = match plane_query.single() {
-                    Ok(plane_transform) => plane_transform,
-                    Err(err) => {
-                        warn_once!(
-                            "sync_viz_objects: viz projection needs exactly one terminal plane: {err}"
-                        );
-                        *visibility = Visibility::Hidden;
-                        continue;
-                    }
+                let Some(plane_transform) = focused_plane else {
+                    // Latched once per process: a dressed focused seat
+                    // without an owned front plane is a broken dress
+                    // (#54's silent-miss finding).
+                    warn_once!("sync_viz_objects: the focused terminal has no owned plane anchor");
+                    *visibility = Visibility::Hidden;
+                    continue;
                 };
                 let local_position = plane_surface_point(
                     presentation.mode,
@@ -2914,35 +2894,17 @@ pub fn animate_terminal_plane_warp(
     time: Res<Time>,
     presentation: Res<TerminalPresentation>,
     mobius_transition: Res<MobiusTransition>,
-    warp: Query<Ref<TerminalPlaneWarp>>,
-    plane_meshes: Query<&TerminalPlaneMeshes>,
+    focus: Res<crate::focus::FocusedTerminal>,
+    seats: Query<(Ref<TerminalPlaneWarp>, &TerminalPlaneMeshes)>,
     mut meshes: ResMut<Assets<Mesh>>,
 ) {
-    let plane_meshes = match plane_meshes.single() {
-        Ok(plane_meshes) => plane_meshes,
-        Err(err) => {
-            // Latched once per process: the warp writes THE seat's meshes,
-            // and the miss must name its system (#54's silent-.single()
-            // finding).
-            warn_once!(
-                "animate_terminal_plane_warp: plane meshes need exactly one terminal seat: {err}"
-            );
-            return;
-        }
-    };
-    // `Ref` carries the same last-run change ticks as `Res` did, so the
-    // `warp.is_changed()` gate below keeps its exact cadence.
-    let warp = match warp.single() {
-        Ok(warp) => warp,
-        Err(err) => {
-            // Latched once per process: the warp lives on THE terminal
-            // seat, and the miss must name its system (#54's silent-.single()
-            // finding).
-            warn_once!(
-                "animate_terminal_plane_warp: the plane warp needs exactly one terminal seat: {err}"
-            );
-            return;
-        }
+    // Only the FOCUSED seat's plane pair is on the 3D stage
+    // (focused-1:1), so only its meshes rebuild — a hidden plane's
+    // rebuild would be pure waste. (Decision 9's per-frame-×-N cost note
+    // stays routed to #54's successor for when composition puts N planes
+    // on stage.) `Ref` keeps the `warp.is_changed()` cadence exact.
+    let Some((warp, plane_meshes)) = focus.get().and_then(|focused| seats.get(focused).ok()) else {
+        return;
     };
     if presentation.mode == TerminalPresentationMode::Flat2d {
         return;
@@ -2986,18 +2948,16 @@ pub fn animate_mobius_transition(
     mut presentation: ResMut<TerminalPresentation>,
     mut mobius_transition: ResMut<MobiusTransition>,
     mut plane_view: ResMut<TerminalPlaneView>,
+    focus: Res<crate::focus::FocusedTerminal>,
     mut redraw: Query<&mut TerminalRedrawState>,
 ) {
-    let mut redraw = match redraw.single_mut() {
-        Ok(redraw) => redraw,
-        Err(err) => {
-            // Latched once per process: the redraw flag lives on THE terminal
-            // seat, and the miss must name its system (#54's silent-.single()
-            // finding).
-            warn_once!(
-                "animate_mobius_transition: the redraw flag needs exactly one terminal seat: {err}"
-            );
-            return;
+    // The morph animates the FOCUSED seat's on-stage strip; its texture
+    // is the one that must keep repainting through the transition.
+    let request_focused_redraw = |redraw: &mut Query<&mut TerminalRedrawState>| {
+        if let Some(focused) = focus.get()
+            && let Ok(mut redraw) = redraw.get_mut(focused)
+        {
+            redraw.request();
         }
     };
     if presentation.mode != TerminalPresentationMode::Mobius3d {
@@ -3010,7 +2970,7 @@ pub fn animate_mobius_transition(
     }
 
     mobius_transition.elapsed_secs += time.delta_secs();
-    redraw.request();
+    request_focused_redraw(&mut redraw);
 
     if mobius_transition.finished() {
         plane_view.zoom = mobius_transition.end_zoom.max(0.1);
@@ -3021,7 +2981,7 @@ pub fn animate_mobius_transition(
             presentation.mode = mobius_transition.source_mode;
         }
         mobius_transition.stop();
-        redraw.request();
+        request_focused_redraw(&mut redraw);
     }
 }
 
@@ -3030,44 +2990,49 @@ pub fn animate_mobius_transition(
 /// dispatch instantly (the Möbius transition owns its own clock); the other
 /// fields apply instantly or start a [`StageTween`] when `dur` is set.
 pub fn apply_rgp_stage(
-    mut inline_objects: Query<&mut TerminalInlineObjects>,
+    mut seats: Query<(
+        Entity,
+        &mut TerminalInlineObjects,
+        &mut TerminalPlaneWarp,
+        &mut TerminalRedrawState,
+    )>,
     mut presentation: ResMut<TerminalPresentation>,
-    mut plane_warp: Query<&mut TerminalPlaneWarp>,
     mut plane_view: ResMut<TerminalPlaneView>,
     mut mobius_transition: ResMut<MobiusTransition>,
     mut stage_tween: ResMut<StageTween>,
-    mut redraw: Query<&mut TerminalRedrawState>,
 ) {
-    let mut plane_warp = match plane_warp.single_mut() {
-        Ok(plane_warp) => plane_warp,
-        Err(err) => {
-            // Latched once per process: the warp lives on THE terminal
-            // seat, and the miss must name its system (#54's silent-.single()
-            // finding).
-            warn_once!("apply_rgp_stage: the plane warp needs exactly one terminal seat: {err}");
-            return;
-        }
-    };
-    let mut redraw = match redraw.single_mut() {
-        Ok(redraw) => redraw,
-        Err(err) => {
-            // Latched once per process: the redraw flag lives on THE terminal
-            // seat, and the miss must name its system (#54's silent-.single()
-            // finding).
-            warn_once!("apply_rgp_stage: the redraw flag needs exactly one terminal seat: {err}");
-            return;
-        }
-    };
-    let mut inline_objects = match inline_objects.single_mut() {
-        Ok(inline_objects) => inline_objects,
-        Err(err) => {
-            // Latched once per process: the inline registry lives on THE
-            // terminal seat, and the miss must name its system (#54's
-            // silent-.single() finding).
-            warn_once!("apply_rgp_stage: inline objects need exactly one terminal seat: {err}");
-            return;
-        }
-    };
+    // Each seat drains its OWN pending stage moves: warp lands on that
+    // seat's plane (#52's per-terminal surface shape), the camera
+    // channels write the shared scene view last-writer-wins in seat
+    // iteration order — the arbitration a granted wire class already
+    // gets (#56 decision 16).
+    for (seat, mut inline_objects, mut plane_warp, mut redraw) in seats.iter_mut() {
+        apply_seat_stage_updates(
+            seat,
+            &mut inline_objects,
+            &mut plane_warp,
+            &mut redraw,
+            &mut presentation,
+            &mut plane_view,
+            &mut mobius_transition,
+            &mut stage_tween,
+        );
+    }
+}
+
+/// One seat's half of [`apply_rgp_stage`], split out so the borrow of the
+/// seat's components stays scoped to its own iteration.
+#[allow(clippy::too_many_arguments)]
+fn apply_seat_stage_updates(
+    seat: Entity,
+    inline_objects: &mut TerminalInlineObjects,
+    plane_warp: &mut TerminalPlaneWarp,
+    redraw: &mut TerminalRedrawState,
+    presentation: &mut TerminalPresentation,
+    plane_view: &mut TerminalPlaneView,
+    mobius_transition: &mut MobiusTransition,
+    stage_tween: &mut StageTween,
+) {
     for update in inline_objects.take_stage_updates() {
         let mut applied = false;
 
@@ -3077,12 +3042,7 @@ pub fn apply_rgp_stage(
                 RgpStageMode::Plane3d => TerminalPresentationMode::Plane3d,
                 RgpStageMode::Mobius3d => TerminalPresentationMode::Mobius3d,
             };
-            if apply_stage_mode_change(
-                target,
-                &mut presentation,
-                &plane_view,
-                &mut mobius_transition,
-            ) {
+            if apply_stage_mode_change(target, presentation, plane_view, mobius_transition) {
                 // A mode change is a scene cut: it cancels any camera tween.
                 stage_tween.stop();
                 applied = true;
@@ -3115,6 +3075,7 @@ pub fn apply_rgp_stage(
                         start: plane_warp.amount,
                         end,
                     }),
+                    warp_seat: warp.is_some().then_some(seat),
                     yaw: yaw.map(|end| StageChannel {
                         start: plane_view.yaw,
                         end,
@@ -3159,34 +3120,9 @@ pub fn apply_rgp_stage(
 pub fn animate_stage_tween(
     time: Res<Time>,
     mut stage_tween: ResMut<StageTween>,
-    mut plane_warp: Query<&mut TerminalPlaneWarp>,
+    mut seats: Query<(&mut TerminalPlaneWarp, &mut TerminalRedrawState)>,
     mut plane_view: ResMut<TerminalPlaneView>,
-    mut redraw: Query<&mut TerminalRedrawState>,
 ) {
-    let mut plane_warp = match plane_warp.single_mut() {
-        Ok(plane_warp) => plane_warp,
-        Err(err) => {
-            // Latched once per process: the warp lives on THE terminal
-            // seat, and the miss must name its system (#54's silent-.single()
-            // finding).
-            warn_once!(
-                "animate_stage_tween: the plane warp needs exactly one terminal seat: {err}"
-            );
-            return;
-        }
-    };
-    let mut redraw = match redraw.single_mut() {
-        Ok(redraw) => redraw,
-        Err(err) => {
-            // Latched once per process: the redraw flag lives on THE terminal
-            // seat, and the miss must name its system (#54's silent-.single()
-            // finding).
-            warn_once!(
-                "animate_stage_tween: the redraw flag needs exactly one terminal seat: {err}"
-            );
-            return;
-        }
-    };
     if !stage_tween.active {
         return;
     }
@@ -3195,8 +3131,15 @@ pub fn animate_stage_tween(
     let progress = (stage_tween.elapsed_secs / stage_tween.duration_secs).clamp(0.0, 1.0);
     let eased = stage_tween.ease.apply(progress);
 
-    if let Some(channel) = stage_tween.warp {
+    // The warp channel drives its OWNING seat's plane (#52's split); a
+    // dead owner just skips the write — the camera channels are
+    // scene-side and keep animating either way.
+    if let Some(channel) = stage_tween.warp
+        && let Some(seat) = stage_tween.warp_seat
+        && let Ok((mut plane_warp, mut redraw)) = seats.get_mut(seat)
+    {
         plane_warp.amount = channel.sample(eased).clamp(0.0, 1.0);
+        redraw.request();
     }
     if let Some(channel) = stage_tween.yaw {
         plane_view.yaw = channel.sample(eased);
@@ -3207,7 +3150,6 @@ pub fn animate_stage_tween(
     if let Some(channel) = stage_tween.zoom {
         plane_view.zoom = channel.sample(eased).clamp(0.1, 4.0);
     }
-    redraw.request();
 
     if progress >= 1.0 {
         // Eased progress is exactly 1.0 at the end for every curve, so the
@@ -4158,21 +4100,32 @@ mod single_plane_degrade_tests {
         warns.iter().filter(|warn| warn.contains(system)).count()
     }
 
-    fn base_resources(world: &mut World, mode: TerminalPresentationMode) {
-        world.spawn((
-            TerminalSurface::new(&AppConfig::default()).expect("surface construction is CPU-only"),
-            TerminalViewport {
-                size: Vec2::new(800.0, 480.0),
-                center: Vec2::ZERO,
-            },
-            TerminalPlaneWarp::default(),
-        ));
+    /// Spawns a dressed-enough seat (boot identity, ns 0) plus the shared
+    /// presentation resources, returning the seat for focusing.
+    fn base_resources(world: &mut World, mode: TerminalPresentationMode) -> Entity {
+        let seat = world
+            .spawn((
+                crate::identity::TerminalIdentity::test_boot(),
+                TerminalSurface::new(&AppConfig::default())
+                    .expect("surface construction is CPU-only"),
+                TerminalViewport {
+                    size: Vec2::new(800.0, 480.0),
+                    center: Vec2::ZERO,
+                },
+                TerminalPlaneWarp::default(),
+            ))
+            .id();
         world.insert_resource(TerminalPresentation { mode });
         world.init_resource::<Time>();
+        world.init_resource::<crate::focus::FocusedTerminal>();
+        world
+            .resource_mut::<crate::focus::FocusedTerminal>()
+            .set_for_test(Some(seat));
+        seat
     }
 
     #[test]
-    fn inline_sync_warns_once_when_the_plane_is_not_unique() {
+    fn inline_sync_warns_once_without_an_owned_plane() {
         // A real AssetServer resource is required for the system to run at
         // all; AssetPlugin::build constructs one without task pools and no
         // load is ever issued (app.update() is never called).
@@ -4181,11 +4134,15 @@ mod single_plane_degrade_tests {
         let world = app.world_mut();
         // The default last_viewport_size differs from the viewport below, so
         // needs_sync reports a full sync and the plane resolution is reached.
-        world.spawn(TerminalInlineObjects::default());
-        base_resources(world, TerminalPresentationMode::Flat2d);
+        let seat = base_resources(world, TerminalPresentationMode::Flat2d);
+        world
+            .entity_mut(seat)
+            .insert(TerminalInlineObjects::default());
         world.init_resource::<Assets<StandardMaterial>>();
         world.init_resource::<Assets<Image>>();
         world.init_resource::<Assets<Mesh>>();
+        // Planes exist but neither is owned by the focused seat — the
+        // owner join must never anchor to a foreign plane.
         world.spawn((TerminalPlane, Transform::default()));
         world.spawn((TerminalPlane, Transform::default()));
 
@@ -4206,10 +4163,10 @@ mod single_plane_degrade_tests {
     }
 
     #[test]
-    fn rgp_projection_warns_once_and_hides_without_a_unique_plane() {
+    fn rgp_projection_warns_once_and_hides_without_an_owned_plane() {
         let mut world = World::new();
         world.insert_resource(AppConfig::default());
-        base_resources(&mut world, TerminalPresentationMode::Plane3d);
+        let seat = base_resources(&mut world, TerminalPresentationMode::Plane3d);
         world.init_resource::<MobiusTransition>();
         let mut inline_objects = TerminalInlineObjects::default();
         inline_objects.anchors.insert(
@@ -4222,7 +4179,7 @@ mod single_plane_degrade_tests {
                 style: InlineStyle::default(),
             },
         );
-        world.spawn(inline_objects);
+        world.entity_mut(seat).insert(inline_objects);
         let object = world
             .spawn((
                 TerminalRgpObject { object_id: 1 },
@@ -4255,10 +4212,10 @@ mod single_plane_degrade_tests {
     }
 
     #[test]
-    fn viz_projection_warns_once_and_hides_without_a_unique_plane() {
+    fn viz_projection_warns_once_and_hides_without_an_owned_plane() {
         const ID: u32 = 0x8000_0001;
         let mut world = World::new();
-        base_resources(&mut world, TerminalPresentationMode::Plane3d);
+        let _seat = base_resources(&mut world, TerminalPresentationMode::Plane3d);
         world.init_resource::<MobiusTransition>();
         let mut registry = VizRegistry::default();
         registry.upsert(
@@ -4323,9 +4280,12 @@ mod single_plane_degrade_tests {
         let mut world = World::new();
         world.insert_resource(AppConfig::default());
         world.init_resource::<CursorSettings>();
-        world.init_resource::<crate::focus::FocusedTerminal>();
-        base_resources(&mut world, TerminalPresentationMode::Plane3d);
+        let seat = base_resources(&mut world, TerminalPresentationMode::Plane3d);
         world.init_resource::<MobiusTransition>();
+        // This test drives the no-focus path first.
+        world
+            .resource_mut::<crate::focus::FocusedTerminal>()
+            .set_for_test(None);
         let cursor = world
             .spawn((CursorModel, Transform::default(), Visibility::Visible))
             .id();
@@ -4354,10 +4314,6 @@ mod single_plane_degrade_tests {
 
         // Focus the dressed seat: 3D pose needs the seat's OWNED plane
         // anchor, and none exists — loud, once, hidden.
-        let seat = world
-            .query_filtered::<Entity, With<TerminalSurface>>()
-            .single(&world)
-            .expect("base_resources spawns one seat");
         let runtime =
             TerminalRuntime::virtual_channel(&config, crate::runtime::IngressSource::test_boot()).0;
         world.entity_mut(seat).insert(runtime);

@@ -237,6 +237,7 @@ impl TerminalSelection {
 #[derive(SystemParam)]
 pub struct MouseSystemParams<'w, 's> {
     primary_window: Query<'w, 's, (Entity, &'static Window), With<PrimaryWindow>>,
+    focus: Res<'w, crate::focus::FocusedTerminal>,
     runtime: Query<'w, 's, &'static mut TerminalRuntime>,
     terminal: Query<'w, 's, &'static TerminalSurface>,
     viewport: Query<'w, 's, &'static TerminalViewport>,
@@ -259,6 +260,7 @@ pub(crate) fn handle_mouse_input(
 ) {
     let MouseSystemParams {
         primary_window,
+        focus,
         runtime,
         terminal,
         viewport,
@@ -269,47 +271,26 @@ pub(crate) fn handle_mouse_input(
         selection,
         redraw,
     } = &mut params;
-    let terminal = match terminal.single() {
-        Ok(terminal) => terminal,
-        Err(err) => {
-            // Latched once per process: the surface lives on THE terminal
-            // seat, and the miss must name its system (#54's silent-.single()
-            // finding).
-            warn_once!("handle_mouse_input: the surface needs exactly one terminal seat: {err}");
-            return;
-        }
+    // Until cell picking lands (M4.6), the pointer addresses the FOCUSED
+    // terminal: selection, forwarding and wheel all resolve through the
+    // focus authority. Zero focused only happens with zero terminals —
+    // nothing to select, forward to, or orbit around — so the whole
+    // system no-ops (Flat2d N=1 behavior is byte-identical: the boot
+    // seat is focused by policy).
+    let Some(focused) = focus.get() else {
+        return;
     };
-    let viewport = match viewport.single() {
-        Ok(viewport) => viewport,
-        Err(err) => {
-            // Latched once per process: the viewport lives on THE terminal
-            // seat, and the miss must name its system (#54's silent-.single()
-            // finding).
-            warn_once!("handle_mouse_input: the viewport needs exactly one terminal seat: {err}");
-            return;
-        }
+    let Ok(terminal) = terminal.get(focused) else {
+        return;
     };
-    let mut runtime = match runtime.single_mut() {
-        Ok(runtime) => runtime,
-        Err(err) => {
-            // Latched once per process: the runtime lives on THE terminal
-            // seat, and the miss must name its system (#54's silent-.single()
-            // finding).
-            warn_once!("handle_mouse_input: the runtime needs exactly one terminal seat: {err}");
-            return;
-        }
+    let Ok(viewport) = viewport.get(focused) else {
+        return;
     };
-    let mut redraw = match redraw.single_mut() {
-        Ok(redraw) => redraw,
-        Err(err) => {
-            // Latched once per process: the redraw flag lives on THE terminal
-            // seat, and the miss must name its system (#54's silent-.single()
-            // finding).
-            warn_once!(
-                "handle_mouse_input: the redraw flag needs exactly one terminal seat: {err}"
-            );
-            return;
-        }
+    let Ok(mut runtime) = runtime.get_mut(focused) else {
+        return;
+    };
+    let Ok(mut redraw) = redraw.get_mut(focused) else {
+        return;
     };
     let Ok((primary_window, window)) = primary_window.single() else {
         return;

@@ -926,7 +926,10 @@ pub fn apply_viz_commands(
     mut registry: ResMut<VizRegistry>,
     mut acks: MessageWriter<AckOutcome>,
     mut diagnostics: DiagnosticsSink,
-    mut redraw: Query<&mut crate::terminal::TerminalRedrawState>,
+    mut seats: Query<(
+        &crate::identity::TerminalIdentity,
+        &mut crate::terminal::TerminalRedrawState,
+    )>,
 ) {
     // Chart-family kinds carry a vello underlay inside the terminal
     // texture, so any mutation that adds, replaces, or removes one must
@@ -940,18 +943,6 @@ pub fn apply_viz_commands(
                 | VizPayload::Timeline(_)
         )
     }
-    let mut redraw = match redraw.single_mut() {
-        Ok(redraw) => redraw,
-        Err(err) => {
-            // Latched once per process: the redraw flag lives on THE terminal
-            // seat, and the miss must name its system (#54's silent-.single()
-            // finding).
-            warn_once!(
-                "apply_viz_commands: the redraw flag needs exactly one terminal seat: {err}"
-            );
-            return;
-        }
-    };
     for AiCommand {
         source,
         ack_token,
@@ -1134,7 +1125,11 @@ pub fn apply_viz_commands(
                     None
                 };
                 let replaced_underlay = live.is_some_and(|entry| has_underlay(&entry.payload));
-                if replaced_underlay || has_underlay(&payload) {
+                if (replaced_underlay || has_underlay(&payload))
+                    && let Some((_, mut redraw)) = seats
+                        .iter_mut()
+                        .find(|(identity, _)| identity.id() == source.terminal())
+                {
                     redraw.request();
                 }
                 registry.upsert(id, payload, anchor);
@@ -1210,7 +1205,11 @@ pub fn apply_viz_commands(
                     .get(id)
                     .is_some_and(|entry| has_underlay(&entry.payload));
                 if registry.remove(id) {
-                    if removed_underlay {
+                    if removed_underlay
+                        && let Some((_, mut redraw)) = seats
+                            .iter_mut()
+                            .find(|(identity, _)| identity.id() == source.terminal())
+                    {
                         redraw.request();
                     }
                     ack_commit(&mut acks, *source, ack_token);
@@ -1231,7 +1230,11 @@ pub fn apply_viz_commands(
                     .iter()
                     .any(|(_, entry)| has_underlay(&entry.payload))
                 {
-                    redraw.request();
+                    // Reset clears every namespace's charts (reset is
+                    // global), so every seat's texture repaints.
+                    for (_, mut redraw) in seats.iter_mut() {
+                        redraw.request();
+                    }
                 }
                 registry.clear_all();
             }

@@ -37,6 +37,11 @@ pub struct StageTween {
     pub ease: RgpEase,
     /// Plane warp channel.
     pub warp: Option<StageChannel>,
+    /// The seat whose plane the warp channel drives (#52's split: warp is
+    /// per-terminal surface shape; the camera channels stay scene-side).
+    /// `None` with a live warp channel means the owning seat died — the
+    /// animator just skips the write.
+    pub warp_seat: Option<Entity>,
     /// Camera yaw channel.
     pub yaw: Option<StageChannel>,
     /// Camera pitch channel.
