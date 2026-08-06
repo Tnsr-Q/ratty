@@ -71,6 +71,21 @@ pub const TERMINAL_FOCUS_PER_SEC: u32 = 4;
 /// Wire-driven focus burst per arrival terminal.
 pub const TERMINAL_FOCUS_BURST: u32 = 8;
 
+/// Sustained wire-driven grid changes per second, per arrival terminal.
+///
+/// `term.place` is the most expensive verb in the family, not the
+/// cheapest: each accepted grid change reallocates both ratatui buffers
+/// over `cols × rows`, issues a PTY `SIGWINCH`, and — whenever the column
+/// count moves — serializes the whole screen, builds a fresh scrollback
+/// parser and re-processes it. The same argument that gives spawn and
+/// focus a budget applies here verbatim: the live cap bounds how many
+/// terminals exist, and nothing else bounds how fast a caller can churn
+/// one.
+pub const TERMINAL_PLACES_PER_SEC: u32 = 4;
+
+/// Wire-driven grid-change burst per arrival terminal.
+pub const TERMINAL_PLACE_BURST: u32 = 8;
+
 /// The live-terminal cap this config asks for, clamped to what the wire
 /// can address. A configured 0 would make the app unbootable and a
 /// configured 9999 would alias namespaces, so both ends are clamped
@@ -79,13 +94,39 @@ pub fn max_live_terminals(config: &crate::config::TerminalConfig) -> usize {
     config.max_live.clamp(1, MAX_LIVE_TERMINALS)
 }
 
-/// Whether a wire-requested grid is admissible: both axes within
+/// Whether a grid is admissible: both axes within
 /// [`MIN_TERMINAL_AXIS`]`..=`[`MAX_TERMINAL_AXIS`], and the area within
 /// [`MAX_TERMINAL_CELLS`].
 pub fn grid_is_admissible(cols: u16, rows: u16) -> bool {
     (MIN_TERMINAL_AXIS..=MAX_TERMINAL_AXIS).contains(&cols)
         && (MIN_TERMINAL_AXIS..=MAX_TERMINAL_AXIS).contains(&rows)
         && usize::from(cols) * usize::from(rows) <= MAX_TERMINAL_CELLS
+}
+
+/// Whether a wire *request* is admissible — holding only the axes the
+/// caller actually named to the ceiling.
+///
+/// The distinction matters because a window-fitted grid can legitimately
+/// sit outside the wire's bounds: `resize_to_fit` clamps only to
+/// `2..=u16::MAX` and the font-size chord shrinks cells with no upper
+/// floor on the resulting column count. Validating an inherited axis
+/// would make `term.place;rows=24` refuse on a wide window, citing a
+/// `cols` the caller never sent — and would turn an all-absent
+/// `term.place`, which is a documented vacuous commit, into a rejection.
+///
+/// The area check applies only when both axes are named, since that is
+/// the only case where the request alone determines the area.
+pub fn grid_is_admissible_request(cols: Option<u16>, rows: Option<u16>) -> bool {
+    let axis_ok = |axis: Option<u16>| {
+        axis.is_none_or(|value| (MIN_TERMINAL_AXIS..=MAX_TERMINAL_AXIS).contains(&value))
+    };
+    if !axis_ok(cols) || !axis_ok(rows) {
+        return false;
+    }
+    match (cols, rows) {
+        (Some(cols), Some(rows)) => usize::from(cols) * usize::from(rows) <= MAX_TERMINAL_CELLS,
+        _ => true,
+    }
 }
 
 /// Monotonic terminal identity (spine decision 2): never reused, never

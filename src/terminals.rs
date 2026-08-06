@@ -47,8 +47,8 @@ use bevy::ecs::message::{MessageReader, MessageWriter};
 use bevy::prelude::*;
 
 use crate::identity::{
-    TERMINAL_FOCUS_BURST, TERMINAL_FOCUS_PER_SEC, TERMINAL_SPAWN_BURST, TERMINAL_SPAWNS_PER_SEC,
-    TerminalId,
+    TERMINAL_FOCUS_BURST, TERMINAL_FOCUS_PER_SEC, TERMINAL_PLACE_BURST, TERMINAL_PLACES_PER_SEC,
+    TERMINAL_SPAWN_BURST, TERMINAL_SPAWNS_PER_SEC, TerminalId,
 };
 
 /// Where a terminal is in its wire-visible lifecycle. Callers poll this
@@ -146,6 +146,7 @@ pub struct TerminalRoster {
     /// their terminal.
     spawn_buckets: HashMap<TerminalId, TokenBucket>,
     focus_buckets: HashMap<TerminalId, TokenBucket>,
+    place_buckets: HashMap<TerminalId, TokenBucket>,
 }
 
 /// A token bucket over a per-terminal wire budget (the sound organ's
@@ -245,6 +246,11 @@ impl TerminalRoster {
     }
 
     /// Takes a spawn token for `arrival`, refilling by elapsed time.
+    ///
+    /// Unused on wasm, where `term.spawn` is unconditionally `unsupported`
+    /// and deliberately takes no token — a permanent refusal must not
+    /// degrade into `rate-limited` because a caller retried.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pub(crate) fn take_spawn_token(&mut self, arrival: TerminalId, now: f64) -> bool {
         self.spawn_buckets
             .entry(arrival)
@@ -260,6 +266,14 @@ impl TerminalRoster {
             .try_take(now)
     }
 
+    /// Takes a grid-change token for `arrival`, refilling by elapsed time.
+    pub(crate) fn take_place_token(&mut self, arrival: TerminalId, now: f64) -> bool {
+        self.place_buckets
+            .entry(arrival)
+            .or_insert_with(|| TokenBucket::new(now, TERMINAL_PLACE_BURST, TERMINAL_PLACES_PER_SEC))
+            .try_take(now)
+    }
+
     /// Despawn sweep: drops a dead terminal's row and budgets, and orphans
     /// every terminal it created.
     ///
@@ -272,6 +286,7 @@ impl TerminalRoster {
         self.rows.remove(&id);
         self.spawn_buckets.remove(&id);
         self.focus_buckets.remove(&id);
+        self.place_buckets.remove(&id);
         for row in self.rows.values_mut() {
             if row.creator == Some(id) {
                 row.creator = None;
@@ -363,8 +378,7 @@ pub fn terminals_state_items(
 
 /// Applies the `term.*` family.
 ///
-/// Every arm opens the same way, in this order and for reasons that do not
-/// commute:
+/// Every arm opens the same way, and the order does not commute:
 ///
 /// 1. **Wire origin.** A replayed `term.spawn` forks a process and a
 ///    replayed `term.close` kills a session someone is typing into, so
@@ -373,9 +387,14 @@ pub fn terminals_state_items(
 ///    family is control-plane, so nothing recordable can carry it).
 /// 2. **Capability.** Both gates default DENY, derived purely from
 ///    `(IngressSource, AppConfig)` — the wire can never grant itself one.
-/// 3. **Rate.** The live cap bounds how many terminals exist, not how fast
-///    they are made; one PTY chunk can carry arbitrarily many commands.
-/// 4. **Target resolution**, then ownership, then validation, then commit.
+/// 3. **Target resolution**, then ownership.
+/// 4. **Rate**, deliberately AFTER ownership on the targeted verbs, so a
+///    refusal the caller was never entitled to costs it no budget. The
+///    live cap bounds how many terminals exist, not how fast a caller may
+///    churn them, and one PTY chunk can carry arbitrarily many commands.
+///    (`term.spawn` has no target, so its budget is taken at admission,
+///    inside the native spawner.)
+/// 5. **Validation**, then commit.
 #[allow(clippy::too_many_arguments)]
 pub fn apply_terminal_commands(
     mut commands: MessageReader<crate::ai::AiCommand>,
@@ -487,18 +506,19 @@ pub fn apply_terminal_commands(
                     );
                     continue;
                 }
-                if !spawn.roster.take_spawn_token(source.terminal(), now) {
-                    reject!(
-                        "term.spawn",
-                        codes::RATE_LIMITED,
-                        "spawn rate budget exhausted ({} per second, burst {}); the live \
-                         cap bounds how many terminals exist, this bounds how fast",
-                        crate::identity::TERMINAL_SPAWNS_PER_SEC,
-                        crate::identity::TERMINAL_SPAWN_BURST
-                    );
-                    continue;
-                }
-                spawn_from_wire(&mut spawn, *source, ack_token, &mut acks, &mut diagnostics);
+                // The budget is taken inside the native path, not here:
+                // on wasm the verb is unconditionally `unsupported`, and a
+                // permanent refusal must never degrade into
+                // `rate-limited` on the fifth attempt — same command, same
+                // grant, two codes decided by invisible bucket state.
+                spawn_from_wire(
+                    &mut spawn,
+                    *source,
+                    ack_token,
+                    &mut acks,
+                    &mut diagnostics,
+                    now,
+                );
             }
             RattyAiCommand::TermPlace {
                 id,
@@ -567,22 +587,46 @@ pub fn apply_terminal_commands(
                 };
                 // Absent keys keep their current value — naming only
                 // `cols` must not silently reset `rows`.
-                let next_cols = cols.unwrap_or_else(|| surface.cols);
-                let next_rows = rows.unwrap_or_else(|| surface.rows);
-                if !crate::identity::grid_is_admissible(next_cols, next_rows) {
+                let next_cols = cols.unwrap_or(surface.cols);
+                let next_rows = rows.unwrap_or(surface.rows);
+                // Only the axes the CALLER named are held to the wire
+                // ceiling. A window-fitted grid can legitimately sit
+                // outside it — `resize_to_fit` clamps only to
+                // `2..=u16::MAX` and the font-size chord has no upper
+                // floor — so validating an inherited axis would make
+                // `term.place;rows=24` self-deny on a large window, citing
+                // a `cols` the caller never sent, and would turn the
+                // documented vacuous commit into `bad-command`.
+                if !crate::identity::grid_is_admissible_request(*cols, *rows) {
                     reject!(
                         "term.place",
                         codes::BAD_COMMAND,
-                        "grid {next_cols}x{next_rows} is outside {}..={} per axis or over \
-                         {} cells; vt100 underflows below two and a wire-chosen grid \
-                         becomes a CPU-side image",
+                        "requested grid is outside {}..={} per axis or over {} cells; vt100 \
+                         underflows below two and a wire-chosen grid becomes a CPU-side image",
                         crate::identity::MIN_TERMINAL_AXIS,
                         crate::identity::MAX_TERMINAL_AXIS,
                         crate::identity::MAX_TERMINAL_CELLS
                     );
                     continue;
                 }
-                if cols.is_some() || rows.is_some() {
+                // A grid change is the family's MOST expensive verb, not
+                // its cheapest: two buffer reallocations, a SIGWINCH, and
+                // — when the column count moves — a full screen
+                // serialization plus a fresh scrollback parser. Budgeted
+                // after ownership so a refused command burns nothing, and
+                // skipped entirely when the grid would not move.
+                let would_move = next_cols != surface.cols || next_rows != surface.rows;
+                if would_move && !spawn.roster.take_place_token(source.terminal(), now) {
+                    reject!(
+                        "term.place",
+                        codes::RATE_LIMITED,
+                        "grid-change budget exhausted ({} per second, burst {})",
+                        TERMINAL_PLACES_PER_SEC,
+                        TERMINAL_PLACE_BURST
+                    );
+                    continue;
+                }
+                if would_move {
                     // The window-resize path, narrowed to one seat. Every
                     // step matters: skip `sync_terminal_layout` and the 3D
                     // planes render the new grid at the old logical size
@@ -621,9 +665,13 @@ pub fn apply_terminal_commands(
                         continue;
                     }
                 };
-                // Creator scope on the handle-carrying form (#49 §2/§8):
-                // the bare form targets self and needs only the grant.
-                if id.is_some()
+                // Creator scope (#49 §2/§8), keyed on the TARGET rather
+                // than on whether `id=` was written: naming your own
+                // handle must mean exactly what the bare form means, or
+                // the same terminal answers `ok` and `not-owner` to two
+                // spellings of one request. Self needs only the grant;
+                // anything else needs creator match.
+                if target != source.terminal()
                     && let Err(message) = require_creator(&spawn.roster, *source, target)
                 {
                     reject!("term.focus", codes::NOT_OWNER, "{message}");
@@ -842,10 +890,34 @@ fn spawn_from_wire(
     ack_token: &Option<String>,
     acks: &mut MessageWriter<crate::query_channel::AckOutcome>,
     diagnostics: &mut crate::query_channel::DiagnosticsSink,
+    now: f64,
 ) {
     use crate::query::codes;
     use crate::query_channel::ack_commit_with_payload;
     use crate::scene::SpawnTerminalError;
+
+    // The live cap bounds how many terminals exist; this bounds how fast
+    // they are made. Closes are deferred a frame and one PTY chunk can
+    // carry arbitrarily many commands, so a spawn/close cycle would
+    // otherwise fork processes at frame rate without ever exceeding it.
+    if !spawn.roster.take_spawn_token(source.terminal(), now) {
+        let message = format!(
+            "spawn rate budget exhausted ({} per second, burst {})",
+            crate::identity::TERMINAL_SPAWNS_PER_SEC,
+            crate::identity::TERMINAL_SPAWN_BURST
+        );
+        warn!("ratty-term: term.spawn rejected: {message}");
+        crate::query_channel::reject(
+            diagnostics,
+            acks,
+            source,
+            ack_token,
+            "term.spawn",
+            codes::RATE_LIMITED,
+            message,
+        );
+        return;
+    }
 
     let config = spawn.app_config.as_ref().clone();
     // The creator is the ARRIVAL terminal's id, never its namespace: the
@@ -921,7 +993,11 @@ fn spawn_from_wire(
     ack_token: &Option<String>,
     acks: &mut MessageWriter<crate::query_channel::AckOutcome>,
     diagnostics: &mut crate::query_channel::DiagnosticsSink,
+    _now: f64,
 ) {
+    // Deliberately takes no rate token: the refusal below is permanent on
+    // this target, and a permanent `unsupported` must never become
+    // `rate-limited` because a caller retried.
     crate::query_channel::reject(
         diagnostics,
         acks,
@@ -1092,6 +1168,15 @@ mod tests {
         &acks[0]
     }
 
+    fn handle_of(world: &World, id: TerminalId) -> String {
+        world
+            .resource::<TerminalRoster>()
+            .row(id)
+            .expect("the terminal has a row")
+            .handle
+            .clone()
+    }
+
     /// M4.5's exit criterion (#58) as one executable story: the `term.*`
     /// family driven through the real systems, from a stock deny-by-default
     /// config to a drained roster, with every locked decision it proves
@@ -1113,14 +1198,6 @@ mod tests {
         world.init_resource::<crate::bookmarks::PendingBookmarkJumps>();
         world.init_resource::<crate::ai::AiObjectRegistry>();
 
-        let handle_of = |world: &World, id: TerminalId| {
-            world
-                .resource::<TerminalRoster>()
-                .row(id)
-                .expect("row")
-                .handle
-                .clone()
-        };
         let identity_of = |world: &World, id: TerminalId| {
             *world
                 .get::<TerminalIdentity>(
@@ -1419,6 +1496,50 @@ mod tests {
             handle_of(&world, boot.id()),
             "and the handle is fresh"
         );
+    }
+
+    /// The deferral edge, asserted against the REAL schedule rather than a
+    /// hand-run system order.
+    ///
+    /// `despawn_closed_terminals` must run after `answer_queries`, because
+    /// `answer_queries` writes each reply into the ARRIVAL terminal's own
+    /// transport and drops it with a warn once that terminal is gone. Every
+    /// other close test drives the drain by hand, so flipping this edge to
+    /// `.before(...)` would leave them all green while making every
+    /// self-close in production eat its own ack. This test is the only
+    /// thing that would go red.
+    #[test]
+    fn the_close_deferral_edge_is_in_the_real_schedule() {
+        use bevy::ecs::schedule::Schedule;
+
+        let mut world = World::new();
+        let mut schedule = Schedule::default();
+
+        // The real registration, verbatim — this is the thing under test.
+        schedule.add_systems(
+            despawn_closed_terminals
+                .after(crate::query_channel::answer_queries)
+                .run_if(|pending: Res<PendingTerminalCloses>| !pending.0.is_empty()),
+        );
+        schedule.add_systems(crate::query_channel::answer_queries);
+
+        // The probe: a no-op that must sit strictly between them. It can
+        // only be scheduled if the despawn genuinely runs AFTER the query
+        // channel; flipping the real edge to `.before(answer_queries)`
+        // makes these three constraints a cycle, and the build below
+        // fails. Every other close test hand-runs the drain, so without
+        // this one that flip stays green while making every self-close in
+        // production eat the ack it just committed.
+        fn probe() {}
+        schedule.add_systems(
+            probe
+                .after(crate::query_channel::answer_queries)
+                .before(despawn_closed_terminals),
+        );
+
+        schedule
+            .initialize(&mut world)
+            .expect("the deferral edge orders the drain after the query channel");
     }
 
     #[test]
@@ -1780,6 +1901,229 @@ mod tests {
             (surface.cols, surface.rows),
             (80, 24),
             "a refused command commits none of its fields"
+        );
+    }
+
+    /// `term.place` is creator-scoped like the other targeted verbs: a
+    /// granted caller cannot resize a terminal it did not create. Without
+    /// this the verb would be a cross-agent PTY resize primitive.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn place_refuses_a_terminal_the_caller_did_not_create() {
+        let (mut world, boot) = organ_world();
+        grant(&mut world, true, false);
+        // Boot spawns X; X spawns Y. Y is X's, not boot's.
+        let acks = wire(&mut world, boot.ingress(), spawn_command());
+        let x_handle = only_ack(&acks).payload.as_ref().expect("payload")["id"]
+            .as_str()
+            .expect("handle")
+            .to_string();
+        let x = world
+            .resource::<TerminalRoster>()
+            .by_handle(&x_handle)
+            .expect("live");
+        let x_identity = *world
+            .get::<TerminalIdentity>(
+                world
+                    .resource::<TerminalRegistry>()
+                    .entity_of(x)
+                    .expect("bound"),
+            )
+            .expect("identity");
+        let acks = wire(&mut world, x_identity.ingress(), spawn_command());
+        let y_handle = only_ack(&acks).payload.as_ref().expect("payload")["id"]
+            .as_str()
+            .expect("handle")
+            .to_string();
+
+        let place_y = |world: &mut World, source| {
+            wire(
+                world,
+                source,
+                RattyAiCommand::TermPlace {
+                    id: Some(y_handle.clone()),
+                    x: None,
+                    y: None,
+                    scale: None,
+                    cols: Some(70),
+                    rows: None,
+                },
+            )
+        };
+
+        // Boot is Y's grandparent, not its creator.
+        let acks = place_y(&mut world, boot.ingress());
+        let ack = only_ack(&acks);
+        assert!(!ack.ok);
+        assert_eq!(ack.code, Some(codes::NOT_OWNER));
+
+        // Y's actual creator may.
+        let acks = place_y(&mut world, x_identity.ingress());
+        assert!(only_ack(&acks).ok, "the creator resizes its creation");
+    }
+
+    /// Naming your own handle means exactly what the bare form means, on
+    /// every targeted verb. A request must never change verdict because of
+    /// how it was spelled.
+    #[test]
+    fn the_self_handle_form_matches_the_bare_form_on_every_verb() {
+        let (mut world, boot) = organ_world();
+        grant(&mut world, true, true);
+        let own = handle_of(&world, boot.id());
+
+        for (bare, named) in [
+            (
+                RattyAiCommand::TermFocus { id: None },
+                RattyAiCommand::TermFocus {
+                    id: Some(own.clone()),
+                },
+            ),
+            (
+                RattyAiCommand::TermPlace {
+                    id: None,
+                    x: None,
+                    y: None,
+                    scale: None,
+                    cols: None,
+                    rows: None,
+                },
+                RattyAiCommand::TermPlace {
+                    id: Some(own.clone()),
+                    x: None,
+                    y: None,
+                    scale: None,
+                    cols: None,
+                    rows: None,
+                },
+            ),
+            (
+                // Boot is creator-less, so close refuses BOTH spellings —
+                // agreeing is the property, not the verdict.
+                RattyAiCommand::TermClose { id: None },
+                RattyAiCommand::TermClose {
+                    id: Some(own.clone()),
+                },
+            ),
+        ] {
+            let bare_ack = only_ack(&wire(&mut world, boot.ingress(), bare.clone())).clone();
+            let named_ack = only_ack(&wire(&mut world, boot.ingress(), named.clone())).clone();
+            assert_eq!(bare_ack.ok, named_ack.ok, "{bare:?} vs {named:?}");
+            assert_eq!(bare_ack.code, named_ack.code, "{bare:?} vs {named:?}");
+        }
+    }
+
+    /// The grid budget bounds the family's most expensive verb, refills
+    /// with elapsed time, and is not spent by a place that would not move
+    /// the grid.
+    #[test]
+    fn the_place_budget_bounds_churn_refills_and_spares_no_op_places() {
+        let (mut world, boot) = organ_world();
+        grant(&mut world, true, false);
+        let place = |world: &mut World, cols| {
+            wire(
+                world,
+                boot.ingress(),
+                RattyAiCommand::TermPlace {
+                    id: None,
+                    x: None,
+                    y: None,
+                    scale: None,
+                    cols,
+                    rows: None,
+                },
+            )
+        };
+
+        // Alternating widths so every command genuinely moves the grid —
+        // the expensive path, which is what the budget is for.
+        for attempt in 0..TERMINAL_PLACE_BURST {
+            let cols = if attempt % 2 == 0 { 80 } else { 81 };
+            assert!(
+                only_ack(&place(&mut world, Some(cols))).ok,
+                "attempt {attempt} is within the burst"
+            );
+        }
+        let ack = only_ack(&place(&mut world, Some(120))).clone();
+        assert!(!ack.ok);
+        assert_eq!(ack.code, Some(codes::RATE_LIMITED));
+
+        // A place that would not move the grid costs nothing, even with
+        // the bucket empty: it does no work to bound.
+        let settled = world
+            .get::<crate::terminal::TerminalSurface>(
+                world
+                    .resource::<TerminalRegistry>()
+                    .entity_of(boot.id())
+                    .expect("bound"),
+            )
+            .expect("surface")
+            .cols;
+        assert!(only_ack(&place(&mut world, Some(settled))).ok);
+        assert!(
+            only_ack(&place(&mut world, None)).ok,
+            "and the vacuous commit stays free"
+        );
+
+        // Time refills it — the branch nothing else in this suite runs.
+        world
+            .resource_mut::<Time>()
+            .advance_by(std::time::Duration::from_secs(2));
+        assert!(
+            only_ack(&place(&mut world, Some(120))).ok,
+            "the budget refills"
+        );
+    }
+
+    /// Budgets are per arrival terminal: one caller cannot spend another's.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn rate_budgets_are_per_arrival_terminal() {
+        let (mut world, boot) = organ_world();
+        grant(&mut world, true, true);
+        let acks = wire(&mut world, boot.ingress(), spawn_command());
+        let child_handle = only_ack(&acks).payload.as_ref().expect("payload")["id"]
+            .as_str()
+            .expect("handle")
+            .to_string();
+        let child = world
+            .resource::<TerminalRoster>()
+            .by_handle(&child_handle)
+            .expect("live");
+        let child_identity = *world
+            .get::<TerminalIdentity>(
+                world
+                    .resource::<TerminalRegistry>()
+                    .entity_of(child)
+                    .expect("bound"),
+            )
+            .expect("identity");
+
+        // Boot drains its own focus budget.
+        for _ in 0..TERMINAL_FOCUS_BURST {
+            wire(
+                &mut world,
+                boot.ingress(),
+                RattyAiCommand::TermFocus { id: None },
+            );
+        }
+        assert_eq!(
+            only_ack(&wire(
+                &mut world,
+                boot.ingress(),
+                RattyAiCommand::TermFocus { id: None }
+            ))
+            .code,
+            Some(codes::RATE_LIMITED)
+        );
+        // The child's is untouched.
+        assert!(
+            only_ack(&wire(
+                &mut world,
+                child_identity.ingress(),
+                RattyAiCommand::TermFocus { id: None }
+            ))
+            .ok,
+            "one caller cannot spend another's budget"
         );
     }
 

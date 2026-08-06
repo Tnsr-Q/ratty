@@ -106,11 +106,13 @@ recycled slot's next tenant would inherit the relationship (#56 decision
 17, the stamp rule). On the wire that field renders as the creator's
 *current* namespace ordinal, resolved at read time.
 
-- Handle-carrying `term.place` / `term.focus` / `term.close` require
-  creator match.
-- Bare forms target the arrival terminal and need only the capability —
-  except `term.close`, which refuses creator-less rows even from their own
-  ingress (that is the wire-unkillable clause).
+- Addressing a terminal **other than the caller's own** requires creator
+  match, on `term.place` / `term.focus` / `term.close` alike.
+- Targeting the arrival terminal needs only the capability, and the bare
+  form and the caller's own handle mean exactly the same thing — a request
+  never changes verdict because of how it was spelled.
+- `term.close` is the exception: it refuses creator-less rows even from
+  their own ingress (that is the wire-unkillable clause).
 - **Orphans**: a creator's death does **not** cascade-close its children —
   they are principals in their own right, possibly with a user inside.
   Their `creator` is cleared instead, which makes them wire-unaddressable
@@ -144,6 +146,7 @@ spawn; there is no `term.cancel`.
 | Grid area | 100 000 cells | The per-axis ceiling alone still admits 262 144 |
 | Spawns | 1/s, burst 4 | Per arrival terminal |
 | Focus moves | 4/s, burst 8 | Per arrival terminal |
+| Grid changes | 4/s, burst 8 | Per arrival terminal; a place that would not move the grid is free |
 
 The live cap binds **every** spawn path — the `Ctrl+Alt+T` chord and the
 wire alike — because it is checked at the single allocation site. Raising
@@ -153,7 +156,13 @@ own font stack and CPU-side texture today.
 The rate budgets exist because the cap bounds *concurrency*, not *rate*:
 closes are deferred a frame and one PTY chunk can carry arbitrarily many
 commands, so a spawn/close cycle would otherwise fork processes at frame
-rate while never exceeding the cap.
+rate while never exceeding the cap. `term.place` is budgeted for the same
+reason and is the most expensive verb of the three — each accepted grid
+change reallocates two buffers, issues a `SIGWINCH`, and when the column
+count moves rebuilds the scrollback parser from a serialized screen.
+
+The targeted verbs take their budget **after** the ownership check, so a
+refusal the caller was never entitled to costs it nothing.
 
 ## Errors
 

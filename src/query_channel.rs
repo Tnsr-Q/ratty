@@ -790,6 +790,7 @@ fn caps(ctx: &QueryCtx<'_>, source: IngressSource) -> Value {
             "sound_plays_per_sec": crate::sound::SOUND_PLAYS_PER_SEC,
             "terminal_spawns_per_sec": crate::identity::TERMINAL_SPAWNS_PER_SEC,
             "terminal_focus_per_sec": crate::identity::TERMINAL_FOCUS_PER_SEC,
+            "terminal_places_per_sec": crate::identity::TERMINAL_PLACES_PER_SEC,
             "terminal_min_axis": crate::identity::MIN_TERMINAL_AXIS,
             "terminal_max_axis": crate::identity::MAX_TERMINAL_AXIS,
             "terminal_max_cells": crate::identity::MAX_TERMINAL_CELLS,
@@ -838,7 +839,15 @@ fn caps(ctx: &QueryCtx<'_>, source: IngressSource) -> Value {
             "live": ctx.terminals.len(),
             "max": crate::identity::max_live_terminals(&ctx.config.terminal),
             "pool": crate::identity::MAX_LIVE_TERMINALS,
-            "verbs": ["spawn", "place", "focus", "close"],
+            // `spawn` is absent on wasm, where the page API owns terminal
+            // lifecycle and the verb can never commit. Advertising a verb
+            // that always answers `unsupported` would be the one place
+            // this organ's own honesty contract went unapplied.
+            "verbs": if cfg!(target_arch = "wasm32") {
+                &["place", "focus", "close"][..]
+            } else {
+                &["spawn", "place", "focus", "close"][..]
+            },
             "spawn_fields": [],
             "place_fields": ["cols", "rows"],
         },
@@ -1513,6 +1522,38 @@ mod tests {
             .resource_mut::<crate::terminals::TerminalRoster>()
             .insert(identity.id(), handle.clone(), creator, creator.is_some());
         (identity, host, handle)
+    }
+
+    /// Terminals are not panes (#22): the #57 pane-0 contract holds until
+    /// #86 ships, no matter how many terminals are live.
+    ///
+    /// This is the tripwire the `caps` comment promises. The risk it
+    /// guards is a well-meaning change — someone reading `"panes": 1`
+    /// beside a live terminal count and "fixing" it — so the assertion
+    /// must run with N>1, which the single-seat `caps` tests cannot do.
+    #[test]
+    fn caps_panes_stays_one_with_two_live_terminals() {
+        let (mut app, host) = test_app();
+        let (_id_b, _host_b, _handle_b) = add_seat(&mut app, None);
+        assert_eq!(
+            app.world_mut()
+                .query::<&crate::identity::TerminalIdentity>()
+                .iter(app.world())
+                .count(),
+            2,
+            "seat count asserted (#58 rider)"
+        );
+        let caps = payload(&run_query(&mut app, &host, "q1", "caps", None));
+        assert_eq!(
+            caps["terminals"]["live"],
+            json!(2),
+            "the roster genuinely sees two — otherwise the panes assert proves nothing"
+        );
+        assert_eq!(
+            caps["panes"],
+            json!(1),
+            "terminals are not panes; the #57 pane-0 contract is unmoved by N"
+        );
     }
 
     /// The M4.5 closed loop on real bytes: one PTY chunk carrying the
@@ -2699,8 +2740,6 @@ mod tests {
             caps["limits"]["terminal_max_axis"],
             json!(crate::identity::MAX_TERMINAL_AXIS)
         );
-        // Terminals are not panes (#22): the #57 pane-0 contract holds
-        // until #86 ships, no matter how many terminals are live.
         assert_eq!(caps["panes"], json!(1));
         assert_eq!(
             caps["limits"]["avatar_text_bytes"],
