@@ -26,6 +26,68 @@ use bevy::ecs::resource::Resource;
 /// `u8`.
 const MAX_NAMESPACE: u8 = 0x7F;
 
+/// The hard ceiling on live terminals: one per namespace slot, and the
+/// wire masks object ids with `& 0x7F`. `[terminal] max_live` is clamped
+/// to this; no configuration can exceed it without aliasing every
+/// allocation above 127.
+pub const MAX_LIVE_TERMINALS: usize = MAX_NAMESPACE as usize + 1;
+
+/// The smallest grid vt100 can drive. Below two columns its wide-character
+/// wrap logic underflows (`cols - width` for a 2-cell glyph), and below two
+/// rows its wrap/scroll bookkeeping does (`prev_row - scrolled`) — the same
+/// floor [`crate::terminal::TerminalSurface::resize_to_fit`] clamps to.
+pub const MIN_TERMINAL_AXIS: u16 = 2;
+
+/// The largest grid a wire caller may ask for on either axis.
+///
+/// `TerminalSurface::resize` guards only zero, so `u16` is the only other
+/// bound — and `u16` is not a bound: a grid is a `cols × rows` buffer of
+/// ratatui cells whose texture becomes a CPU-side `w × h × 4` image, so
+/// `cols=65535` is tens of gigabytes from one OSC sequence. A window can
+/// never reach these sizes; the wire can, which is why the ceiling lives
+/// here rather than in the resize path.
+pub const MAX_TERMINAL_AXIS: u16 = 512;
+
+/// The largest cell count a wire caller may ask for. The per-axis ceiling
+/// alone still admits 512×512 — 262 144 cells, an order of magnitude past
+/// any real terminal — so the area is bounded too.
+pub const MAX_TERMINAL_CELLS: usize = 100_000;
+
+/// Sustained wire-driven spawns per second, per arrival terminal (the
+/// token-bucket refill rate). The live cap bounds concurrency, not rate:
+/// closes are deferred a frame and one PTY chunk can carry arbitrarily
+/// many commands, so a spawn/close cycle would otherwise fork processes at
+/// frame rate while never exceeding the cap.
+pub const TERMINAL_SPAWNS_PER_SEC: u32 = 1;
+
+/// Wire-driven spawn burst per arrival terminal (the bucket capacity).
+pub const TERMINAL_SPAWN_BURST: u32 = 4;
+
+/// Sustained wire-driven focus moves per second, per arrival terminal.
+/// Without a budget a granted caller wins every frame the user does not
+/// act, which is keystroke capture by attrition rather than by grant.
+pub const TERMINAL_FOCUS_PER_SEC: u32 = 4;
+
+/// Wire-driven focus burst per arrival terminal.
+pub const TERMINAL_FOCUS_BURST: u32 = 8;
+
+/// The live-terminal cap this config asks for, clamped to what the wire
+/// can address. A configured 0 would make the app unbootable and a
+/// configured 9999 would alias namespaces, so both ends are clamped
+/// rather than rejected.
+pub fn max_live_terminals(config: &crate::config::TerminalConfig) -> usize {
+    config.max_live.clamp(1, MAX_LIVE_TERMINALS)
+}
+
+/// Whether a wire-requested grid is admissible: both axes within
+/// [`MIN_TERMINAL_AXIS`]`..=`[`MAX_TERMINAL_AXIS`], and the area within
+/// [`MAX_TERMINAL_CELLS`].
+pub fn grid_is_admissible(cols: u16, rows: u16) -> bool {
+    (MIN_TERMINAL_AXIS..=MAX_TERMINAL_AXIS).contains(&cols)
+        && (MIN_TERMINAL_AXIS..=MAX_TERMINAL_AXIS).contains(&rows)
+        && usize::from(cols) * usize::from(rows) <= MAX_TERMINAL_CELLS
+}
+
 /// Monotonic terminal identity (spine decision 2): never reused, never
 /// recycled. Starts at 1 so a zeroed value can never alias a live terminal.
 ///
@@ -264,6 +326,18 @@ impl TerminalRegistry {
     pub fn namespace_of(&self, id: TerminalId) -> Option<u8> {
         self.live.get(&id).map(|live| live.namespace)
     }
+
+    /// How many terminals hold a lease right now — the number the live
+    /// cap is checked against.
+    ///
+    /// Deliberately the lease count and not a seat-entity query: leases
+    /// mutate synchronously inside [`Self::allocate`] and [`Self::release`]
+    /// while seat entities are deferred `Commands`, so a query-based count
+    /// reads stale mid-batch and two spawns in one PTY chunk would both
+    /// pass a cap they jointly exceed.
+    pub fn live_count(&self) -> usize {
+        self.live.len()
+    }
 }
 
 #[cfg(test)]
@@ -327,6 +401,62 @@ mod tests {
             ))),
             "an id the registry never minted errors"
         );
+    }
+
+    #[test]
+    fn the_live_cap_clamps_to_what_the_wire_can_address() {
+        let mut config = crate::config::TerminalConfig::default();
+        assert_eq!(config.max_live, 4, "the shipped default (#56 decision 2)");
+        assert_eq!(max_live_terminals(&config), 4);
+        // A zero cap would make the app unbootable; a huge one would alias
+        // namespaces above 127. Both ends clamp rather than reject.
+        config.max_live = 0;
+        assert_eq!(max_live_terminals(&config), 1);
+        config.max_live = 9_999;
+        assert_eq!(max_live_terminals(&config), MAX_LIVE_TERMINALS);
+        assert_eq!(MAX_LIVE_TERMINALS, 128);
+
+        // Additive for existing user configs: naming the new key leaves
+        // every neighbor at its default, and omitting it is the default.
+        let parsed = crate::config::AppConfig::from_toml_str("[terminal]\nmax_live = 1\n")
+            .expect("the terminal section parses");
+        assert_eq!(parsed.terminal.max_live, 1);
+        assert_eq!(parsed.terminal.default_cols, 104);
+        assert_eq!(parsed.terminal.scrollback, 2_000);
+        let bare = crate::config::AppConfig::from_toml_str("[terminal]\ndefault_cols = 80\n")
+            .expect("an existing config without the key still parses");
+        assert_eq!(bare.terminal.max_live, 4);
+    }
+
+    #[test]
+    fn the_grid_ceiling_bounds_both_axes_and_the_area() {
+        assert!(grid_is_admissible(80, 24));
+        assert!(grid_is_admissible(MIN_TERMINAL_AXIS, MIN_TERMINAL_AXIS));
+        assert!(grid_is_admissible(MAX_TERMINAL_AXIS, 24));
+        // vt100 underflows below two on either axis.
+        assert!(!grid_is_admissible(1, 24));
+        assert!(!grid_is_admissible(80, 1));
+        assert!(!grid_is_admissible(0, 0));
+        // A `u16` is not a bound: the grid becomes a CPU-side image.
+        assert!(!grid_is_admissible(MAX_TERMINAL_AXIS + 1, 24));
+        assert!(!grid_is_admissible(80, MAX_TERMINAL_AXIS + 1));
+        assert!(!grid_is_admissible(u16::MAX, u16::MAX));
+        // The per-axis ceiling alone still admits 262 144 cells, so the
+        // area is bounded separately.
+        assert!(!grid_is_admissible(MAX_TERMINAL_AXIS, MAX_TERMINAL_AXIS));
+    }
+
+    #[test]
+    fn live_count_tracks_leases_not_entities() {
+        let mut registry = TerminalRegistry::default();
+        assert_eq!(registry.live_count(), 0);
+        let a = registry.allocate().expect("slot 0");
+        let _b = registry.allocate().expect("slot 1");
+        // Counted at allocate, before any seat entity exists — the cap
+        // must hold within a single command batch.
+        assert_eq!(registry.live_count(), 2);
+        registry.release(a.id()).expect("a is live");
+        assert_eq!(registry.live_count(), 1);
     }
 
     #[test]

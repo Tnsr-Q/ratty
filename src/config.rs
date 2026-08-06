@@ -187,6 +187,13 @@ pub struct TerminalConfig {
     pub default_rows: u16,
     /// Scrollback line count.
     pub scrollback: usize,
+    /// Live terminal cap (#56 decision 2): how many terminals may exist
+    /// at once, across every spawn path. Clamped to `1..=128` at read
+    /// time — 128 is the wire's hard ceiling, since object ids carry the
+    /// agent namespace in seven bits. Raising it past 4 is gated on the
+    /// shared parley `FontContext`: every live terminal carries its own
+    /// font stack and CPU-side texture today.
+    pub max_live: usize,
 }
 
 impl Default for TerminalConfig {
@@ -195,6 +202,7 @@ impl Default for TerminalConfig {
             default_cols: 104,
             default_rows: 32,
             scrollback: 2_000,
+            max_live: 4,
         }
     }
 }

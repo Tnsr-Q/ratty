@@ -8,6 +8,12 @@ opacity = 0.8
 default_cols = 104
 default_rows = 32
 scrollback = 2000
+# How many terminals may live at once, across every spawn path (the
+# Ctrl+Alt+T chord and the wire's term.spawn alike). Clamped to 1..=128 —
+# 128 is the protocol's hard ceiling, since object ids carry the agent
+# namespace in seven bits. Raising this past 4 waits on a shared font
+# context: every live terminal carries its own font stack today.
+max_live = 4
 
 # [shell]
 # program = "/bin/bash" 

@@ -567,6 +567,16 @@ pub(crate) fn dress_terminal_seat(
 /// Failure modes of [`spawn_terminal`].
 #[derive(Debug)]
 pub enum SpawnTerminalError<E> {
+    /// The configured live cap (`[terminal] max_live`) is full. Distinct
+    /// from [`Self::Alloc`]: this is an operator budget that can be
+    /// raised, that one is the protocol's hard wall. Both answer the wire
+    /// with `terminal-cap` — the caller's remedy is the same either way.
+    LiveCap {
+        /// Terminals live when the spawn was refused.
+        live: usize,
+        /// The cap in force.
+        cap: usize,
+    },
     /// The 128-slot namespace pool is exhausted — reported explicitly,
     /// never masked by minting past the wire's `& 0x7F` width.
     Alloc(crate::identity::TerminalAllocError),
@@ -594,12 +604,25 @@ pub enum SpawnTerminalError<E> {
 ///
 /// # Errors
 ///
+/// [`SpawnTerminalError::LiveCap`] when `[terminal] max_live` is full;
 /// [`SpawnTerminalError::Alloc`] on pool exhaustion;
 /// [`SpawnTerminalError::Build`] when `build` fails (lease restored).
 pub fn spawn_terminal<E>(
     params: &mut TerminalSpawnParams,
     build: impl FnOnce(IngressSource) -> Result<(TerminalSurface, TerminalRuntime), E>,
 ) -> Result<(Entity, TerminalIdentity), SpawnTerminalError<E>> {
+    // The cap binds every spawn path — the chord and the wire alike —
+    // because this is the one place a seat is created. Checked BEFORE the
+    // lease so a refusal needs no rollback and adds no release site; the
+    // despawn sweep stays the only one. It cannot live inside
+    // `TerminalRegistry::allocate`: main()/start() call that directly to
+    // mint the boot identity, and a cap there would have to special-case
+    // the boot terminal.
+    let cap = crate::identity::max_live_terminals(&params.app_config.terminal);
+    let live = params.terminals.live_count();
+    if live >= cap {
+        return Err(SpawnTerminalError::LiveCap { live, cap });
+    }
     let identity = params
         .terminals
         .allocate()
@@ -1222,6 +1245,80 @@ mod tests {
             ))
         })
         .expect("the scaffold spawn succeeds")
+    }
+
+    /// The live cap binds at the one allocation site, so every spawn path
+    /// honors it — the chord and M4.5's wire loop alike. A refusal costs
+    /// nothing: no lease is taken and no `TerminalId` is burned.
+    #[test]
+    fn the_live_cap_refuses_at_the_allocation_site_and_costs_nothing() {
+        use bevy::ecs::system::RunSystemOnce;
+
+        fn try_spawn(
+            mut params: TerminalSpawnParams,
+        ) -> Result<(Entity, TerminalIdentity), SpawnTerminalError<std::convert::Infallible>>
+        {
+            spawn_terminal(&mut params, |source| {
+                let (runtime, _host) =
+                    TerminalRuntime::virtual_channel(&AppConfig::default(), source);
+                Ok((
+                    TerminalSurface::new(&AppConfig::default())
+                        .expect("surface construction is CPU-only"),
+                    runtime,
+                ))
+            })
+        }
+
+        let mut world = spawner_world();
+        world.resource_mut::<AppConfig>().terminal.max_live = 2;
+
+        let (_seat_a, id_a) = world
+            .run_system_once(try_spawn)
+            .expect("system runs")
+            .expect("first spawn is under the cap");
+        let (_seat_b, id_b) = world
+            .run_system_once(try_spawn)
+            .expect("system runs")
+            .expect("second spawn fills the cap");
+        assert_eq!(
+            world.query::<&TerminalIdentity>().iter(&world).count(),
+            2,
+            "seat count asserted (#58 rider)"
+        );
+
+        let refused = world.run_system_once(try_spawn).expect("system runs");
+        assert!(
+            matches!(
+                refused,
+                Err(SpawnTerminalError::LiveCap { live: 2, cap: 2 })
+            ),
+            "the third spawn is refused by the cap, not by the pool"
+        );
+        assert_eq!(
+            world.query::<&TerminalIdentity>().iter(&world).count(),
+            2,
+            "seat count asserted (#58 rider): a refusal creates nothing"
+        );
+        assert_eq!(
+            world.resource::<TerminalRegistry>().live_count(),
+            2,
+            "a capped spawn takes no lease"
+        );
+
+        // The refusal is checked before the mint, so it burns no id: the
+        // next admitted spawn is the immediate successor of the last one.
+        // (A failed *build* does skip an id — that is a different path.)
+        world.resource_mut::<AppConfig>().terminal.max_live = 3;
+        let (_seat_c, id_c) = world
+            .run_system_once(try_spawn)
+            .expect("system runs")
+            .expect("raising the cap admits the next spawn");
+        assert!(id_a.id() < id_b.id() && id_b.id() < id_c.id());
+        assert_eq!(
+            world.resource::<TerminalRegistry>().namespace_of(id_c.id()),
+            Some(2),
+            "and it leases the next free slot, not a skipped one"
+        );
     }
 
     /// Decision 8's user-spawn half through the real spawner: the child

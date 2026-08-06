@@ -161,6 +161,12 @@ pub mod codes {
     pub const UNKNOWN_ANCHOR: &str = "unknown-anchor";
     /// An avatar gesture name not in the choreography vocabulary (#23 §1).
     pub const UNKNOWN_GESTURE: &str = "unknown-gesture";
+    /// No room for another live terminal (#49): either the configured
+    /// live cap (`[terminal] max_live`, default 4) or the hard 128-slot
+    /// namespace pool. One code for both because the caller's remedy is
+    /// identical — close something. The operator distinction survives in
+    /// the log, where the two spawn failures are separate error values.
+    pub const TERMINAL_CAP: &str = "terminal-cap";
 }
 
 /// Returns whether `token` is a valid correlation token: 1 to
