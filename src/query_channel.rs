@@ -386,13 +386,13 @@ pub fn answer_queries(
         &TerminalDiagnostics,
         &crate::macros::TerminalMacros,
         &crate::reactive::TerminalReactive,
+        &AiEffects,
     )>,
     presentation: Res<TerminalPresentation>,
     plane_warp: Query<&TerminalPlaneWarp>,
     plane_view: Res<TerminalPlaneView>,
     stage_tween: Res<StageTween>,
     cursor: Res<CursorSettings>,
-    effects: Res<AiEffects>,
     organs: OrganRegistries,
 ) {
     // The reply transport itself: without the runtime no ack or reply can
@@ -472,9 +472,10 @@ pub fn answer_queries(
                 // session macros), resolved by TerminalId (the stamp rule)
                 // — a query whose arrival terminal died is dropped loudly,
                 // never answered from another seat's state.
-                let Some((_, seat_diagnostics, seat_macros, seat_reactive)) = seat_state
-                    .iter()
-                    .find(|(identity, ..)| identity.id() == source.terminal())
+                let Some((_, seat_diagnostics, seat_macros, seat_reactive, seat_effects)) =
+                    seat_state
+                        .iter()
+                        .find(|(identity, ..)| identity.id() == source.terminal())
                 else {
                     warn!(
                         "answer_queries: query dropped: arrival terminal {:?} no longer exists",
@@ -493,7 +494,10 @@ pub fn answer_queries(
                     plane_view: &plane_view,
                     stage_tween: &stage_tween,
                     cursor: &cursor,
-                    effects: &effects,
+                    // The ARRIVAL terminal's own effects (#56 decision 14's
+                    // read side): a mood that does not render — unfocused
+                    // under focused-wash — is still observable.
+                    effects: seat_effects,
                     viz: &organs.viz,
                     sound: &organs.sound,
                     bookmarks: &organs.bookmarks,
@@ -1254,7 +1258,6 @@ mod tests {
         app.init_resource::<AiObjectRegistry>();
         app.init_resource::<CursorSettings>();
         app.init_resource::<QuerySession>();
-        app.init_resource::<AiEffects>();
         app.init_resource::<crate::viz::VizRegistry>();
         app.init_resource::<SoundState>();
         app.init_resource::<crate::bookmarks::BookmarkRegistry>();
@@ -1820,9 +1823,15 @@ mod tests {
         assert!(replies[0].ok && replies[0].ack, "rule.set commits");
         assert!(replies[1].ok && replies[1].ack, "sensor.publish commits");
         // The transition fired `think` and the effects applier lowered it
-        // in the same frame.
+        // in the same frame — onto the arrival seat's own effects
+        // component (decision 14's routing).
         assert!(
-            app.world().resource::<AiEffects>().public_state().thinking,
+            app.world_mut()
+                .query::<&AiEffects>()
+                .single(app.world())
+                .expect("exactly one seat carries effects")
+                .public_state()
+                .thinking,
             "the fired action lowered the same frame"
         );
 
