@@ -372,6 +372,25 @@ pub fn apply_ai_commands(
             // day the subsystem exists. The message is `state.errors` prose
             // (`reject` records it; the ack carries only `code`), so this is
             // not a wire change.
+            // TEMPORARY (M4.5, in flight): the terminals organ does not
+            // exist yet, so this arm owns the `term.*` acks until each verb
+            // moves to `crate::terminals::apply_terminal_commands`. It is
+            // emptied one verb at a time and deleted with the last.
+            RattyAiCommand::TermSpawn { .. }
+            | RattyAiCommand::TermPlace { .. }
+            | RattyAiCommand::TermFocus { .. }
+            | RattyAiCommand::TermClose { .. } => {
+                debug!("ratty-ai: term command received; the terminals organ is not built yet");
+                reject(
+                    &mut diagnostics,
+                    &mut acks,
+                    *source,
+                    ack_token,
+                    "term",
+                    codes::UNSUPPORTED,
+                    "the terminals organ is not built yet".to_string(),
+                );
+            }
             RattyAiCommand::SplitPane { .. }
             | RattyAiCommand::FocusPane { .. }
             | RattyAiCommand::ResizePane { .. }

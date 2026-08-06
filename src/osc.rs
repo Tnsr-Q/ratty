@@ -374,6 +374,62 @@ pub enum RattyAiCommand {
         pane: u8,
     },
 
+    // ── Terminals (#49; supersedes the frozen pane block above) ──
+    /// Create a terminal (`term.spawn`). Returns a handle in its ack;
+    /// never accepts one, so there is no caller-chosen terminal identity
+    /// and #16's collision machinery does not apply. The placement and
+    /// grid fields are the locked wire shape and are parsed so a caller
+    /// sending them gets an explicit refusal rather than a silent
+    /// discard — the applier rejects any of them (see
+    /// `caps.terminals.spawn_fields`).
+    ///
+    /// No command, cwd or env, ever: `RuntimeOptions` never reaches this
+    /// enum, so the wire cannot choose an executable or name a
+    /// filesystem path (#12).
+    TermSpawn {
+        /// World-space x of the quad's center.
+        x: Option<f32>,
+        /// World-space y of the quad's center.
+        y: Option<f32>,
+        /// Uniform quad scale.
+        scale: Option<f32>,
+        /// PTY grid columns.
+        cols: Option<u16>,
+        /// PTY grid rows.
+        rows: Option<u16>,
+    },
+    /// Place or resize a terminal (`term.place`). Every key is optional
+    /// and one invalid field rejects the whole command (the `avatar.set`
+    /// atomicity convention); an all-absent form is a vacuous commit.
+    TermPlace {
+        /// Target handle; absent targets the carrying terminal.
+        id: Option<String>,
+        /// World-space x of the quad's center.
+        x: Option<f32>,
+        /// World-space y of the quad's center.
+        y: Option<f32>,
+        /// Uniform quad scale.
+        scale: Option<f32>,
+        /// PTY grid columns.
+        cols: Option<u16>,
+        /// PTY grid rows.
+        rows: Option<u16>,
+    },
+    /// Aim the user's keyboard at a terminal (`term.focus`). The
+    /// keystroke-capture primitive, which is why it carries its own
+    /// capability separate from lifecycle (#56 decision 18).
+    TermFocus {
+        /// Target handle; absent targets the carrying terminal.
+        id: Option<String>,
+    },
+    /// Close a terminal (`term.close`). Closing a still-spawning
+    /// terminal is legal and cancels the spawn — there is no
+    /// `term.cancel`.
+    TermClose {
+        /// Target handle; absent targets the carrying terminal.
+        id: Option<String>,
+    },
+
     // ── View bookmarks ──
     /// Store the current public view state (mode, warp) under a
     /// caller-namespaced name. An existing name rejects `already-exists`
@@ -724,15 +780,37 @@ impl RattyAiCommand {
         )
     }
 
+    /// Whether this is a terminal-lifecycle command (`term.*`, #49).
+    /// Principal lifecycle is ingress truth, exactly as presence identity
+    /// is: a replayed `term.spawn` forks a process and leases a namespace
+    /// slot from a 128-wide pool, and a replayed `term.close` kills a live
+    /// session a user may be typing into. The whole family is
+    /// control-plane, excluded from macro recording, refused by the
+    /// trusted macro loader, and the applier additionally rejects any
+    /// non-wire origin.
+    pub fn is_terminal_control(&self) -> bool {
+        matches!(
+            self,
+            Self::TermSpawn { .. }
+                | Self::TermPlace { .. }
+                | Self::TermFocus { .. }
+                | Self::TermClose { .. }
+        )
+    }
+
     /// Whether this command belongs to the control-plane class excluded from
-    /// macro recording (#16 plus the #21 and #25 amendments): macro-control
-    /// commands, reactive control (`rule.*` / `sensor.*`), and collaboration
-    /// presence (`user.*` / `note*`). Query and transport envelopes are OSC
-    /// 778, never `RattyAiCommand`s, so they are excluded by construction,
-    /// and `tok=` correlation tokens are transport metadata stripped before
-    /// capture. Everything else is recordable choreography.
+    /// macro recording (#16 plus the #21, #25 and #49 amendments):
+    /// macro-control commands, reactive control (`rule.*` / `sensor.*`),
+    /// collaboration presence (`user.*` / `note*`), and terminal lifecycle
+    /// (`term.*`). Query and transport envelopes are OSC 778, never
+    /// `RattyAiCommand`s, so they are excluded by construction, and `tok=`
+    /// correlation tokens are transport metadata stripped before capture.
+    /// Everything else is recordable choreography.
     pub fn is_control_plane(&self) -> bool {
-        self.is_macro_control() || self.is_reactive_control() || self.is_presence_control()
+        self.is_macro_control()
+            || self.is_reactive_control()
+            || self.is_presence_control()
+            || self.is_terminal_control()
     }
 
     /// Whether this command belongs to the rule-action allowlist's directly
@@ -776,6 +854,17 @@ impl RattyAiCommand {
             // scope is scene-global (arg-dependent classification has
             // precedent: rule-safe `object.update` keys on x/y).
             Self::AvatarSpeechClear { scope } => !matches!(scope, SpeechClearScope::Own),
+            // Terminal lifecycle (#49): a terminal is shared workspace
+            // composition and shared input routing, never one namespace's
+            // private state. Belt-and-suspenders only — the family is
+            // control-plane, so the recorder never captures one and the
+            // privileged/scene-lock machinery this predicate feeds can
+            // never actually see it. Kept so a future injection path
+            // inherits the right class by default.
+            Self::TermSpawn { .. }
+            | Self::TermPlace { .. }
+            | Self::TermFocus { .. }
+            | Self::TermClose { .. } => true,
             _ => false,
         }
     }
@@ -966,6 +1055,35 @@ fn parse_action(action: &str, p: &Payload) -> Option<RattyAiCommand> {
         "pane.close" => RattyAiCommand::ClosePane {
             pane: p.parse_req("pane")?,
         },
+
+        // Terminals (#49). Handles ride `id=` as opaque strings (the
+        // `avatar.cancel` shape) and validate at apply, so a dead or
+        // foreign handle answers `unknown-id` rather than failing parse.
+        // `term=` stays deliberately unclaimed: it is the recorded
+        // envelope-key escape, and a family squatting it would make its
+        // later addition a silent reinterpretation of shipped bytes.
+        //
+        // Every numeric is strict — a typo'd `cols` must be a bad command,
+        // never a silently different grid. `Payload::parse` retains
+        // unknown keys, so `term.spawn;id=x` parses and discards the `id`;
+        // spawn genuinely has no target.
+        "term.spawn" => RattyAiCommand::TermSpawn {
+            x: p.opt_strict("x").ok()?,
+            y: p.opt_strict("y").ok()?,
+            scale: p.opt_strict("scale").ok()?,
+            cols: p.opt_strict("cols").ok()?,
+            rows: p.opt_strict("rows").ok()?,
+        },
+        "term.place" => RattyAiCommand::TermPlace {
+            id: p.string("id"),
+            x: p.opt_strict("x").ok()?,
+            y: p.opt_strict("y").ok()?,
+            scale: p.opt_strict("scale").ok()?,
+            cols: p.opt_strict("cols").ok()?,
+            rows: p.opt_strict("rows").ok()?,
+        },
+        "term.focus" => RattyAiCommand::TermFocus { id: p.string("id") },
+        "term.close" => RattyAiCommand::TermClose { id: p.string("id") },
 
         // View bookmarks — the retired `history` and `jump` stub actions
         // fail parse like any unknown action (`ratty-ai history` is a
@@ -1669,6 +1787,10 @@ mod tests {
             "ratty:pane.focus;pane=2",
             "ratty:pane.resize;pane=1&width=80",
             "ratty:pane.close;pane=2",
+            "ratty:term.spawn",
+            "ratty:term.place;id=h&cols=80&rows=24",
+            "ratty:term.focus;id=h",
+            "ratty:term.close",
             "ratty:bookmark;name=x",
             "ratty:bookmark;name=x&mode=replace",
             "ratty:bookmark.jump;name=x",
@@ -1820,6 +1942,10 @@ mod tests {
             parse_command("ratty:user.leave;id=alice").expect("parses"),
             parse_command("ratty:note;id=n1&text=hi&x=1&y=2").expect("parses"),
             parse_command("ratty:note.remove;id=n1").expect("parses"),
+            parse_command("ratty:term.spawn").expect("parses"),
+            parse_command("ratty:term.place;id=h").expect("parses"),
+            parse_command("ratty:term.focus;id=h").expect("parses"),
+            parse_command("ratty:term.close").expect("parses"),
         ] {
             assert!(control.is_control_plane(), "{control:?} is control-plane");
         }
@@ -1838,6 +1964,12 @@ mod tests {
             parse_command("ratty:avatar.hide").expect("parses"),
             parse_command("ratty:avatar.speech.clear;ns=0").expect("parses"),
             parse_command("ratty:avatar.speech.clear;scope=all").expect("parses"),
+            // Terminals are shared workspace composition and shared input
+            // routing (#49) — never one namespace's private state.
+            parse_command("ratty:term.spawn").expect("parses"),
+            parse_command("ratty:term.place;id=h").expect("parses"),
+            parse_command("ratty:term.focus;id=h").expect("parses"),
+            parse_command("ratty:term.close").expect("parses"),
         ] {
             assert!(global.is_scene_global(), "{global:?} is scene-global");
         }
@@ -2177,6 +2309,118 @@ mod tests {
                 !command.is_presence_control(),
                 "{command:?} is effects choreography, not presence control"
             );
+        }
+    }
+
+    /// The terminal family's class, pinned (#49 §3): control-plane so it
+    /// is never recorded and never replayable, scene-global so any future
+    /// injection path inherits the privileged class, and outside both the
+    /// rule allowlist and the execution-control set.
+    #[test]
+    fn terminal_lifecycle_class_is_pinned() {
+        for spec in [
+            "ratty:term.spawn",
+            "ratty:term.place;id=h&cols=80",
+            "ratty:term.focus;id=h",
+            "ratty:term.close",
+        ] {
+            let command = parse_command(spec).expect("parses");
+            assert!(
+                command.is_terminal_control(),
+                "{command:?} is terminal control"
+            );
+            assert!(command.is_control_plane(), "{command:?} is control-plane");
+            assert!(
+                command.is_scene_global(),
+                "{command:?} is shared scene composition"
+            );
+            assert!(
+                !command.is_presence_control(),
+                "{command:?} is not presence control"
+            );
+            assert!(
+                !command.is_rule_safe_action(),
+                "{command:?} must never be fireable by a rule"
+            );
+            // #56 decision 19: a terminal is not transport-epoch metadata,
+            // so it gets no `state.executions` row and this stays false.
+            assert!(
+                !command.is_execution_control(),
+                "{command:?} is not execution control"
+            );
+        }
+        // The frozen pane family is a different (superseded) surface.
+        for spec in ["ratty:pane.split;ratio=0.3", "ratty:pane.close;pane=1"] {
+            let command = parse_command(spec).expect("parses");
+            assert!(
+                !command.is_terminal_control(),
+                "{command:?} is the superseded pane surface, not term.*"
+            );
+        }
+    }
+
+    /// The wire grammar (#49 §1): optional everywhere, strict on every
+    /// numeric, handles opaque at parse.
+    #[test]
+    fn terminal_wire_grammar_parses_and_rejects_strictly() {
+        // An all-absent spawn is the canonical form: no runtime arguments
+        // exist on this command, ever (#12).
+        assert_eq!(
+            parse_command("ratty:term.spawn"),
+            Some(RattyAiCommand::TermSpawn {
+                x: None,
+                y: None,
+                scale: None,
+                cols: None,
+                rows: None,
+            })
+        );
+        assert_eq!(
+            parse_command("ratty:term.place;id=h1&x=1.5&y=-2.5&scale=2&cols=80&rows=24"),
+            Some(RattyAiCommand::TermPlace {
+                id: Some("h1".to_string()),
+                x: Some(1.5),
+                y: Some(-2.5),
+                scale: Some(2.0),
+                cols: Some(80),
+                rows: Some(24),
+            })
+        );
+        // Absent `id=` is the bare self-form (arrival is the address).
+        assert_eq!(
+            parse_command("ratty:term.focus"),
+            Some(RattyAiCommand::TermFocus { id: None })
+        );
+        assert_eq!(
+            parse_command("ratty:term.close;id=h1"),
+            Some(RattyAiCommand::TermClose {
+                id: Some("h1".to_string()),
+            })
+        );
+        // An empty `id=` is a present-but-empty handle, NOT the bare
+        // form — it must fail to resolve at apply, never target self.
+        assert_eq!(
+            parse_command("ratty:term.close;id="),
+            Some(RattyAiCommand::TermClose {
+                id: Some(String::new()),
+            })
+        );
+        // `term.spawn` reads no `id=`: the payload retains the key and the
+        // command discards it, so spawn genuinely has no target.
+        assert_eq!(
+            parse_command("ratty:term.spawn;id=h1"),
+            parse_command("ratty:term.spawn")
+        );
+        for bad in [
+            // Present-but-malformed fails the WHOLE parse (opt_strict):
+            // a typo'd grid must never become a silently different one.
+            "ratty:term.spawn;cols=abc",
+            "ratty:term.spawn;rows=70000",
+            "ratty:term.spawn;scale=big",
+            "ratty:term.place;id=h&x=left",
+            "ratty:term.place;id=h&cols=-1",
+        ] {
+            assert!(parse_command(bad).is_none(), "`{bad}` must not parse");
         }
     }
 }

@@ -527,6 +527,19 @@ impl MacroRegistry {
         {
             return Err("a trusted macro may not contain execution-control commands");
         }
+        // Terminal lifecycle (#49): a durable artifact that forks processes
+        // and kills live sessions on load is not choreography. The wire can
+        // never reach this path anyway (the family is control-plane, so the
+        // recorder tap skips it), but `insert_trusted` copies `privileged`
+        // from the caller verbatim, so this is the one lever that survives
+        // a hand-authored trusted macro.
+        if steps_source
+            .steps
+            .iter()
+            .any(|step| step.command.is_terminal_control())
+        {
+            return Err("a trusted macro may not contain terminal-lifecycle commands");
+        }
         self.trusted.insert(
             name,
             Arc::new(Macro {
@@ -1847,6 +1860,84 @@ mod tests {
             .resource_mut::<Messages<AckOutcome>>()
             .drain()
             .collect()
+    }
+
+    /// Terminal lifecycle never enters a recording (#49): the tap's
+    /// class filter keys on `is_control_plane()`, which the family now
+    /// joins. A recorded `term.spawn` would fork a process every replay.
+    #[test]
+    fn terminal_lifecycle_is_never_captured() {
+        let mut app = app_test();
+        send(
+            &mut app,
+            None,
+            RattyAiCommand::MacroRecord {
+                name: "workspace".to_string(),
+                replace: false,
+            },
+        );
+        for command in [
+            RattyAiCommand::TermSpawn {
+                x: None,
+                y: None,
+                scale: None,
+                cols: None,
+                rows: None,
+            },
+            RattyAiCommand::TermPlace {
+                id: Some("h1".to_string()),
+                x: None,
+                y: None,
+                scale: None,
+                cols: Some(80),
+                rows: None,
+            },
+            RattyAiCommand::TermFocus {
+                id: Some("h1".to_string()),
+            },
+            RattyAiCommand::TermClose {
+                id: Some("h1".to_string()),
+            },
+        ] {
+            send(&mut app, None, command);
+        }
+        // One recordable command proves the recording was live the whole
+        // time — an empty macro could otherwise mean the tap never ran.
+        send(&mut app, None, mode("3d"));
+        send(&mut app, None, RattyAiCommand::MacroStop);
+        let recorded = resolve_session(&mut app, "workspace").expect("stored");
+        assert_eq!(
+            recorded.step_count(),
+            1,
+            "only the mode change recorded; the whole term.* family is control-plane"
+        );
+    }
+
+    /// The trusted tier refuses it too. The wire cannot reach
+    /// `insert_trusted`, but it copies `privileged` from the caller
+    /// verbatim, so a hand-authored trusted macro needs its own refusal.
+    #[test]
+    fn a_trusted_macro_may_not_contain_terminal_lifecycle() {
+        let mut registry = MacroRegistry::default();
+        let mut seat = TerminalMacros::default();
+        seat.test_record(
+            NS0,
+            "workspace",
+            &[RattyAiCommand::TermSpawn {
+                x: None,
+                y: None,
+                scale: None,
+                cols: None,
+                rows: None,
+            }],
+        );
+        let workspace = registry.resolve(&seat, "workspace", None).expect("stored");
+        assert_eq!(
+            registry
+                .insert_trusted("t".to_string(), &workspace)
+                .expect_err("terminal lifecycle refused"),
+            "a trusted macro may not contain terminal-lifecycle commands"
+        );
     }
 
     #[test]
