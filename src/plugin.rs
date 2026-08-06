@@ -70,9 +70,9 @@ impl Plugin for TerminalPlugin {
             // before the focus drain — the ordering edge auto-inserts a
             // command flush, so the child seat is live (and focusable) the
             // same frame its chord was pressed.
-            // Also before the query channel: this system now writes the
-            // wire roster through `TerminalSpawnParams`, and the query
-            // channel reads it. Without the edge, whether a same-frame
+            // Also before the query channel: this system writes the wire
+            // roster through `TerminalSpawnParams`, and the query channel
+            // reads it. Without the edge, whether a same-frame
             // `state.terminals` observes a chord spawn is a schedule
             // tiebreak.
             .add_systems(

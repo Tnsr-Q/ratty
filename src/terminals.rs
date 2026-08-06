@@ -54,9 +54,15 @@ use crate::identity::TerminalId;
 /// ack `code=started` (which, under `protocols/query.md`'s
 /// absence-means-finished rule, would tell a conforming caller the spawn
 /// had completed while it was still spawning).
+///
+/// Two of the three are DERIVED, never stored — see
+/// [`TerminalRow::wire_state`]. A stored readiness flag would need a
+/// system to flip it, and when that system ran relative to the query
+/// channel would decide what a caller observed: a schedule tiebreak
+/// masquerading as a lifecycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TerminalWireState {
-    /// Admitted; the seat entity has not flushed into the world yet.
+    /// Admitted, but the seat entity has not flushed into the world yet.
     Spawning,
     /// Live and addressable.
     Ready,
@@ -91,8 +97,29 @@ pub struct TerminalRow {
     /// live relationship and IS cleared when the creator dies. Conflating
     /// them would make orphans read as chord-born.
     pub wire_born: bool,
-    /// Where this terminal is in its lifecycle.
-    pub state: TerminalWireState,
+    /// Whether a close has committed for this terminal. The one piece of
+    /// lifecycle that must be stored: it is a decision the applier made,
+    /// not a fact about the world.
+    pub closing: bool,
+}
+
+impl TerminalRow {
+    /// This terminal's wire-visible state, given whether its seat entity
+    /// is live in the world right now.
+    ///
+    /// `spawning` is literally "the row exists and the seat does not" —
+    /// `spawn_terminal` inserts the row synchronously but spawns the seat
+    /// through deferred `Commands`, so the gap is real, and deriving the
+    /// answer from the world means no observer can ever disagree with it.
+    pub fn wire_state(&self, seat_live: bool) -> TerminalWireState {
+        if self.closing {
+            TerminalWireState::Closing
+        } else if seat_live {
+            TerminalWireState::Ready
+        } else {
+            TerminalWireState::Spawning
+        }
+    }
 }
 
 /// The wire's view of every live terminal: handle, creator, state.
@@ -128,7 +155,7 @@ impl TerminalRoster {
                 handle,
                 creator,
                 wire_born,
-                state: TerminalWireState::Spawning,
+                closing: false,
             },
         );
     }
@@ -136,11 +163,6 @@ impl TerminalRoster {
     /// The row for a live terminal.
     pub fn row(&self, id: TerminalId) -> Option<&TerminalRow> {
         self.rows.get(&id)
-    }
-
-    /// The mutable row for a live terminal.
-    pub(crate) fn row_mut(&mut self, id: TerminalId) -> Option<&mut TerminalRow> {
-        self.rows.get_mut(&id)
     }
 
     /// Resolves a wire handle to its terminal.
@@ -190,25 +212,85 @@ impl TerminalRoster {
     }
 }
 
-/// Flips `spawning` rows to `ready` once their seat entity is live in the
-/// world.
+/// One `state.terminals` row, resolved against the live world.
 ///
-/// `spawning` is genuinely one frame: `spawn_terminal` inserts the row
-/// synchronously but spawns the seat through deferred `Commands`, so the
-/// row exists (and is addressable) before the entity does. Ordered after
-/// the chord spawner so a chord-spawned row's first observable state is
-/// not a schedule tiebreak.
-pub(crate) fn promote_spawning_terminals(
-    seats: Query<&crate::identity::TerminalIdentity>,
-    mut roster: ResMut<TerminalRoster>,
-) {
-    for identity in seats.iter() {
-        if let Some(row) = roster.row_mut(identity.id())
-            && row.state == TerminalWireState::Spawning
-        {
-            row.state = TerminalWireState::Ready;
-        }
-    }
+/// Built in `answer_queries` because the roster alone cannot answer it:
+/// the namespace and the grid live on the seat entity and its transport,
+/// and `creator_ns` is the creator's *current* namespace — resolved from
+/// the creator's `TerminalId` at read time, never stored (the stamp rule).
+#[derive(Debug, Clone)]
+pub struct TerminalRowSnapshot {
+    /// The terminal this row describes.
+    pub id: TerminalId,
+    /// Its wire handle.
+    pub handle: String,
+    /// Its lifecycle state.
+    pub state: TerminalWireState,
+    /// Its leased namespace.
+    pub ns: u8,
+    /// Its creator, if it still has one.
+    pub creator: Option<TerminalId>,
+    /// The creator's live namespace ordinal — the wire-facing rendering
+    /// of `creator`, resolved now rather than stored.
+    pub creator_ns: Option<u8>,
+    /// Live grid columns, or `None` while the seat entity has not flushed.
+    pub cols: Option<u16>,
+    /// Live grid rows, or `None` while the seat entity has not flushed.
+    pub rows: Option<u16>,
+}
+
+/// `state.terminals`: the roster as tier-1 scene-global public state.
+///
+/// The quads are visibly on screen, so enumerating them observes nothing
+/// a viewer cannot already see, and a handle grants nothing — #18's
+/// "visibility grants observation, not control" does the work.
+///
+/// `creator` is the one own-scoped field (#56 decision 15): it is grafted
+/// on only when the querier IS the creator. Absent-when-foreign, never a
+/// distinguishable "exists but hidden" marker — and the value is the
+/// creator's namespace ordinal, which is why it can never appear under any
+/// other key: a namespace is a stable, enumerable, wire-visible address,
+/// so leaking it under a second name would defeat the scoping entirely.
+pub fn terminals_state_items(
+    rows: &[TerminalRowSnapshot],
+    source: crate::runtime::IngressSource,
+) -> Vec<(u64, serde_json::Value)> {
+    use serde_json::json;
+
+    let mut sorted: Vec<&TerminalRowSnapshot> = rows.iter().collect();
+    sorted.sort_by_key(|row| row.id);
+    sorted
+        .into_iter()
+        .enumerate()
+        .map(|(index, row)| {
+            let mut value = json!({
+                "id": row.handle,
+                "state": row.state.as_str(),
+                // `ns` is the leased namespace, which is also the address
+                // wire object ids carry — scene-global public state, like
+                // the quad itself.
+                "ns": row.ns,
+                "cols": row.cols,
+                "rows": row.rows,
+                // Live truth, not a placeholder: nothing in this build
+                // renders a per-terminal position or scale. The focused
+                // terminal draws 1:1 and centered, and `sync_terminal_layout`
+                // rewrites every viewport centre to the origin on each
+                // layout pass. `term.place` refuses these fields for the
+                // same reason.
+                "x": 0.0,
+                "y": 0.0,
+                "scale": 1.0,
+            });
+            if row.creator == Some(source.terminal()) {
+                value["creator"] = json!(row.creator_ns);
+            }
+            // The pagination key is positional: `TerminalId` has no public
+            // raw accessor and the wire id is a string handle, so the
+            // mint-ordered index is the only honest stable key.
+            (index as u64, value)
+        })
+        .collect()
 }
 
 /// Registers the terminals organ.
@@ -216,16 +298,7 @@ pub struct TerminalsPlugin;
 
 impl Plugin for TerminalsPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<TerminalRoster>().add_systems(
-            Update,
-            promote_spawning_terminals
-                .after(crate::systems::pump_pty_output)
-                // Not decoration: the chord spawner holds the same roster
-                // through `TerminalSpawnParams`, so without this edge
-                // whether a chord-spawned row reads `spawning` or `ready`
-                // on its first observable frame is a schedule tiebreak.
-                .after(crate::scene::spawn_requested_terminals),
-        );
+        app.init_resource::<TerminalRoster>();
     }
 }
 
@@ -296,5 +369,27 @@ mod tests {
         assert_eq!(TerminalWireState::Spawning.as_str(), "spawning");
         assert_eq!(TerminalWireState::Ready.as_str(), "ready");
         assert_eq!(TerminalWireState::Closing.as_str(), "closing");
+    }
+
+    #[test]
+    fn readiness_is_derived_from_the_seat_and_closing_overrides_it() {
+        let mut roster = TerminalRoster::default();
+        roster.insert(id(1), "h1".to_string(), None, false);
+        let row = roster.row(id(1)).expect("row");
+        // The row exists before the seat entity flushes; that gap IS
+        // `spawning`, and no system has to notice it.
+        assert_eq!(row.wire_state(false), TerminalWireState::Spawning);
+        assert_eq!(row.wire_state(true), TerminalWireState::Ready);
+
+        let closing = TerminalRow {
+            closing: true,
+            ..row.clone()
+        };
+        assert_eq!(
+            closing.wire_state(true),
+            TerminalWireState::Closing,
+            "a committed close outranks liveness — the seat is still there, briefly"
+        );
+        assert_eq!(closing.wire_state(false), TerminalWireState::Closing);
     }
 }

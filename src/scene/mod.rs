@@ -1349,23 +1349,11 @@ mod tests {
             // shape, which is exactly what makes them wire-unkillable.
             assert_eq!(row_a.creator, None);
             assert!(!row_a.wire_born);
-            assert_eq!(row_a.state, TerminalWireState::Spawning);
+            // Readiness is derived from the seat, so the seat entity
+            // being live IS the answer — no promotion step to get wrong.
+            assert_eq!(row_a.wire_state(true), TerminalWireState::Ready);
             row_a.handle.clone()
         };
-
-        // Promotion is one frame behind the mint, because the seat entity
-        // is a deferred Commands spawn.
-        world
-            .run_system_once(crate::terminals::promote_spawning_terminals)
-            .expect("promotion runs");
-        assert_eq!(
-            world
-                .resource::<TerminalRoster>()
-                .row(id_a.id())
-                .expect("row")
-                .state,
-            TerminalWireState::Ready
-        );
 
         // A dies; its slot recycles into C.
         world.despawn(seat_a);

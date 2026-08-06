@@ -68,6 +68,7 @@ pub const SUPPORTED_OPS: &[&str] = &[
     "state.rules",
     "state.sensors",
     "state.presence",
+    "state.terminals",
 ];
 
 /// One OSC 778 item drained from the parser, delivered to the Bevy world.
@@ -363,6 +364,7 @@ pub struct OrganRegistries<'w> {
     reactive: Res<'w, crate::reactive::ReactiveRegistry>,
     avatar: Res<'w, crate::avatar::AvatarState>,
     presence: Res<'w, crate::presence::PresenceRegistry>,
+    terminals: Res<'w, crate::terminals::TerminalRoster>,
     config: Res<'w, crate::config::AppConfig>,
     time: Res<'w, Time>,
 }
@@ -387,6 +389,7 @@ pub fn answer_queries(
         &TerminalInlineObjects,
     )>,
     session: Res<QuerySession>,
+    registry: Res<crate::identity::TerminalRegistry>,
     seat_state: Query<(
         &crate::identity::TerminalIdentity,
         &TerminalDiagnostics,
@@ -407,6 +410,48 @@ pub fn answer_queries(
             .iter()
             .find(|(identity, ..)| identity.id() == terminal)
     };
+
+    // The `state.terminals` rows, resolved once against the world: the
+    // roster holds handle/creator/state, and the seat holds the namespace
+    // and the live grid. `creator_ns` is deliberately resolved HERE rather
+    // than stored — a creator's namespace recycles when it dies, so a
+    // stored ordinal would re-parent orphans to strangers (the stamp
+    // rule). A row whose seat has not flushed yet reports a null grid
+    // rather than a guess.
+    let terminal_rows: Vec<crate::terminals::TerminalRowSnapshot> = organs
+        .terminals
+        .iter()
+        .filter_map(|(id, row)| {
+            // The namespace is knowable without the seat entity — the
+            // registry holds the lease — so a `spawning` row is still
+            // fully addressable in the reply. A row with no lease is an
+            // invariant violation (the sweep drops both together), so it
+            // is reported and skipped, never defaulted to namespace 0.
+            let Some(ns) = registry.namespace_of(id) else {
+                warn!("answer_queries: roster row for {id:?} has no namespace lease; skipping");
+                return None;
+            };
+            let seat = transport_of(id);
+            let grid = seat.map(|(_, runtime, ..)| runtime.parser.screen().size());
+            Some(crate::terminals::TerminalRowSnapshot {
+                id,
+                handle: row.handle.clone(),
+                // Derived, so no observer can disagree with the world:
+                // a row whose seat has not flushed reads `spawning`.
+                state: row.wire_state(seat.is_some()),
+                ns,
+                creator: row.creator,
+                // Resolved NOW, never stored: a creator's namespace
+                // returns to the pool when it dies, so a stored ordinal
+                // would re-parent orphans to strangers (the stamp rule).
+                creator_ns: row
+                    .creator
+                    .and_then(|creator| registry.namespace_of(creator)),
+                cols: grid.map(|(_, cols)| cols),
+                rows: grid.map(|(rows, _)| rows),
+            })
+        })
+        .collect();
 
     // Acks first: a same-chunk "command with tok= then query" reads its
     // ack before the query reply, in mutation order.
@@ -498,6 +543,7 @@ pub fn answer_queries(
                     config: &organs.config,
                     now: organs.time.elapsed(),
                     grid: runtime.parser.screen().size(),
+                    terminals: &terminal_rows,
                 };
                 match answer(envelope, *source, &ctx) {
                     Ok(value) => {
@@ -597,6 +643,9 @@ struct QueryCtx<'a> {
     now: std::time::Duration,
     /// Live grid size as `(rows, cols)`, from the parser screen.
     grid: (u16, u16),
+    /// Every live terminal, resolved against the world for
+    /// `state.terminals`.
+    terminals: &'a [crate::terminals::TerminalRowSnapshot],
 }
 
 /// Resolves one query op to its JSON payload, or an error code.
@@ -664,6 +713,14 @@ fn answer(
             crate::presence::presence_state_items(ctx.presence, source.namespace(), ctx.now),
             &data,
         ),
+        // The terminal roster (#49). Paginated even though the live cap
+        // defaults to 4: `state.namespaces` is this file's own cautionary
+        // note about unpaginated ops, and the cap is configurable to 128.
+        "state.terminals" => paginate(
+            ctx,
+            crate::terminals::terminals_state_items(ctx.terminals, source),
+            &data,
+        ),
         _ => Err(codes::UNSUPPORTED_OP),
     }
 }
@@ -679,6 +736,11 @@ fn caps(ctx: &QueryCtx<'_>, source: IngressSource) -> Value {
         // any future pane-addressed content MUST degrade to it. Hosts
         // introspect this key instead of inferring from behavior; it grows
         // only when a multi-grid browser story actually ships (#86).
+        //
+        // Terminals are NOT panes — that is the whole #22 ruling — so N
+        // live terminals leave this at 1. The risk here is a well-meaning
+        // change, not a deliberate one; the milestone test asserts it
+        // still reads 1 with two terminals live.
         "panes": 1,
         "ack": { "key": ACK_TOKEN_KEY },
         "limits": {
@@ -693,6 +755,11 @@ fn caps(ctx: &QueryCtx<'_>, source: IngressSource) -> Value {
             "viz_items": crate::viz::MAX_VIZ_ITEMS_PER_SNAPSHOT,
             "sound_voices": crate::sound::MAX_SOUND_VOICES,
             "sound_plays_per_sec": crate::sound::SOUND_PLAYS_PER_SEC,
+            "terminal_spawns_per_sec": crate::identity::TERMINAL_SPAWNS_PER_SEC,
+            "terminal_focus_per_sec": crate::identity::TERMINAL_FOCUS_PER_SEC,
+            "terminal_min_axis": crate::identity::MIN_TERMINAL_AXIS,
+            "terminal_max_axis": crate::identity::MAX_TERMINAL_AXIS,
+            "terminal_max_cells": crate::identity::MAX_TERMINAL_CELLS,
             "viz_series": crate::viz::MAX_VIZ_SERIES_PER_SNAPSHOT,
             "viz_points_per_series": crate::viz::MAX_VIZ_POINTS_PER_SERIES,
             "viz_points": crate::viz::MAX_VIZ_POINTS_PER_SNAPSHOT,
@@ -729,6 +796,19 @@ fn caps(ctx: &QueryCtx<'_>, source: IngressSource) -> Value {
             "presence_max_ttl_secs": crate::presence::MAX_PRESENCE_TTL_SECS,
         },
         "viz_kinds": crate::viz::REGISTERED_VIZ_KINDS,
+        // The terminals organ (#49), append-only beside `viz_kinds`.
+        // `spawn_fields` and `place_fields` are the honesty contract: they
+        // name exactly which payload keys the applier will act on, so a
+        // caller learns the geometry refusal from `caps` rather than from
+        // an `unsupported` ack. Empty means "this verb takes no fields".
+        "terminals": {
+            "live": ctx.terminals.len(),
+            "max": crate::identity::max_live_terminals(&ctx.config.terminal),
+            "pool": crate::identity::MAX_LIVE_TERMINALS,
+            "verbs": ["spawn", "place", "focus", "close"],
+            "spawn_fields": [],
+            "place_fields": ["cols", "rows"],
+        },
         "avatar_models": crate::osc::AVATAR_MODELS,
         // #23 honesty: the scene-level capabilities THIS caller's ingress
         // tier carries, derived from trusted config — discoverable before
@@ -1244,14 +1324,35 @@ mod tests {
         app.insert_resource(config);
         // The terminal seat, mirroring main()/setup_scene's spawns for the
         // components this harness needs.
-        app.world_mut().spawn((
-            TerminalInlineObjects::default(),
-            TerminalPlaneWarp::default(),
-            TerminalRedrawState::default(),
-            runtime,
-            crate::identity::TerminalIdentity::test_boot(),
-            crate::identity::terminal_session_state(),
-        ));
+        let seat = app
+            .world_mut()
+            .spawn((
+                TerminalInlineObjects::default(),
+                TerminalPlaneWarp::default(),
+                TerminalRedrawState::default(),
+                runtime,
+                crate::identity::TerminalIdentity::test_boot(),
+                crate::identity::terminal_session_state(),
+            ))
+            .id();
+        // The boot seat as the real spawner would leave it: its lease
+        // taken and bound, and a wire row carrying a minted handle. A
+        // fresh registry's first allocation IS `test_boot()` (id 1,
+        // namespace 0), so the two agree.
+        app.init_resource::<QuerySession>();
+        let mut registry = crate::identity::TerminalRegistry::default();
+        let identity = registry.allocate().expect("a fresh registry has slots");
+        registry
+            .bind(identity.id(), seat)
+            .expect("the lease is live");
+        app.insert_resource(registry);
+        let handle = app
+            .world_mut()
+            .resource_mut::<QuerySession>()
+            .mint_execution_id();
+        let mut roster = crate::terminals::TerminalRoster::default();
+        roster.insert(identity.id(), handle, None, false);
+        app.insert_resource(roster);
         app.init_resource::<AiObjectRegistry>();
         app.init_resource::<CursorSettings>();
         app.init_resource::<QuerySession>();
@@ -1334,6 +1435,149 @@ mod tests {
 
     fn payload(reply: &ParsedReply) -> Value {
         serde_json::from_slice(&reply.data).expect("reply payload is JSON")
+    }
+
+    /// Adds a second seat the way the real spawner would: a lease from
+    /// the app's own registry, bound to the seat, plus a roster row with a
+    /// minted handle. Returns its identity, transport host and handle.
+    fn add_seat(
+        app: &mut App,
+        creator: Option<crate::identity::TerminalId>,
+    ) -> (
+        crate::identity::TerminalIdentity,
+        VirtualTerminalHost,
+        String,
+    ) {
+        let identity = app
+            .world_mut()
+            .resource_mut::<crate::identity::TerminalRegistry>()
+            .allocate()
+            .expect("the test pool is nowhere near 128 seats");
+        let (runtime, host) = TerminalRuntime::virtual_channel(
+            &crate::config::AppConfig::default(),
+            identity.ingress(),
+        );
+        let seat = app
+            .world_mut()
+            .spawn((
+                TerminalInlineObjects::default(),
+                TerminalPlaneWarp::default(),
+                TerminalRedrawState::default(),
+                runtime,
+                identity,
+                crate::identity::terminal_session_state(),
+            ))
+            .id();
+        app.world_mut()
+            .resource_mut::<crate::identity::TerminalRegistry>()
+            .bind(identity.id(), seat)
+            .expect("the just-allocated lease is live");
+        let handle = app
+            .world_mut()
+            .resource_mut::<QuerySession>()
+            .mint_execution_id();
+        app.world_mut()
+            .resource_mut::<crate::terminals::TerminalRoster>()
+            .insert(identity.id(), handle.clone(), creator, creator.is_some());
+        (identity, host, handle)
+    }
+
+    /// `state.terminals` enumerates every live terminal as tier-1
+    /// scene-global state — the quads are visibly on screen — with the
+    /// live grid resolved from each seat's own parser.
+    #[test]
+    fn state_terminals_lists_every_seat_with_its_live_grid() {
+        let (mut app, host) = test_app();
+        let reply = run_query(&mut app, &host, "q1", "state.terminals", None);
+        assert!(reply.ok);
+        let items = payload(&reply)["items"]
+            .as_array()
+            .expect("items array")
+            .clone();
+        assert_eq!(items.len(), 1, "the boot seat");
+        assert_eq!(items[0]["state"], json!("ready"));
+        assert_eq!(items[0]["ns"], json!(0), "the boot seat leases namespace 0");
+        assert!(
+            items[0]["id"].as_str().is_some_and(|id| !id.is_empty()),
+            "every terminal is addressable by handle"
+        );
+        // Placement is reported as live truth, not as a promise: nothing
+        // in this build renders a per-terminal position or scale.
+        assert_eq!(items[0]["x"], json!(0.0));
+        assert_eq!(items[0]["scale"], json!(1.0));
+        assert!(
+            items[0]["cols"].as_u64().is_some(),
+            "the grid comes from the seat's own parser screen"
+        );
+
+        let (id_b, _host_b, handle_b) = add_seat(&mut app, None);
+        assert_eq!(
+            app.world_mut()
+                .query::<&crate::identity::TerminalIdentity>()
+                .iter(app.world())
+                .count(),
+            2,
+            "seat count asserted (#58 rider)"
+        );
+        let reply = run_query(&mut app, &host, "q2", "state.terminals", None);
+        let items = payload(&reply)["items"]
+            .as_array()
+            .expect("items array")
+            .clone();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[1]["id"], json!(handle_b), "rows list in mint order");
+        assert_eq!(items[1]["ns"], json!(id_b.namespace()));
+    }
+
+    /// `creator` is the one own-scoped field (#56 decision 15), and its
+    /// value is the creator's namespace ordinal. Foreign queriers see the
+    /// key absent — never null, which would be a distinguishable
+    /// "exists but hidden" marker.
+    #[test]
+    fn the_creator_field_is_own_scoped_and_never_leaks_under_another_key() {
+        let (mut app, host_a) = test_app();
+        let boot = crate::identity::TerminalIdentity::test_boot().id();
+        let (_id_b, host_b, handle_b) = add_seat(&mut app, Some(boot));
+        let (_id_c, host_c, _handle_c) = add_seat(&mut app, None);
+
+        // A created B, so A sees the creator field on B's row.
+        let reply = run_query(&mut app, &host_a, "qa", "state.terminals", None);
+        let items = payload(&reply)["items"].as_array().expect("items").clone();
+        let row_b = items
+            .iter()
+            .find(|row| row["id"] == json!(handle_b))
+            .expect("B is listed");
+        assert_eq!(
+            row_b["creator"],
+            json!(0),
+            "the creator's namespace ordinal, resolved live"
+        );
+
+        // C did not create B, so the key is absent from C's view.
+        let reply = run_query(&mut app, &host_c, "qc", "state.terminals", None);
+        let items = payload(&reply)["items"].as_array().expect("items").clone();
+        let row_b = items
+            .iter()
+            .find(|row| row["id"] == json!(handle_b))
+            .expect("B is still listed — the ROW is public, only creator is scoped");
+        assert!(
+            row_b.get("creator").is_none(),
+            "absent when foreign, never a null that says 'someone owns this'"
+        );
+
+        // And it never rides any other key, for anyone: the namespace is
+        // a stable enumerable address, so a second spelling would defeat
+        // the scoping entirely.
+        for (host, token) in [(&host_a, "qa2"), (&host_b, "qb2"), (&host_c, "qc2")] {
+            let reply = run_query(&mut app, host, token, "state.terminals", None);
+            let items = payload(&reply)["items"].as_array().expect("items").clone();
+            for row in &items {
+                assert!(
+                    row.get("creator_ns").is_none(),
+                    "creator_ns is a snapshot field, never a wire key"
+                );
+            }
+        }
     }
 
     const ID: u32 = 0x8000_0001;
@@ -2356,6 +2600,21 @@ mod tests {
         // Both terminal grants are readable and both default DENY.
         assert_eq!(caps["trust"]["terminal_lifecycle"], json!(false));
         assert_eq!(caps["trust"]["terminal_focus"], json!(false));
+        // The terminals organ advertises its shape before a caller
+        // attempts a verb: `spawn_fields: []` and `place_fields` are the
+        // honesty contract for the fields the appliers refuse.
+        assert_eq!(caps["terminals"]["live"], json!(1));
+        assert_eq!(caps["terminals"]["max"], json!(4));
+        assert_eq!(caps["terminals"]["pool"], json!(128));
+        assert_eq!(caps["terminals"]["spawn_fields"], json!([]));
+        assert_eq!(caps["terminals"]["place_fields"], json!(["cols", "rows"]));
+        assert_eq!(
+            caps["limits"]["terminal_max_axis"],
+            json!(crate::identity::MAX_TERMINAL_AXIS)
+        );
+        // Terminals are not panes (#22): the #57 pane-0 contract holds
+        // until #86 ships, no matter how many terminals are live.
+        assert_eq!(caps["panes"], json!(1));
         assert_eq!(
             caps["limits"]["avatar_text_bytes"],
             json!(crate::avatar::MAX_AVATAR_TEXT_BYTES)
