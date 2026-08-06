@@ -404,7 +404,12 @@ pub fn start(canvas_selector: &str, config_toml: Option<String>) -> Result<Ratty
     // dresses it with the world-derived per-terminal components. Nothing
     // runs between this spawn and run().
     app.insert_resource(registry);
-    app.world_mut().spawn((terminal, runtime, identity));
+    app.world_mut().spawn((
+        terminal,
+        runtime,
+        identity,
+        crate::identity::terminal_session_state(),
+    ));
 
     // Bevy's winit runner on wasm spawns onto the browser event loop and
     // returns, so the session handle is live after this call.

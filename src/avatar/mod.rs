@@ -63,7 +63,7 @@ pub use present::{
 };
 
 use crate::query_channel::{
-    AckOutcome, AiDiagnostics, QuerySession, ack_commit, ack_commit_long_running, reject,
+    AckOutcome, DiagnosticsSink, QuerySession, ack_commit, ack_commit_long_running, reject,
 };
 
 // ── Limits (advertised in `caps.limits`) ──
@@ -721,7 +721,7 @@ pub fn apply_avatar_commands(
     app_config: Res<AppConfig>,
     mut session: ResMut<QuerySession>,
     mut acks: MessageWriter<AckOutcome>,
-    mut diagnostics: ResMut<AiDiagnostics>,
+    mut diagnostics: DiagnosticsSink,
 ) {
     let now = time.elapsed();
     for AiCommand {
@@ -1225,7 +1225,10 @@ mod tests {
         config.trust.local.avatar_scene = avatar_scene;
         app.insert_resource(config);
         app.init_resource::<AvatarState>();
-        app.init_resource::<AiDiagnostics>();
+        app.world_mut().spawn((
+            crate::identity::TerminalIdentity::test_boot(),
+            crate::identity::terminal_session_state(),
+        ));
         app.init_resource::<QuerySession>();
         app.init_resource::<Time>();
         app.add_message::<AiCommand>();

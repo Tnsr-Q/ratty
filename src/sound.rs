@@ -37,7 +37,7 @@ use crate::ai::AiCommand;
 use crate::config::AppConfig;
 use crate::osc::{RattyAiCommand, SoundKindClass};
 use crate::query::codes;
-use crate::query_channel::{AckOutcome, AiDiagnostics, ack_commit, ack_commit_qualified};
+use crate::query_channel::{AckOutcome, DiagnosticsSink, ack_commit, ack_commit_qualified};
 
 /// Global cap on simultaneously live one-shot voices: an honest failure
 /// instead of unbounded mixer load driven by untrusted output.
@@ -446,7 +446,7 @@ pub fn apply_sound_commands(
     app_config: Res<AppConfig>,
     time: Res<Time>,
     mut acks: MessageWriter<AckOutcome>,
-    mut diagnostics: ResMut<AiDiagnostics>,
+    mut diagnostics: DiagnosticsSink,
 ) {
     let now = time.elapsed_secs_f64();
     // Backstop for a device-less backend: the playback layer never observes
@@ -1075,7 +1075,10 @@ mod tests {
         let mut app = App::new();
         app.insert_resource(config);
         app.init_resource::<SoundState>();
-        app.init_resource::<AiDiagnostics>();
+        app.world_mut().spawn((
+            crate::identity::TerminalIdentity::test_boot(),
+            crate::identity::terminal_session_state(),
+        ));
         app.init_resource::<Time>();
         app.init_resource::<AckLog>();
         app.add_message::<AiCommand>();

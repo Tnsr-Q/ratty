@@ -609,10 +609,15 @@ pub fn spawn_terminal<E>(
             return Err(SpawnTerminalError::Build(error));
         }
     };
-    // The seat is born carrying its identity, then dressed in the same
-    // command batch — the publisher can never observe a seat without its
-    // mailbox (commands apply atomically).
-    let seat = params.commands.spawn(identity).id();
+    // The seat is born carrying its identity and Default-fresh
+    // session-half state, then dressed in the same command batch — the
+    // publisher can never observe a seat without its mailbox (commands
+    // apply atomically), and a recycled namespace slot's next tenant can
+    // never inherit a prior tenant's session state.
+    let seat = params
+        .commands
+        .spawn((identity, crate::identity::terminal_session_state()))
+        .id();
     dress_terminal_seat(params, seat, identity, &mut surface, &mut runtime);
     params.commands.entity(seat).insert((surface, runtime));
     Ok((seat, identity))

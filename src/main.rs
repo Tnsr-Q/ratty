@@ -14,7 +14,7 @@ use winit::window::Icon;
 
 use ratty::cli::Cli;
 use ratty::config::AppConfig;
-use ratty::identity::TerminalRegistry;
+use ratty::identity::{TerminalRegistry, terminal_session_state};
 use ratty::paths::runtime_asset_root;
 use ratty::plugin::TerminalPlugin;
 use ratty::runtime::{RuntimeOptions, TerminalRuntime};
@@ -116,7 +116,8 @@ fn main() -> anyhow::Result<()> {
     // dresses it with the world-derived per-terminal components. Nothing
     // runs between this spawn and run().
     app.insert_resource(registry);
-    app.world_mut().spawn((terminal, runtime, identity));
+    app.world_mut()
+        .spawn((terminal, runtime, identity, terminal_session_state()));
     app.run();
 
     Ok(())

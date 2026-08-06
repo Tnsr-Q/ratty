@@ -26,7 +26,7 @@ use bevy::prelude::*;
 use crate::ai::{AiCommand, CommandOrigin};
 use crate::osc::RattyAiCommand;
 use crate::query::codes;
-use crate::query_channel::{AckOutcome, AiDiagnostics, ack_commit};
+use crate::query_channel::{AckOutcome, DiagnosticsSink, ack_commit};
 use crate::runtime::IngressSource;
 use crate::scene::{TerminalPlaneWarp, TerminalPresentation, TerminalPresentationMode};
 
@@ -145,7 +145,7 @@ pub fn apply_bookmark_commands(
     plane_warp: Query<&TerminalPlaneWarp>,
     mut pending: ResMut<PendingBookmarkJumps>,
     mut acks: MessageWriter<AckOutcome>,
-    mut diagnostics: ResMut<AiDiagnostics>,
+    mut diagnostics: DiagnosticsSink,
 ) {
     let plane_warp = match plane_warp.single() {
         Ok(plane_warp) => plane_warp,
@@ -316,11 +316,14 @@ mod tests {
         let mut app = App::new();
         app.init_resource::<BookmarkRegistry>();
         app.init_resource::<PendingBookmarkJumps>();
-        app.init_resource::<AiDiagnostics>();
         app.insert_resource(TerminalPresentation {
             mode: TerminalPresentationMode::Flat2d,
         });
-        app.world_mut().spawn(TerminalPlaneWarp::default());
+        app.world_mut().spawn((
+            TerminalPlaneWarp::default(),
+            crate::identity::TerminalIdentity::test_boot(),
+            crate::identity::terminal_session_state(),
+        ));
         app.add_message::<AiCommand>();
         app.add_message::<AckOutcome>();
         app.add_systems(

@@ -77,7 +77,7 @@ use serde_json::{Value, json};
 use crate::ai::{AiCommand, CommandOrigin};
 use crate::osc::{MacroScope, RattyAiCommand};
 use crate::query::codes;
-use crate::query_channel::{AckOutcome, AiDiagnostics, ack_commit, reject};
+use crate::query_channel::{AckOutcome, DiagnosticsSink, ack_commit, reject};
 use crate::runtime::IngressSource;
 
 /// Upper bound on stored macros per agent namespace: an honest failure
@@ -760,7 +760,7 @@ pub fn apply_macro_commands(
     mut registry: ResMut<MacroRegistry>,
     mut session: ResMut<crate::query_channel::QuerySession>,
     mut acks: MessageWriter<AckOutcome>,
-    mut diagnostics: ResMut<AiDiagnostics>,
+    mut diagnostics: DiagnosticsSink,
 ) {
     let now = time.elapsed();
     for AiCommand {
@@ -1677,7 +1677,10 @@ mod tests {
     fn app_test() -> App {
         let mut app = App::new();
         app.init_resource::<MacroRegistry>();
-        app.init_resource::<AiDiagnostics>();
+        app.world_mut().spawn((
+            crate::identity::TerminalIdentity::test_boot(),
+            crate::identity::terminal_session_state(),
+        ));
         app.init_resource::<crate::query_channel::QuerySession>();
         app.init_resource::<Time>();
         app.add_message::<AiCommand>();

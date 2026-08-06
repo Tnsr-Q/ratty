@@ -106,7 +106,7 @@ use crate::ai::{AiCommand, CommandOrigin};
 use crate::config::CURSOR_DEPTH;
 use crate::osc::RattyAiCommand;
 use crate::query::codes;
-use crate::query_channel::{AckOutcome, AiDiagnostics, ack_commit, reject};
+use crate::query_channel::{AckOutcome, DiagnosticsSink, ack_commit, reject};
 use crate::scene::{
     MobiusTransition, TerminalPlane, TerminalPlaneWarp, TerminalPresentation,
     TerminalPresentationMode, TerminalViewport,
@@ -1229,7 +1229,7 @@ pub fn apply_presence_commands(
     mut registry: ResMut<PresenceRegistry>,
     mut redraw: Query<&mut TerminalRedrawState>,
     mut acks: MessageWriter<AckOutcome>,
-    mut diagnostics: ResMut<AiDiagnostics>,
+    mut diagnostics: DiagnosticsSink,
 ) {
     let mut redraw = match redraw.single_mut() {
         Ok(redraw) => redraw,
@@ -2047,9 +2047,12 @@ mod tests {
 
     fn app_test() -> App {
         let mut app = App::new();
-        app.world_mut().spawn(TerminalRedrawState::default());
+        app.world_mut().spawn((
+            TerminalRedrawState::default(),
+            crate::identity::TerminalIdentity::test_boot(),
+            crate::identity::terminal_session_state(),
+        ));
         app.init_resource::<PresenceRegistry>();
-        app.init_resource::<AiDiagnostics>();
         app.init_resource::<Time>();
         app.add_message::<AiCommand>();
         app.add_message::<AckOutcome>();

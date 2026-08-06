@@ -73,7 +73,7 @@ use crate::config::{AppConfig, TrustedRuleConfig};
 use crate::macros::MacroRegistry;
 use crate::osc::{RattyAiCommand, ai_object_namespace};
 use crate::query::codes;
-use crate::query_channel::{AckOutcome, AiDiagnostics, ack_commit, reject};
+use crate::query_channel::{AckOutcome, DiagnosticsSink, ack_commit, reject};
 use crate::runtime::IngressSource;
 
 /// Upper bound on stored rules per agent namespace: an honest failure
@@ -1042,7 +1042,7 @@ pub fn apply_reactive_commands(
     mut registry: ResMut<ReactiveRegistry>,
     macros: Res<MacroRegistry>,
     mut acks: MessageWriter<AckOutcome>,
-    mut diagnostics: ResMut<AiDiagnostics>,
+    mut diagnostics: DiagnosticsSink,
 ) {
     let now = time.elapsed();
     for AiCommand {
@@ -2290,7 +2290,10 @@ action = "flash;color=%23ff0000&duration=0.4"
         let mut app = App::new();
         app.init_resource::<ReactiveRegistry>();
         app.init_resource::<MacroRegistry>();
-        app.init_resource::<AiDiagnostics>();
+        app.world_mut().spawn((
+            crate::identity::TerminalIdentity::test_boot(),
+            crate::identity::terminal_session_state(),
+        ));
         app.init_resource::<Time>();
         app.add_message::<AiCommand>();
         app.add_message::<AckOutcome>();

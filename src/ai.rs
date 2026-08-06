@@ -131,7 +131,6 @@ impl Plugin for RattyAiPlugin {
             .add_message::<crate::query_channel::AckOutcome>()
             .init_resource::<AiObjectRegistry>()
             .init_resource::<crate::query_channel::QuerySession>()
-            .init_resource::<crate::query_channel::AiDiagnostics>()
             .add_systems(
                 Update,
                 apply_ai_commands
@@ -185,7 +184,7 @@ pub fn apply_ai_commands(
     mut stage_tween: ResMut<StageTween>,
     mut redraw: Query<&mut TerminalRedrawState>,
     mut acks: MessageWriter<crate::query_channel::AckOutcome>,
-    mut diagnostics: ResMut<crate::query_channel::AiDiagnostics>,
+    mut diagnostics: crate::query_channel::DiagnosticsSink,
 ) {
     use crate::query::codes;
     use crate::query_channel::{ack_commit, reject};
@@ -362,7 +361,7 @@ pub fn apply_ai_object_commands(
     app_config: Res<AppConfig>,
     mut redraw: Query<&mut TerminalRedrawState>,
     mut acks: MessageWriter<crate::query_channel::AckOutcome>,
-    mut diagnostics: ResMut<crate::query_channel::AiDiagnostics>,
+    mut diagnostics: crate::query_channel::DiagnosticsSink,
 ) {
     use crate::query::codes;
     use crate::query_channel::ack_commit;
@@ -735,10 +734,11 @@ mod tests {
         app.world_mut().spawn((
             TerminalInlineObjects::default(),
             crate::terminal::TerminalRedrawState::default(),
+            crate::identity::TerminalIdentity::test_boot(),
+            crate::identity::terminal_session_state(),
         ));
         app.init_resource::<AiObjectRegistry>();
         app.init_resource::<CursorSettings>();
-        app.init_resource::<crate::query_channel::AiDiagnostics>();
         app.init_resource::<crate::viz::VizRegistry>();
         app.init_resource::<RemovedLog>();
         app.add_message::<AiCommand>();

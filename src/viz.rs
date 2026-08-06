@@ -39,7 +39,7 @@ use bevy::prelude::*;
 use crate::ai::AiCommand;
 use crate::osc::{RattyAiCommand, ai_object_namespace};
 use crate::query::codes;
-use crate::query_channel::{AckOutcome, AiDiagnostics, ack_commit};
+use crate::query_channel::{AckOutcome, DiagnosticsSink, ack_commit};
 
 // The payload/item/label limits are part of the wire contract and live in
 // the shared std-only `osc` module so the `ratty-ai` collectors compile
@@ -897,7 +897,7 @@ pub fn apply_viz_commands(
     mut commands: MessageReader<AiCommand>,
     mut registry: ResMut<VizRegistry>,
     mut acks: MessageWriter<AckOutcome>,
-    mut diagnostics: ResMut<AiDiagnostics>,
+    mut diagnostics: DiagnosticsSink,
     mut redraw: Query<&mut crate::terminal::TerminalRedrawState>,
 ) {
     // Chart-family kinds carry a vello underlay inside the terminal
@@ -1496,10 +1496,12 @@ mod tests {
 
     fn test_app() -> App {
         let mut app = App::new();
-        app.world_mut()
-            .spawn(crate::terminal::TerminalRedrawState::default());
+        app.world_mut().spawn((
+            crate::terminal::TerminalRedrawState::default(),
+            crate::identity::TerminalIdentity::test_boot(),
+            crate::identity::terminal_session_state(),
+        ));
         app.init_resource::<VizRegistry>();
-        app.init_resource::<AiDiagnostics>();
         app.add_message::<AiCommand>();
         app.add_message::<AckOutcome>();
         app.add_systems(Update, apply_viz_commands);

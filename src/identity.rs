@@ -85,6 +85,15 @@ impl TerminalIdentity {
     }
 }
 
+/// The per-terminal session-half state (#56 decision 5) every seat is
+/// born with, alongside its [`TerminalIdentity`]. Freshness for a
+/// recycled namespace slot's next tenant is not a cleanup discipline —
+/// it is `Default::default()` at spawn, unconditionally; the session
+/// halves die with the seat entity and can never be inherited.
+pub fn terminal_session_state() -> impl bevy::ecs::bundle::Bundle {
+    (crate::query_channel::TerminalDiagnostics::default(),)
+}
+
 /// A live terminal's registry row: the leased namespace plus the seat
 /// entity once [`TerminalRegistry::bind`] runs.
 struct LiveTerminal {
