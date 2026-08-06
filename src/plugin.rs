@@ -3,6 +3,10 @@
 use bevy::prelude::*;
 
 use crate::direct_render::DirectTerminalRenderPlugin;
+use crate::focus::{
+    FocusGained, FocusLost, FocusRequest, FocusedTerminal, drain_focus_requests,
+    focus_boot_terminal,
+};
 use crate::inline::{
     TerminalInlineObjectPlane, TerminalInlineObjectSprite, TerminalInlineObjects, TerminalRgpObject,
 };
@@ -45,8 +49,28 @@ impl Plugin for TerminalPlugin {
             .init_resource::<crate::model::CursorSettings>()
             .init_resource::<TerminalKeyBindings>()
             .init_resource::<StageTween>()
+            .init_resource::<FocusedTerminal>()
+            .add_message::<FocusRequest>()
+            .add_message::<FocusGained>()
+            .add_message::<FocusLost>()
             .init_non_send::<TerminalClipboard>()
             .add_systems(Startup, setup_scene)
+            // Boot lifecycle policy (#56 decision 8): startup focuses the
+            // boot seat through the same request bus as every other writer.
+            .add_systems(Startup, focus_boot_terminal.after(setup_scene))
+            // The single focus writer (invariant 2), after every request
+            // emitter in the tree and before every focus consumer: the
+            // render set (blink, materials), the presentation applier
+            // (plane visibility), and the cursor sync behind them.
+            .add_systems(
+                Update,
+                drain_focus_requests
+                    .after(handle_keyboard_input)
+                    .after(handle_mouse_input)
+                    .after(crate::ai::apply_ai_commands)
+                    .before(apply_terminal_presentation)
+                    .before(TerminalRedrawSet),
+            )
             .add_systems(Update, request_exit_on_primary_window_close)
             .add_systems(Update, pump_pty_output)
             .add_systems(Update, handle_keyboard_input)
