@@ -19,6 +19,13 @@ use crate::terminal::TerminalSurface;
 const SELECTION_DRAG_THRESHOLD: f32 = 4.0;
 
 /// Active terminal text selection.
+///
+/// One selection exists screen-wide until picking lands (M4.6), but it
+/// BELONGS to the terminal it was made on (#56 decision 11: selections
+/// survive focus loss — on their own terminal): `owner` records the seat
+/// the press-capture started on, and every consumer (render, copy,
+/// typing-clear) attributes through it. `None` means unowned (a fresh
+/// state, or a test-made selection) and falls back to focused-only.
 #[derive(Resource, Clone, Default)]
 pub struct TerminalSelection {
     start: Option<UVec2>,
@@ -27,6 +34,7 @@ pub struct TerminalSelection {
     pending_position: Option<Vec2>,
     dragging: bool,
     cursor_position: Option<Vec2>,
+    owner: Option<Entity>,
 }
 
 #[derive(Default)]
@@ -172,7 +180,23 @@ impl TerminalSelection {
         self.pending_position = None;
         self.dragging = false;
         self.cursor_position = None;
+        self.owner = None;
         changed
+    }
+
+    /// Stamps the seat this selection belongs to (the press-capture
+    /// terminal); set where the drag begins.
+    pub(crate) fn set_owner(&mut self, owner: Entity) {
+        self.owner = Some(owner);
+    }
+
+    /// Whether `seat` may treat this selection as its own: it owns it, or
+    /// the selection is unowned (fresh, or test-made) and falls back to
+    /// whoever asks. A selection owned elsewhere is standing state — it
+    /// must neither render on, be copied from, nor be cleared by another
+    /// terminal (#56 decision 11).
+    pub(crate) fn owned_by_or_unowned(&self, seat: Entity) -> bool {
+        self.owner.is_none_or(|owner| owner == seat)
     }
 
     /// Stores the current pointer position.
@@ -237,6 +261,7 @@ impl TerminalSelection {
 #[derive(SystemParam)]
 pub struct MouseSystemParams<'w, 's> {
     primary_window: Query<'w, 's, (Entity, &'static Window), With<PrimaryWindow>>,
+    focus: Res<'w, crate::focus::FocusedTerminal>,
     runtime: Query<'w, 's, &'static mut TerminalRuntime>,
     terminal: Query<'w, 's, &'static TerminalSurface>,
     viewport: Query<'w, 's, &'static TerminalViewport>,
@@ -259,6 +284,7 @@ pub(crate) fn handle_mouse_input(
 ) {
     let MouseSystemParams {
         primary_window,
+        focus,
         runtime,
         terminal,
         viewport,
@@ -269,47 +295,26 @@ pub(crate) fn handle_mouse_input(
         selection,
         redraw,
     } = &mut params;
-    let terminal = match terminal.single() {
-        Ok(terminal) => terminal,
-        Err(err) => {
-            // Latched once per process: the surface lives on THE terminal
-            // seat, and the miss must name its system (#54's silent-.single()
-            // finding).
-            warn_once!("handle_mouse_input: the surface needs exactly one terminal seat: {err}");
-            return;
-        }
+    // Until cell picking lands (M4.6), the pointer addresses the FOCUSED
+    // terminal: selection, forwarding and wheel all resolve through the
+    // focus authority. Zero focused only happens with zero terminals —
+    // nothing to select, forward to, or orbit around — so the whole
+    // system no-ops (Flat2d N=1 behavior is byte-identical: the boot
+    // seat is focused by policy).
+    let Some(focused) = focus.get() else {
+        return;
     };
-    let viewport = match viewport.single() {
-        Ok(viewport) => viewport,
-        Err(err) => {
-            // Latched once per process: the viewport lives on THE terminal
-            // seat, and the miss must name its system (#54's silent-.single()
-            // finding).
-            warn_once!("handle_mouse_input: the viewport needs exactly one terminal seat: {err}");
-            return;
-        }
+    let Ok(terminal) = terminal.get(focused) else {
+        return;
     };
-    let mut runtime = match runtime.single_mut() {
-        Ok(runtime) => runtime,
-        Err(err) => {
-            // Latched once per process: the runtime lives on THE terminal
-            // seat, and the miss must name its system (#54's silent-.single()
-            // finding).
-            warn_once!("handle_mouse_input: the runtime needs exactly one terminal seat: {err}");
-            return;
-        }
+    let Ok(viewport) = viewport.get(focused) else {
+        return;
     };
-    let mut redraw = match redraw.single_mut() {
-        Ok(redraw) => redraw,
-        Err(err) => {
-            // Latched once per process: the redraw flag lives on THE terminal
-            // seat, and the miss must name its system (#54's silent-.single()
-            // finding).
-            warn_once!(
-                "handle_mouse_input: the redraw flag needs exactly one terminal seat: {err}"
-            );
-            return;
-        }
+    let Ok(mut runtime) = runtime.get_mut(focused) else {
+        return;
+    };
+    let Ok(mut redraw) = redraw.get_mut(focused) else {
+        return;
     };
     let Ok((primary_window, window)) = primary_window.single() else {
         return;
@@ -430,6 +435,10 @@ pub(crate) fn handle_mouse_input(
                     && let Some(cell) = position_to_cell(pos, window_size, viewport, terminal)
                     && selection.begin_pending(cell, pos)
                 {
+                    // The press-capture terminal owns the selection for its
+                    // whole life (#56 decision 11): under M4.4's routing
+                    // that is the focused seat.
+                    selection.set_owner(focused);
                     redraw.request();
                 }
             }
@@ -572,7 +581,9 @@ pub(crate) fn handle_mouse_input(
                 let current = screen.scrollback() as isize;
                 let next = (current + amount).max(0) as usize;
                 screen.set_scrollback(next);
-                selection.clear();
+                if selection.owned_by_or_unowned(focused) {
+                    selection.clear();
+                }
                 redraw.request();
             }
         } else if matches!(

@@ -115,8 +115,10 @@ struct Pulse {
     total: f32,
 }
 
-/// The live emotional state of the terminal.
-#[derive(Resource, Default)]
+/// The live emotional state of ONE terminal (#56 decision 14: state is
+/// per-runtime, seated with the session halves and dying with the seat;
+/// the render is focused-wash — see [`animate_ai_effects`]).
+#[derive(Component, Default)]
 pub struct AiEffects {
     clock: f32,
     flash: Option<Flash>,
@@ -320,20 +322,22 @@ pub struct AiEffectsPlugin;
 
 impl Plugin for AiEffectsPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<AiEffects>()
-            .add_systems(Startup, setup_ai_effects)
-            .add_systems(
-                Update,
-                // Ordered after the pump like the other two AiCommand
-                // appliers, so a same-chunk effect-command-then-query
-                // observes the applied effect and its ack precedes the
-                // query reply (answer_queries orders after this system).
-                (
-                    apply_ai_effect_commands.after(crate::systems::pump_pty_output),
-                    animate_ai_effects,
-                )
-                    .chain(),
-            );
+        // AiEffects is a seat component since M4.4 (decision 14): born in
+        // `terminal_session_state`, dead with the seat — no resource here.
+        app.add_systems(Startup, setup_ai_effects).add_systems(
+            Update,
+            // Ordered after the pump like the other two AiCommand
+            // appliers, so a same-chunk effect-command-then-query
+            // observes the applied effect and its ack precedes the
+            // query reply (answer_queries orders after this system).
+            // The animator reads focus, so it runs after the drain —
+            // the wash follows a focus flip the same frame.
+            (
+                apply_ai_effect_commands.after(crate::systems::pump_pty_output),
+                animate_ai_effects.after(crate::focus::drain_focus_requests),
+            )
+                .chain(),
+        );
     }
 }
 
@@ -365,30 +369,23 @@ fn setup_ai_effects(mut commands: Commands) {
 }
 
 /// Applies `flash`/`pulse`/`tint`/`think`/`confidence`/`mood`/`reset`
-/// commands to the effect state.
+/// commands to the ARRIVAL terminal's effect state (#56 decision 14: the
+/// route is the stamped source, and the redraw request lands on that
+/// seat). A command whose arrival terminal died is dropped with a warn,
+/// never rerouted — the `DiagnosticsSink` posture.
 ///
 /// This system owns the ack for the six effect commands (they always
 /// commit). `reset` is acked by `apply_ai_commands`, which owns that
 /// command's single ack.
 pub(crate) fn apply_ai_effect_commands(
     mut commands: MessageReader<AiCommand>,
-    mut effects: ResMut<AiEffects>,
+    mut seats: Query<(
+        &crate::identity::TerminalIdentity,
+        &mut AiEffects,
+        &mut TerminalRedrawState,
+    )>,
     mut acks: MessageWriter<crate::query_channel::AckOutcome>,
-    mut redraw: Query<&mut TerminalRedrawState>,
 ) {
-    let mut redraw = match redraw.single_mut() {
-        Ok(redraw) => redraw,
-        Err(err) => {
-            // Latched once per process: the redraw flag lives on THE terminal
-            // seat, and the miss must name its system (#54's silent-.single()
-            // finding).
-            warn_once!(
-                "apply_ai_effect_commands: the redraw flag needs exactly one terminal seat: {err}"
-            );
-            return;
-        }
-    };
-    let mut changed = false;
     for AiCommand {
         source,
         ack_token,
@@ -396,21 +393,50 @@ pub(crate) fn apply_ai_effect_commands(
         ..
     } in commands.read()
     {
+        // Full session reset is scene-wide by contract (the object ledger
+        // and presence reset globally too): every seat's effects clear
+        // and every seat repaints. Reset's single ack belongs to
+        // `apply_ai_commands`.
+        if matches!(command, RattyAiCommand::Reset) {
+            for (_, mut effects, mut redraw) in seats.iter_mut() {
+                effects.clear();
+                redraw.request();
+            }
+            continue;
+        }
+        // Foreign command families fall through without a seat lookup.
+        if !matches!(
+            command,
+            RattyAiCommand::Flash { .. }
+                | RattyAiCommand::Pulse { .. }
+                | RattyAiCommand::Tint { .. }
+                | RattyAiCommand::Think { .. }
+                | RattyAiCommand::Confidence { .. }
+                | RattyAiCommand::Mood { .. }
+        ) {
+            continue;
+        }
+        let Some((_, mut effects, mut redraw)) = seats
+            .iter_mut()
+            .find(|(identity, ..)| identity.id() == source.terminal())
+        else {
+            warn!(
+                "apply_ai_effect_commands: dropping an effect command whose arrival terminal is gone"
+            );
+            continue;
+        };
         match command {
             RattyAiCommand::Flash { color, duration } => {
                 effects.set_flash(parse_color(color), *duration);
-                changed = true;
             }
             RattyAiCommand::Pulse {
                 intensity,
                 duration,
             } => {
                 effects.set_pulse(*intensity, *duration);
-                changed = true;
             }
             RattyAiCommand::Tint { color, opacity } => {
                 effects.set_tint(parse_color(color), *opacity);
-                changed = true;
             }
             RattyAiCommand::Think { state } => {
                 effects.thinking = match state.as_str() {
@@ -418,64 +444,60 @@ pub(crate) fn apply_ai_effect_commands(
                     "end" => false,
                     _ => !effects.thinking,
                 };
-                changed = true;
             }
             RattyAiCommand::Confidence { level } => {
                 effects.confidence = Some(level.clamp(0.0, 1.0));
-                changed = true;
             }
             RattyAiCommand::Mood { mood } => {
                 effects.mood = Mood::parse(mood);
-                changed = true;
             }
-            RattyAiCommand::Reset => {
-                effects.clear();
-                changed = true;
-                continue;
-            }
-            _ => continue,
+            _ => unreachable!("filtered to effect commands above"),
         }
-        crate::query_channel::ack_commit(&mut acks, *source, ack_token);
-    }
-    if changed {
         redraw.request();
+        crate::query_channel::ack_commit(&mut acks, *source, ack_token);
     }
 }
 
-/// Advances the effect clock and writes the composite color to the sprite,
-/// keeping the frame alive while a time-varying effect is running.
+/// Advances every terminal's effect clock and writes the FOCUSED
+/// terminal's composite color to the one overlay sprite (#56 decision
+/// 14's focused-wash), keeping the frame alive while a focused
+/// time-varying effect is running.
+///
+/// The stated gap, deliberately not hidden: an unfocused terminal's mood
+/// does not render at all — its state stays live (clocks advance, the
+/// query channel projects it), which is what keeps this a rendering
+/// deferral rather than a data loss. The per-plane tint path rides map
+/// #42's composition return.
 fn animate_ai_effects(
     time: Res<Time>,
-    mut effects: ResMut<AiEffects>,
+    focus: Res<crate::focus::FocusedTerminal>,
+    mut seats: Query<(Entity, &mut AiEffects, &mut TerminalRedrawState)>,
     mut sprite: Query<&mut Sprite, With<AiEffectSprite>>,
-    mut redraw: Query<&mut TerminalRedrawState>,
 ) {
-    let mut redraw = match redraw.single_mut() {
-        Ok(redraw) => redraw,
-        Err(err) => {
-            // Latched once per process: the redraw flag lives on THE terminal
-            // seat, and the miss must name its system (#54's silent-.single()
-            // finding).
-            warn_once!(
-                "animate_ai_effects: the redraw flag needs exactly one terminal seat: {err}"
-            );
-            return;
-        }
-    };
-    effects.advance(time.delta_secs());
-    let (color, _) = effects.overlay();
-    if let Ok(mut sprite) = sprite.single_mut() {
-        // Only touch the component when the value actually moves, so an idle
-        // terminal does not churn change detection.
-        if sprite.color != color {
-            sprite.color = color;
+    let focused = focus.get();
+    // No focused terminal (legal, invariant 1): the wash is idle-clear.
+    let mut wash = Color::srgba(0.0, 0.0, 0.0, 0.0);
+    for (seat, mut effects, mut redraw) in seats.iter_mut() {
+        effects.advance(time.delta_secs());
+        if Some(seat) == focused {
+            let (color, _) = effects.overlay();
+            wash = color;
+            // Keep the frame alive only while something focused is
+            // actually moving; the last frame of a decaying effect was
+            // already requested the prior frame, so the fade-out's final
+            // transparent frame still renders.
+            if effects.animating() {
+                redraw.request();
+            }
         }
     }
-    // Keep the frame alive only while something is actually moving; the
-    // last frame of a decaying effect was already requested the prior frame,
-    // so the fade-out's final transparent frame still renders.
-    if effects.animating() {
-        redraw.request();
+    if let Ok(mut sprite) = sprite.single_mut() {
+        // Only touch the component when the value actually moves, so an idle
+        // terminal does not churn change detection. A focus flip moves the
+        // value by itself, so the wash follows focus with no extra wiring.
+        if sprite.color != wash {
+            sprite.color = wash;
+        }
     }
 }
 
@@ -483,6 +505,191 @@ fn animate_ai_effects(
 #[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
+
+    mod focused_wash {
+        use bevy::ecs::message::Messages;
+        use bevy::ecs::system::RunSystemOnce;
+
+        use super::*;
+        use crate::focus::FocusedTerminal;
+        use crate::identity::{TerminalIdentity, TerminalRegistry};
+        use crate::terminal::TerminalRedrawState;
+
+        const CLEAR: Color = Color::srgba(0.0, 0.0, 0.0, 0.0);
+
+        /// A world with two effect-bearing seats, the overlay sprite, and
+        /// the focus authority.
+        fn wash_world() -> (
+            World,
+            (Entity, TerminalIdentity),
+            (Entity, TerminalIdentity),
+        ) {
+            let mut world = World::new();
+            world.init_resource::<Time>();
+            world.init_resource::<FocusedTerminal>();
+            world.init_resource::<Messages<AiCommand>>();
+            world.init_resource::<Messages<crate::query_channel::AckOutcome>>();
+            let mut registry = TerminalRegistry::default();
+            let seat = |world: &mut World, registry: &mut TerminalRegistry| {
+                let identity = registry.allocate().expect("test lease");
+                let entity = world
+                    .spawn((
+                        identity,
+                        AiEffects::default(),
+                        TerminalRedrawState::default(),
+                    ))
+                    .id();
+                (entity, identity)
+            };
+            let seat_a = seat(&mut world, &mut registry);
+            let seat_b = seat(&mut world, &mut registry);
+            world.spawn((
+                AiEffectSprite,
+                Sprite {
+                    color: CLEAR,
+                    custom_size: Some(Vec2::splat(OVERLAY_SIZE)),
+                    ..default()
+                },
+            ));
+            (world, seat_a, seat_b)
+        }
+
+        fn tint_command(identity: TerminalIdentity) -> AiCommand {
+            AiCommand {
+                source: identity.ingress(),
+                // Tokened, so ack presence/absence discriminates below.
+                ack_token: Some("t1".into()),
+                origin: crate::ai::CommandOrigin::Wire,
+                command: RattyAiCommand::Tint {
+                    color: "#ff0000".into(),
+                    opacity: 1.0,
+                },
+            }
+        }
+
+        fn sprite_color(world: &mut World) -> Color {
+            world
+                .query_filtered::<&Sprite, With<AiEffectSprite>>()
+                .single(world)
+                .expect("one overlay sprite")
+                .color
+        }
+
+        #[test]
+        fn effect_commands_route_to_the_arrival_seat_and_the_wash_follows_focus() {
+            let (mut world, (seat_a, _id_a), (seat_b, id_b)) = wash_world();
+            assert_eq!(
+                world.query::<&TerminalIdentity>().iter(&world).count(),
+                2,
+                "seat count asserted (#58 rider)"
+            );
+
+            // B's transport carries the tint — deliberately the SECOND
+            // seat, so a broken router that grabs the first seat it
+            // iterates fails here — and only B's state mutates.
+            world
+                .resource_mut::<Messages<AiCommand>>()
+                .write(tint_command(id_b));
+            world
+                .run_system_once(apply_ai_effect_commands)
+                .expect("applier runs");
+            let tinted = |world: &mut World, seat: Entity| {
+                world
+                    .get::<AiEffects>(seat)
+                    .expect("seat has effects")
+                    .public_state()
+                    .tint
+            };
+            assert!(tinted(&mut world, seat_b), "the arrival seat is tinted");
+            assert!(
+                !tinted(&mut world, seat_a),
+                "a foreign seat's effects are untouched (decision 14 routing)"
+            );
+            assert_eq!(
+                world
+                    .resource_mut::<Messages<crate::query_channel::AckOutcome>>()
+                    .drain()
+                    .count(),
+                1,
+                "the committed tint acks exactly once"
+            );
+
+            // Focused-wash: with A focused, B's mood does not render (the
+            // decision 14 stated gap) — the wash is idle-clear. Focus B
+            // and the wash shows B's overlay, no extra wiring.
+            world
+                .resource_mut::<FocusedTerminal>()
+                .set_for_test(Some(seat_a));
+            world
+                .run_system_once(animate_ai_effects)
+                .expect("animator runs");
+            assert_eq!(
+                sprite_color(&mut world),
+                CLEAR,
+                "an unfocused terminal's effects do not wash the screen"
+            );
+
+            world
+                .resource_mut::<FocusedTerminal>()
+                .set_for_test(Some(seat_b));
+            world
+                .run_system_once(animate_ai_effects)
+                .expect("animator runs");
+            assert_ne!(
+                sprite_color(&mut world),
+                CLEAR,
+                "the wash follows focus to the tinted seat"
+            );
+
+            // And back: the wash clears again when focus leaves the tint.
+            world
+                .resource_mut::<FocusedTerminal>()
+                .set_for_test(Some(seat_a));
+            world
+                .run_system_once(animate_ai_effects)
+                .expect("animator runs");
+            assert_eq!(
+                sprite_color(&mut world),
+                CLEAR,
+                "the wash tracks every flip"
+            );
+        }
+
+        #[test]
+        fn a_dead_arrival_terminal_drops_the_command_without_a_panic() {
+            let (mut world, (seat_a, id_a), (seat_b, _id_b)) = wash_world();
+            world.despawn(seat_a);
+            assert_eq!(
+                world.query::<&TerminalIdentity>().iter(&world).count(),
+                1,
+                "seat count asserted (#58 rider)"
+            );
+            world
+                .resource_mut::<Messages<AiCommand>>()
+                .write(tint_command(id_a));
+            world
+                .run_system_once(apply_ai_effect_commands)
+                .expect("applier runs");
+            // The command was TOKENED (see tint_command): zero acks means
+            // the drop really happened, not that nothing asked for one.
+            assert_eq!(
+                world
+                    .resource_mut::<Messages<crate::query_channel::AckOutcome>>()
+                    .drain()
+                    .count(),
+                0,
+                "no ack for a command whose arrival terminal is gone"
+            );
+            assert!(
+                !world
+                    .get::<AiEffects>(seat_b)
+                    .expect("survivor has effects")
+                    .public_state()
+                    .tint,
+                "a dead arrival's command is never rerouted to a survivor"
+            );
+        }
+    }
 
     fn alpha(effects: &AiEffects) -> f32 {
         effects.overlay().1

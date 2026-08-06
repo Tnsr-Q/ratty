@@ -389,6 +389,9 @@ pub fn start(canvas_selector: &str, config_toml: Option<String>) -> Result<Ratty
         Update,
         drain_web_controls
             .after(crate::ai::apply_ai_commands)
+            // Widget setters target the focused terminal (#57), so the
+            // drain reads focus after the single writer has settled it.
+            .after(crate::focus::drain_focus_requests)
             .before(crate::scene::apply_terminal_presentation)
             .before(crate::sound::apply_sound_commands),
     )
@@ -422,8 +425,13 @@ pub fn start(canvas_selector: &str, config_toml: Option<String>) -> Result<Ratty
 /// mouse mutate, mirroring the keyboard's mode-toggle semantics (Möbius
 /// enters and exits through its camera transition). Also drains the queued
 /// user gesture into the sound organ's audio unlock.
+///
+/// Widget setters target the FOCUSED terminal (#57's recorded consequence
+/// of the arbitration table): `set_warp` and `set_mode`'s shape half land
+/// on the focused seat; `set_view` stays scene-global.
 fn drain_web_controls(
     queue: Res<WebControlQueue>,
+    focus: Res<crate::focus::FocusedTerminal>,
     mut presentation: ResMut<TerminalPresentation>,
     mut warp: Query<&mut TerminalPlaneWarp>,
     mut view: ResMut<TerminalPlaneView>,
@@ -432,27 +440,16 @@ fn drain_web_controls(
     mut redraw: Query<&mut TerminalRedrawState>,
     mut sound: ResMut<crate::sound::SoundState>,
 ) {
-    let mut warp = match warp.single_mut() {
-        Ok(warp) => warp,
-        Err(err) => {
-            // Latched once per process: the warp lives on THE terminal
-            // seat, and the miss must name its system (#54's silent-.single()
-            // finding).
-            warn_once!("drain_web_controls: the plane warp needs exactly one terminal seat: {err}");
-            return;
-        }
+    // Zero focused happens only with zero terminals on wasm (the page
+    // cannot close the boot seat); stage controls have no target then.
+    let Some(focused) = focus.get() else {
+        return;
     };
-    let mut redraw = match redraw.single_mut() {
-        Ok(redraw) => redraw,
-        Err(err) => {
-            // Latched once per process: the redraw flag lives on THE terminal
-            // seat, and the miss must name its system (#54's silent-.single()
-            // finding).
-            warn_once!(
-                "drain_web_controls: the redraw flag needs exactly one terminal seat: {err}"
-            );
-            return;
-        }
+    let Ok(mut warp) = warp.get_mut(focused) else {
+        return;
+    };
+    let Ok(mut redraw) = redraw.get_mut(focused) else {
+        return;
     };
     let pending = match queue.0.lock() {
         Ok(mut controls) => std::mem::take(&mut *controls),

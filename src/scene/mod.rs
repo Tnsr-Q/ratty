@@ -210,9 +210,10 @@ pub struct ModelLoadState {
 }
 
 type SpriteVisibilityQuery<'w, 's> = Query<'w, 's, &'static mut Visibility, With<TerminalSprite>>;
-type PlaneVisibilityQuery<'w, 's> = Query<'w, 's, &'static mut Visibility, With<TerminalPlane>>;
+type PlaneVisibilityQuery<'w, 's> =
+    Query<'w, 's, (&'static mut Visibility, &'static TerminalOwner), With<TerminalPlane>>;
 type PlaneBackVisibilityQuery<'w, 's> =
-    Query<'w, 's, &'static mut Visibility, With<TerminalPlaneBack>>;
+    Query<'w, 's, (&'static mut Visibility, &'static TerminalOwner), With<TerminalPlaneBack>>;
 type PlaneMaterialQuery<'w, 's> =
     Query<'w, 's, &'static MeshMaterial3d<StandardMaterial>, With<TerminalPlane>>;
 type PlaneTransformQuery<'w, 's> = Query<'w, 's, &'static mut Transform, With<TerminalPlane>>;
@@ -220,12 +221,16 @@ type PlaneBackTransformQuery<'w, 's> =
     Query<'w, 's, &'static mut Transform, With<TerminalPlaneBack>>;
 type PlaneCameraQuery<'w, 's> =
     Query<'w, 's, (&'static mut Projection, &'static mut Transform), With<TerminalPlaneCamera>>;
-pub(crate) type TerminalPlaneLayoutQuery<'w, 's> =
-    Query<'w, 's, &'static mut Transform, (With<TerminalPlane>, Without<TerminalSprite>)>;
+pub(crate) type TerminalPlaneLayoutQuery<'w, 's> = Query<
+    'w,
+    's,
+    (&'static mut Transform, &'static TerminalOwner),
+    (With<TerminalPlane>, Without<TerminalSprite>),
+>;
 pub(crate) type TerminalPlaneBackLayoutQuery<'w, 's> = Query<
     'w,
     's,
-    &'static mut Transform,
+    (&'static mut Transform, &'static TerminalOwner),
     (
         With<TerminalPlaneBack>,
         Without<TerminalPlane>,
@@ -339,9 +344,9 @@ pub(crate) fn setup_scene(mut params: SetupSceneParams) {
     // Exactly one quad exists (decision 12's focused-1:1 scene view), so it
     // spawns in neither split half — bound explicitly to the BOOT seat's
     // present texture by the handle dress returned, never "first seat a
-    // query finds". Focused rebinding is M4.4's work
-    // (`sync_terminal_materials` already rebinds the handle every dirty
-    // frame).
+    // query finds". From the first frame on, `sync_terminal_materials`
+    // rebinds it to the FOCUSED seat's texture on every dirty frame; the
+    // boot binding here only covers the frames before the first redraw.
     let quad = spawn.meshes.add(fullscreen_quad());
     spawn.commands.spawn((
         TerminalSprite,
@@ -623,6 +628,87 @@ pub fn spawn_terminal<E>(
     Ok((seat, identity))
 }
 
+/// A user-initiated request for a fresh terminal (the spawn chord;
+/// #56 decision 8's user class). Carries nothing: #12's
+/// no-runtime-arguments is structural — a spawned terminal runs the
+/// config-default shell, and nothing here could say otherwise.
+#[derive(bevy::ecs::message::Message, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TerminalSpawnRequested;
+
+/// Spawns a terminal through [`spawn_terminal`] and emits the
+/// [`crate::focus::FocusOrigin::SpawnPolicy`] request for its child —
+/// decision 8's user-spawn half in one place, shared by the production
+/// PTY closure and the virtual-transport tests. Failures are loud, never
+/// swallowed: pool exhaustion and transport failure both land in the log
+/// with the lease already restored by [`spawn_terminal`]'s rollback.
+///
+/// The wasm build never calls it — the page API owns lifecycle there —
+/// but the policy stays compiled on both targets so it cannot drift.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+pub(crate) fn spawn_focused_terminal<E: std::fmt::Debug>(
+    params: &mut TerminalSpawnParams,
+    focus_requests: &mut MessageWriter<crate::focus::FocusRequest>,
+    build: impl FnOnce(IngressSource) -> Result<(TerminalSurface, TerminalRuntime), E>,
+) {
+    match spawn_terminal(params, build) {
+        Ok((seat, identity)) => {
+            info!(
+                "spawned terminal {:?} on namespace {}",
+                identity.id(),
+                identity.namespace()
+            );
+            focus_requests.write(crate::focus::FocusRequest {
+                target: Some(seat),
+                origin: crate::focus::FocusOrigin::SpawnPolicy,
+            });
+        }
+        Err(error) => {
+            error!("terminal spawn failed: {error:?}");
+        }
+    }
+}
+
+/// Drains [`TerminalSpawnRequested`] into real seats (native: a PTY
+/// running the config-default shell in the current working directory)
+/// and focuses each child (decision 8: user-initiated spawns focus their
+/// child; the wire's `term.spawn` — M4.5 — never will). Ordered before
+/// the focus drain so the child is live and focused the same frame.
+///
+/// On wasm the request is refused loudly: terminal lifecycle on the web
+/// belongs to the page API (#53's canvas, #86's fork), not a chord.
+pub(crate) fn spawn_requested_terminals(
+    mut requests: MessageReader<TerminalSpawnRequested>,
+    mut params: TerminalSpawnParams,
+    mut focus_requests: MessageWriter<crate::focus::FocusRequest>,
+) {
+    #[cfg(not(target_arch = "wasm32"))]
+    for _ in requests.read() {
+        let config = params.app_config.as_ref().clone();
+        spawn_focused_terminal(&mut params, &mut focus_requests, |source| {
+            let runtime = TerminalRuntime::spawn(
+                &config,
+                &crate::runtime::RuntimeOptions {
+                    command: None,
+                    working_dir: std::env::current_dir().ok(),
+                },
+                source,
+            )?;
+            let surface = TerminalSurface::new(&config)?;
+            Ok::<_, anyhow::Error>((surface, runtime))
+        });
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = &mut params;
+        let _ = &mut focus_requests;
+        for _ in requests.read() {
+            warn!(
+                "terminal spawn is not available in the web build: the page API owns lifecycle there"
+            );
+        }
+    }
+}
+
 /// THE despawn sweep (#56 decision 17's corollary as one reviewable
 /// site): every scene-global structure keyed by a terminal is swept here
 /// when that terminal dies, and any future terminal-keyed scene-global
@@ -633,6 +719,14 @@ pub fn spawn_terminal<E>(
 /// the future `term.close`, a test world's `despawn()`, panic-path
 /// cleanup — it cannot be forgotten. The session halves on the seat
 /// entity need no line here: despawn destroys them with the entity.
+///
+/// Deliberately NOT swept here: the focused-stage projections (kitty
+/// inline sprites/planes, RGP roots, viz roots, presence markers). They
+/// are projections of the FOCUSED seat, not terminal-keyed state — a
+/// dying focused seat triggers the drain's MRU fallback, and the focus
+/// flip forces `sync_inline_objects`' full resync (and the marker/viz
+/// claim passes), which despawns the stale stage; a dying unfocused
+/// seat had nothing on stage to sweep.
 ///
 /// The namespace returns to the pool as the LAST act. This is the only
 /// release site for a lease that ever got keyed or bound to anything
@@ -712,8 +806,12 @@ pub(crate) fn sweep_despawned_terminal(
     }
 }
 
-/// Synchronizes Bevy presentation entities to the terminal texture layout.
+/// Synchronizes one seat's presentation entities to its terminal texture
+/// layout: the seat's viewport, and only the plane pair that seat owns
+/// ([`TerminalOwner`] join) — seat A's font-size step must never rescale
+/// seat B's planes.
 pub(crate) fn sync_terminal_layout(
+    seat: Entity,
     layout: TerminalLayout,
     viewport: &mut TerminalViewport,
     plane_query: &mut TerminalPlaneLayoutQuery,
@@ -722,12 +820,16 @@ pub(crate) fn sync_terminal_layout(
     viewport.size = layout.logical_size;
     viewport.center = Vec2::ZERO;
 
-    for mut transform in plane_query.iter_mut() {
-        transform.scale = layout.logical_size.extend(1.0);
+    for (mut transform, owner) in plane_query.iter_mut() {
+        if owner.0 == seat {
+            transform.scale = layout.logical_size.extend(1.0);
+        }
     }
 
-    for mut transform in plane_back_query.iter_mut() {
-        transform.scale = layout.logical_size.extend(1.0);
+    for (mut transform, owner) in plane_back_query.iter_mut() {
+        if owner.0 == seat {
+            transform.scale = layout.logical_size.extend(1.0);
+        }
     }
 }
 
@@ -752,6 +854,7 @@ pub(crate) fn apply_terminal_presentation(
     presentation: Res<TerminalPresentation>,
     plane_view: Res<TerminalPlaneView>,
     mobius_transition: Res<MobiusTransition>,
+    focus: Res<crate::focus::FocusedTerminal>,
     mut params: PresentationParams,
 ) {
     let PresentationParams {
@@ -784,24 +887,29 @@ pub(crate) fn apply_terminal_presentation(
     } else {
         Visibility::Visible
     };
-    let plane_visibility = if is_3d {
-        Visibility::Visible
-    } else {
-        Visibility::Hidden
-    };
 
     for mut visibility in &mut visibility_queries.p0() {
         *visibility = sprite_visibility;
     }
 
-    for mut visibility in &mut visibility_queries.p1() {
-        *visibility = plane_visibility;
+    // Focused-1:1 (#56 decision 12's scene view): only the FOCUSED seat's
+    // plane pair is on the stage — the quad shows the focused terminal in
+    // flat mode, its planes show it in the 3D modes. What non-focused
+    // terminals display in free 3D is map #42's scene-composition return,
+    // deliberately unbuilt here; with one terminal it is focused by boot
+    // policy, so N=1 is byte-identical.
+    for (mut visibility, owner) in &mut visibility_queries.p1() {
+        *visibility = if is_3d && focus.is_focused(owner.0) {
+            Visibility::Visible
+        } else {
+            Visibility::Hidden
+        };
     }
 
-    for mut visibility in &mut visibility_queries.p2() {
+    for (mut visibility, owner) in &mut visibility_queries.p2() {
         // A Mobius strip is one continuous ribbon, so the separate back sheet model does not map
         // cleanly. Render the front material double-sided instead.
-        *visibility = if is_3d && !is_mobius {
+        *visibility = if is_3d && !is_mobius && focus.is_focused(owner.0) {
             Visibility::Visible
         } else {
             Visibility::Hidden
@@ -1088,10 +1196,8 @@ mod tests {
     }
 
     /// Scaffold world for the spawner-path tests. Deliberately NOT
-    /// `TerminalPlugin`: the M4.1-era `.single()` systems
-    /// (`pump_pty_output`, `sync_terminal_materials`) stay single-seat
-    /// until M4.4's loop conversion and would latch "exactly one terminal
-    /// seat" warns in an N=2 world.
+    /// `TerminalPlugin`: each test runs exactly the systems its story
+    /// needs via `run_system_once`, with only their resources installed.
     fn spawner_world() -> World {
         let mut world = World::new();
         world.insert_resource(AppConfig::default());
@@ -1116,6 +1222,539 @@ mod tests {
             ))
         })
         .expect("the scaffold spawn succeeds")
+    }
+
+    /// Decision 8's user-spawn half through the real spawner: the child
+    /// is focused via its SpawnPolicy request, and the child's death
+    /// falls back to the most-recently-focused survivor.
+    #[test]
+    fn a_user_spawn_focuses_its_child_and_its_death_falls_back_mru() {
+        use bevy::ecs::message::Messages;
+        use bevy::ecs::system::RunSystemOnce;
+
+        use crate::focus::{
+            FocusGained, FocusLost, FocusOrigin, FocusRequest, FocusedTerminal,
+            drain_focus_requests,
+        };
+
+        let mut world = spawner_world();
+        world.init_resource::<FocusedTerminal>();
+        world.init_resource::<Messages<FocusRequest>>();
+        world.init_resource::<Messages<FocusGained>>();
+        world.init_resource::<Messages<FocusLost>>();
+
+        // Boot analog: seat A exists and is focused.
+        let (seat_a, _id_a) = world
+            .run_system_once(spawn_virtual_terminal)
+            .expect("spawner system runs");
+        world
+            .resource_mut::<Messages<FocusRequest>>()
+            .write(FocusRequest {
+                target: Some(seat_a),
+                origin: FocusOrigin::SpawnPolicy,
+            });
+        world
+            .run_system_once(drain_focus_requests)
+            .expect("drain runs");
+        world.resource_mut::<Messages<FocusRequest>>().clear();
+
+        // The spawn chord's path: one spawner call that also emits the
+        // child's SpawnPolicy focus request.
+        fn spawn_virtual_focused(
+            mut params: TerminalSpawnParams,
+            mut focus_requests: bevy::ecs::message::MessageWriter<crate::focus::FocusRequest>,
+        ) {
+            spawn_focused_terminal(&mut params, &mut focus_requests, |source| {
+                let (runtime, _host) =
+                    TerminalRuntime::virtual_channel(&AppConfig::default(), source);
+                Ok::<_, std::convert::Infallible>((
+                    TerminalSurface::new(&AppConfig::default())
+                        .expect("surface construction is CPU-only"),
+                    runtime,
+                ))
+            });
+        }
+        world
+            .run_system_once(spawn_virtual_focused)
+            .expect("spawner system runs");
+        world
+            .run_system_once(drain_focus_requests)
+            .expect("drain runs");
+        world.resource_mut::<Messages<FocusRequest>>().clear();
+
+        assert_eq!(
+            world.query::<&TerminalIdentity>().iter(&world).count(),
+            2,
+            "seat count asserted (#58 rider)"
+        );
+        let child = world
+            .resource::<FocusedTerminal>()
+            .get()
+            .expect("the child is focused");
+        assert_ne!(child, seat_a, "decision 8: a user spawn focuses its child");
+
+        // The child dies through the plain despawn path; succession lands
+        // on the most-recently-focused survivor, not None.
+        world.despawn(child);
+        world.flush();
+        world
+            .run_system_once(drain_focus_requests)
+            .expect("drain runs");
+        assert_eq!(
+            world.resource::<FocusedTerminal>().get(),
+            Some(seat_a),
+            "decision 8: MRU succession after the focused child dies"
+        );
+    }
+
+    /// Focused-1:1 (#56 decision 12's scene view) plus focused-only blink
+    /// (the #51 spine answer): plane visibility and the present quad
+    /// follow focus through the real applier and materials systems, and a
+    /// blink tick dirties only the focused seat while the unfocused one
+    /// stays clean.
+    #[test]
+    fn focused_1_1_visibility_quad_and_blink_follow_focus() {
+        use bevy::ecs::message::Messages;
+        use bevy::ecs::system::RunSystemOnce;
+
+        use crate::focus::{
+            FocusGained, FocusLost, FocusOrigin, FocusRequest, FocusedTerminal,
+            drain_focus_requests,
+        };
+
+        let mut world = spawner_world();
+        world.init_resource::<FocusedTerminal>();
+        world.init_resource::<Messages<FocusRequest>>();
+        world.init_resource::<Messages<FocusGained>>();
+        world.init_resource::<Messages<FocusLost>>();
+        world.init_resource::<Assets<TerminalPresentMaterial>>();
+        world.insert_resource(TerminalPresentation {
+            mode: TerminalPresentationMode::Plane3d,
+        });
+        world.insert_resource(TerminalPlaneView::default());
+        world.insert_resource(MobiusTransition::default());
+        world.init_resource::<Time>();
+        world.init_resource::<crate::model::CursorSettings>();
+        world.insert_resource(ModelLoadState {
+            loaded: true,
+            first_frame_uploaded: true,
+        });
+        world.init_resource::<crate::viz::VizRegistry>();
+        world.init_resource::<crate::presence::PresenceRegistry>();
+        world.init_resource::<crate::mouse::TerminalSelection>();
+
+        let (seat_a, _id_a) = world
+            .run_system_once(spawn_virtual_terminal)
+            .expect("spawner system runs");
+        let (seat_b, _id_b) = world
+            .run_system_once(spawn_virtual_terminal)
+            .expect("spawner system runs");
+        assert_eq!(
+            world.query::<&TerminalIdentity>().iter(&world).count(),
+            2,
+            "seat count asserted (#58 rider)"
+        );
+
+        let handle_of = |world: &mut World, seat: Entity| {
+            world
+                .get::<TerminalSurface>(seat)
+                .expect("dressed seat")
+                .image_handle
+                .clone()
+                .expect("dress created the present texture")
+        };
+        let handle_a = handle_of(&mut world, seat_a);
+        let handle_b = handle_of(&mut world, seat_b);
+
+        // The single present quad, bound to a sentinel texture no seat
+        // owns: any rebind the assertions below observe must have come
+        // from the system under test, and a rebind by the WRONG seat is
+        // distinguishable from no rebind at all.
+        let sentinel = world.resource_mut::<Assets<Image>>().reserve_handle();
+        let quad_material =
+            world
+                .resource_mut::<Assets<TerminalPresentMaterial>>()
+                .add(TerminalPresentMaterial {
+                    texture: sentinel.clone(),
+                });
+        world.spawn((TerminalSprite, MeshMaterial2d(quad_material.clone())));
+
+        let focus = |world: &mut World, target: Entity| {
+            world
+                .resource_mut::<Messages<FocusRequest>>()
+                .write(FocusRequest {
+                    target: Some(target),
+                    origin: FocusOrigin::SpawnPolicy,
+                });
+            world
+                .run_system_once(drain_focus_requests)
+                .expect("drain runs");
+            world.resource_mut::<Messages<FocusRequest>>().clear();
+        };
+        let plane_visibilities = |world: &mut World| {
+            let mut query = world.query::<(&Visibility, &TerminalOwner, &TerminalPlane)>();
+            let mut by_owner: Vec<(Entity, Visibility)> = query
+                .iter(world)
+                .map(|(visibility, owner, _)| (owner.0, *visibility))
+                .collect();
+            by_owner.sort_by_key(|(owner, _)| *owner);
+            by_owner
+        };
+
+        // Focus A: A's plane visible in 3D, B's hidden.
+        focus(&mut world, seat_a);
+        world
+            .run_system_once(apply_terminal_presentation)
+            .expect("applier runs");
+        for (owner, visibility) in plane_visibilities(&mut world) {
+            assert_eq!(
+                visibility,
+                if owner == seat_a {
+                    Visibility::Visible
+                } else {
+                    Visibility::Hidden
+                },
+                "focused-1:1: only the focused seat's plane is on the stage"
+            );
+        }
+
+        // Focus B: visibility flips, and the quad rebinds to B's texture on
+        // B's next dirty frame (the drain dirtied both sides).
+        focus(&mut world, seat_b);
+        world
+            .run_system_once(apply_terminal_presentation)
+            .expect("applier runs");
+        for (owner, visibility) in plane_visibilities(&mut world) {
+            assert_eq!(
+                visibility,
+                if owner == seat_b {
+                    Visibility::Visible
+                } else {
+                    Visibility::Hidden
+                },
+                "focus moved: the stage follows it"
+            );
+        }
+        // A dirty UNFOCUSED seat must not steal the quad: with B focused
+        // and only A dirty, the binding stays on the sentinel (a gateless
+        // any-dirty-seat rebind would write A's handle here — the exact
+        // wrong-terminal-on-the-flat-screen bug decision 12 exists to
+        // prevent).
+        world
+            .get_mut::<crate::systems::TerminalFrameDirty>(seat_a)
+            .expect("dressed seat")
+            .0 = true;
+        world
+            .run_system_once(crate::systems::sync_terminal_materials)
+            .expect("materials sync runs");
+        assert_eq!(
+            world
+                .resource::<Assets<TerminalPresentMaterial>>()
+                .get(&quad_material)
+                .expect("quad material lives")
+                .texture,
+            sentinel,
+            "a dirty unfocused seat never steals the quad"
+        );
+
+        world
+            .get_mut::<crate::systems::TerminalFrameDirty>(seat_b)
+            .expect("dressed seat")
+            .0 = true;
+        world
+            .run_system_once(crate::systems::sync_terminal_materials)
+            .expect("materials sync runs");
+        assert_eq!(
+            world
+                .resource::<Assets<TerminalPresentMaterial>>()
+                .get(&quad_material)
+                .expect("quad material lives")
+                .texture,
+            handle_b,
+            "the present quad samples the FOCUSED seat's texture"
+        );
+        assert_ne!(handle_a, handle_b, "the two seats own distinct textures");
+
+        // Focused-only blink: with both redraw flags clean, a blink tick
+        // dirties the focused seat alone.
+        {
+            let mut redraws = world.query::<&mut TerminalRedrawState>();
+            for mut redraw in redraws.iter_mut(&mut world) {
+                redraw.take();
+            }
+        }
+        world
+            .resource_mut::<Time>()
+            .advance_by(std::time::Duration::from_millis(300));
+        world
+            .run_system_once(crate::systems::render_terminal_widget)
+            .expect("widget render runs");
+        let dirty_of = |world: &mut World, seat: Entity| {
+            world
+                .get::<crate::systems::TerminalFrameDirty>(seat)
+                .expect("dressed seat")
+                .0
+        };
+        assert!(
+            dirty_of(&mut world, seat_b),
+            "the focused seat blink-repaints"
+        );
+        assert!(
+            !dirty_of(&mut world, seat_a),
+            "an idle unfocused terminal repaints at 0 Hz, not 4 Hz"
+        );
+    }
+
+    /// The M4.4 exit criterion as one executable story (#58): two live
+    /// terminals through the real spawner; boot policy focuses #1; a user
+    /// spawn focuses its child; the focus-cycle chord (through the REAL
+    /// keyboard system) reaches the LRU seat; typing follows focus onto
+    /// the focused host alone; a blink tick dirties the focused seat
+    /// only; effect commands stay seat-isolated; and the focused seat's
+    /// death falls back to the MRU survivor. Seat count asserted at every
+    /// phase (#58 rider).
+    #[test]
+    fn m4_4_two_terminals_render_and_focus_cycles_by_keyboard() {
+        use bevy::ecs::message::Messages;
+        use bevy::ecs::system::RunSystemOnce;
+        use bevy::input::ButtonState;
+        use bevy::input::keyboard::{Key, KeyboardInput};
+
+        use crate::focus::{
+            FocusGained, FocusLost, FocusOrigin, FocusRequest, FocusedTerminal,
+            drain_focus_requests, focus_boot_terminal,
+        };
+        use crate::keyboard::{TerminalClipboard, TerminalKeyBindings, handle_keyboard_input};
+        use crate::runtime::VirtualTerminalHost;
+
+        let mut world = spawner_world();
+        world.init_resource::<FocusedTerminal>();
+        world.init_resource::<Messages<FocusRequest>>();
+        world.init_resource::<Messages<FocusGained>>();
+        world.init_resource::<Messages<FocusLost>>();
+        world.init_resource::<Messages<KeyboardInput>>();
+        world.init_resource::<Messages<TerminalSpawnRequested>>();
+        world.init_resource::<Messages<crate::ai::AiCommand>>();
+        world.init_resource::<Messages<crate::query_channel::AckOutcome>>();
+        let bindings = {
+            use bevy::ecs::world::FromWorld;
+            TerminalKeyBindings::from_world(&mut world)
+        };
+        world.insert_resource(bindings);
+        let clipboard = {
+            use bevy::ecs::world::FromWorld;
+            TerminalClipboard::from_world(&mut world)
+        };
+        world.insert_non_send(clipboard);
+        world.init_resource::<ButtonInput<KeyCode>>();
+        world.insert_resource(TerminalPresentation {
+            mode: TerminalPresentationMode::Flat2d,
+        });
+        world.insert_resource(TerminalPlaneView::default());
+        world.insert_resource(MobiusTransition::default());
+        world.init_resource::<StageTween>();
+        world.init_resource::<crate::mouse::TerminalSelection>();
+        world.init_resource::<Time>();
+        world.init_resource::<crate::model::CursorSettings>();
+        world.insert_resource(ModelLoadState {
+            loaded: true,
+            first_frame_uploaded: true,
+        });
+        world.init_resource::<crate::viz::VizRegistry>();
+        world.init_resource::<crate::presence::PresenceRegistry>();
+
+        /// One dressed virtual seat through the real spawner, host kept.
+        fn spawn_with_host(
+            mut params: TerminalSpawnParams,
+        ) -> (Entity, TerminalIdentity, VirtualTerminalHost) {
+            let mut host_slot = None;
+            let (seat, identity) = spawn_terminal(&mut params, |source| {
+                let (runtime, host) =
+                    TerminalRuntime::virtual_channel(&AppConfig::default(), source);
+                host_slot = Some(host);
+                Ok::<_, std::convert::Infallible>((
+                    TerminalSurface::new(&AppConfig::default())
+                        .expect("surface construction is CPU-only"),
+                    runtime,
+                ))
+            })
+            .expect("the scaffold spawn succeeds");
+            (seat, identity, host_slot.expect("the build closure ran"))
+        }
+
+        let drain = |world: &mut World| {
+            world
+                .run_system_once(drain_focus_requests)
+                .expect("drain runs");
+            world.resource_mut::<Messages<FocusRequest>>().clear();
+        };
+        let focused = |world: &mut World| world.resource::<FocusedTerminal>().get();
+        let type_key =
+            |world: &mut World, key_code: KeyCode, logical_key: Key, text: Option<&str>| {
+                world
+                    .resource_mut::<Messages<KeyboardInput>>()
+                    .write(KeyboardInput {
+                        key_code,
+                        logical_key,
+                        state: ButtonState::Pressed,
+                        text: text.map(Into::into),
+                        repeat: false,
+                        window: Entity::PLACEHOLDER,
+                    });
+                world
+                    .run_system_once(handle_keyboard_input)
+                    .expect("keyboard handler runs");
+                world.resource_mut::<Messages<KeyboardInput>>().clear();
+            };
+
+        // Phase 1 — boot: one seat, and the REAL boot policy focuses it.
+        let (seat_a, id_a, host_a) = world
+            .run_system_once(spawn_with_host)
+            .expect("spawner system runs");
+        world
+            .run_system_once(focus_boot_terminal)
+            .expect("boot policy runs");
+        drain(&mut world);
+        assert_eq!(
+            world.query::<&TerminalIdentity>().iter(&world).count(),
+            1,
+            "seat count asserted (#58 rider)"
+        );
+        assert_eq!(
+            focused(&mut world),
+            Some(seat_a),
+            "boot focuses terminal #1"
+        );
+
+        // Phase 2 — the user spawn: the child exists and takes focus.
+        // The SpawnPolicy request is written by hand here — the story
+        // exercises the drain-side policy; the emitting halves are proven
+        // separately (`spawn_focused_terminal` in
+        // `a_user_spawn_focuses_its_child_and_its_death_falls_back_mru`,
+        // the chord in `the_spawn_chord_requests_one_terminal_and_sends_no_bytes`).
+        let (seat_b, _id_b, host_b) = world
+            .run_system_once(spawn_with_host)
+            .expect("spawner system runs");
+        world
+            .resource_mut::<Messages<FocusRequest>>()
+            .write(FocusRequest {
+                target: Some(seat_b),
+                origin: FocusOrigin::SpawnPolicy,
+            });
+        drain(&mut world);
+        assert_eq!(
+            world.query::<&TerminalIdentity>().iter(&world).count(),
+            2,
+            "seat count asserted (#58 rider)"
+        );
+        assert_eq!(
+            focused(&mut world),
+            Some(seat_b),
+            "a user spawn focuses its child"
+        );
+
+        // Phase 3 — the N-gate: Ctrl+Alt+Tab through the REAL keyboard
+        // system cycles focus to the LRU seat.
+        {
+            let mut keys = world.resource_mut::<ButtonInput<KeyCode>>();
+            keys.press(KeyCode::ControlLeft);
+            keys.press(KeyCode::AltLeft);
+        }
+        type_key(&mut world, KeyCode::Tab, Key::Tab, None);
+        drain(&mut world);
+        assert_eq!(
+            focused(&mut world),
+            Some(seat_a),
+            "focus cycles by keybinding (decision 10's rider)"
+        );
+        {
+            let mut keys = world.resource_mut::<ButtonInput<KeyCode>>();
+            keys.release(KeyCode::ControlLeft);
+            keys.release(KeyCode::AltLeft);
+        }
+
+        // Phase 4 — typing follows focus: the byte lands on A's host only.
+        type_key(
+            &mut world,
+            KeyCode::KeyX,
+            Key::Character("x".into()),
+            Some("x"),
+        );
+        assert_eq!(
+            host_a.input_rx.try_recv().expect("A receives the byte"),
+            b"x".to_vec()
+        );
+        assert!(
+            host_b.input_rx.try_recv().is_err(),
+            "typing follows focus, never the other seat"
+        );
+
+        // Phase 5 — focused-only blink: a blink tick dirties A alone.
+        {
+            let mut redraws = world.query::<&mut TerminalRedrawState>();
+            for mut redraw in redraws.iter_mut(&mut world) {
+                redraw.take();
+            }
+        }
+        world
+            .resource_mut::<Time>()
+            .advance_by(std::time::Duration::from_millis(300));
+        world
+            .run_system_once(crate::systems::render_terminal_widget)
+            .expect("widget render runs");
+        let dirty = |world: &mut World, seat: Entity| {
+            world
+                .get::<crate::systems::TerminalFrameDirty>(seat)
+                .expect("dressed seat")
+                .0
+        };
+        assert!(dirty(&mut world, seat_a), "the focused seat blink-repaints");
+        assert!(
+            !dirty(&mut world, seat_b),
+            "an idle unfocused terminal repaints at 0 Hz"
+        );
+
+        // Phase 6 — the wash state routes by arrival: A's tint is A's
+        // alone (the focused-wash sprite reads it; proven in effects.rs).
+        world
+            .resource_mut::<Messages<crate::ai::AiCommand>>()
+            .write(crate::ai::AiCommand {
+                source: id_a.ingress(),
+                ack_token: None,
+                origin: crate::ai::CommandOrigin::Wire,
+                command: crate::osc::RattyAiCommand::Tint {
+                    color: "#ff0000".into(),
+                    opacity: 1.0,
+                },
+            });
+        world
+            .run_system_once(crate::effects::apply_ai_effect_commands)
+            .expect("effects applier runs");
+        let tinted = |world: &mut World, seat: Entity| {
+            world
+                .get::<crate::effects::AiEffects>(seat)
+                .expect("seat has effects")
+                .public_state()
+                .tint
+        };
+        assert!(tinted(&mut world, seat_a), "the arrival seat is tinted");
+        assert!(!tinted(&mut world, seat_b), "the other seat is untouched");
+
+        // Phase 7 — death: the focused terminal dies; succession lands on
+        // the MRU survivor, not None (decision 8).
+        world.despawn(seat_a);
+        world.flush();
+        drain(&mut world);
+        assert_eq!(
+            world.query::<&TerminalIdentity>().iter(&world).count(),
+            1,
+            "seat count asserted (#58 rider)"
+        );
+        assert_eq!(
+            focused(&mut world),
+            Some(seat_b),
+            "MRU succession keeps the user typing after a shell exit"
+        );
     }
 
     /// The M4.3 exit-criteria test: two DirectTerminalSceneExchange
@@ -1743,6 +2382,7 @@ mod tests {
         });
         world.insert_resource(TerminalPlaneView::default());
         world.insert_resource(MobiusTransition::default());
+        world.init_resource::<crate::focus::FocusedTerminal>();
         world.init_resource::<Assets<StandardMaterial>>();
         let (first, second) = {
             let mut materials = world.resource_mut::<Assets<StandardMaterial>>();
@@ -1804,6 +2444,7 @@ mod tests {
         });
         app.insert_resource(TerminalPlaneView::default());
         app.insert_resource(MobiusTransition::default());
+        app.init_resource::<crate::focus::FocusedTerminal>();
         app.init_resource::<Assets<StandardMaterial>>();
         app.add_systems(Update, apply_terminal_presentation);
 

@@ -95,6 +95,7 @@ pub fn terminal_session_state() -> impl bevy::ecs::bundle::Bundle {
         crate::query_channel::TerminalDiagnostics::default(),
         crate::macros::TerminalMacros::default(),
         crate::reactive::TerminalReactive::default(),
+        crate::effects::AiEffects::default(),
     )
 }
 

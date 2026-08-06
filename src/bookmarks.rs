@@ -191,23 +191,11 @@ pub fn apply_bookmark_commands(
     mut commands: MessageReader<AiCommand>,
     mut registry: ResMut<BookmarkRegistry>,
     presentation: Res<TerminalPresentation>,
-    plane_warp: Query<&TerminalPlaneWarp>,
+    seats: Query<(&crate::identity::TerminalIdentity, &TerminalPlaneWarp)>,
     mut pending: ResMut<PendingBookmarkJumps>,
     mut acks: MessageWriter<AckOutcome>,
     mut diagnostics: DiagnosticsSink,
 ) {
-    let plane_warp = match plane_warp.single() {
-        Ok(plane_warp) => plane_warp,
-        Err(err) => {
-            // Latched once per process: the warp lives on THE terminal
-            // seat, and the miss must name its system (#54's silent-.single()
-            // finding).
-            warn_once!(
-                "apply_bookmark_commands: the plane warp needs exactly one terminal seat: {err}"
-            );
-            return;
-        }
-    };
     for AiCommand {
         source,
         ack_token,
@@ -230,6 +218,17 @@ pub fn apply_bookmark_commands(
         }
         match command {
             RattyAiCommand::Bookmark { name, replace } => {
+                // Liveness first: the stored warp is the arrival seat's own
+                // (#56 decision 17's corollary — never a 0.0 stand-in for a
+                // corpse), and a dead arrival's row must not outlive the
+                // sweep.
+                if !seats
+                    .iter()
+                    .any(|(identity, _)| identity.id() == source.terminal())
+                {
+                    warn!("ratty-bookmarks: bookmark dropped: its arrival terminal is gone");
+                    continue;
+                }
                 let namespace = source.namespace();
                 if name.is_empty() {
                     warn!("ratty-ai: bookmark rejected: empty name");
@@ -277,7 +276,14 @@ pub fn apply_bookmark_commands(
                     ViewBookmark {
                         v: BOOKMARK_VERSION,
                         mode: mode_wire_name(presentation.mode),
-                        warp: plane_warp.amount.clamp(0.0, 1.0),
+                        // The ARRIVAL terminal's own warp: a bookmark
+                        // records the scene as its author's terminal
+                        // shapes it (arrival is the address).
+                        warp: seats
+                            .iter()
+                            .find(|(identity, _)| identity.id() == source.terminal())
+                            .map(|(_, plane_warp)| plane_warp.amount.clamp(0.0, 1.0))
+                            .unwrap_or(0.0),
                     },
                 );
                 ack_commit(&mut acks, *source, ack_token);

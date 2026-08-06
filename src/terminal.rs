@@ -256,10 +256,12 @@ impl TerminalSurface {
     /// # Errors
     ///
     /// Returns an error if the offscreen renderer cannot be initialized or rendered.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn sync_image(
         &mut self,
         images: &mut Assets<Image>,
         exchange: &DirectTerminalSceneExchange,
+        namespace: u8,
         elapsed_secs: f32,
         viz: &crate::viz::VizRegistry,
         presence: &crate::presence::PresenceRegistry,
@@ -290,9 +292,15 @@ impl TerminalSurface {
         }
 
         let metrics = self.renderer.metrics();
+        // This surface draws its OWN namespace's overlays only: viz ids
+        // embed their agent namespace, and presence rows ride their
+        // carrying stream (#25) — seat A's texture must never carry seat
+        // B's charts or labels.
         let mut viz_ids: Vec<u32> = viz
             .iter()
-            .filter(|(_, entry)| entry.anchor.is_some())
+            .filter(|(id, entry)| {
+                entry.anchor.is_some() && crate::osc::ai_object_namespace(*id) == Some(namespace)
+            })
             .map(|(id, _)| id)
             .collect();
         viz_ids.sort_unstable();
@@ -322,6 +330,7 @@ impl TerminalSurface {
         }
         underlays.extend(crate::presence::presence_underlays(
             presence,
+            namespace,
             now,
             self.cols,
             self.rows,

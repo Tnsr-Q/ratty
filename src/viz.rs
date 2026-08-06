@@ -699,10 +699,13 @@ impl VizRegistry {
         self.entries.get(&id).map_or(0, |entry| entry.revision)
     }
 
-    /// Whether any live visualization is anchored (the scroll-tracking
-    /// gate in `pump_pty_output`).
-    pub fn has_anchors(&self) -> bool {
-        self.entries.values().any(|entry| entry.anchor.is_some())
+    /// Whether any of `namespace`'s live visualizations is anchored (the
+    /// scroll-tracking gate in `pump_pty_output`, per pumping seat — a
+    /// terminal's scroll may only ever move its own agent's anchors).
+    pub fn has_anchors_in(&self, namespace: u8) -> bool {
+        self.entries.iter().any(|(id, entry)| {
+            entry.anchor.is_some() && crate::osc::ai_object_namespace(*id) == Some(namespace)
+        })
     }
 
     /// Inserts or atomically replaces the entry under `id`, stamping a
@@ -823,16 +826,22 @@ impl VizRegistry {
             .unwrap_or_default()
     }
 
-    /// Applies upward terminal scroll to anchors, mirroring the inline
-    /// registry: rows shift up, and an anchor scrolled fully off the top
-    /// is dropped while the payload is kept (the renderer hides it; a
-    /// later placing `viz.set` re-anchors it). No rebuilds are queued —
+    /// Applies one terminal's upward scroll to that namespace's anchors,
+    /// mirroring the inline registry: rows shift up, and an anchor
+    /// scrolled fully off the top is dropped while the payload is kept
+    /// (the renderer hides it; a later placing `viz.set` re-anchors it).
+    /// Scoped to the scrolling seat's namespace — the registry is one
+    /// resource but its anchors live in per-terminal grids, and seat A's
+    /// scroll must never move seat B's charts. No rebuilds are queued —
     /// the renderer positions from anchors per-frame.
-    pub(crate) fn apply_scroll(&mut self, rows_scrolled: u16) {
+    pub(crate) fn apply_scroll_in(&mut self, namespace: u8, rows_scrolled: u16) {
         if rows_scrolled == 0 {
             return;
         }
-        for entry in self.entries.values_mut() {
+        for (id, entry) in self.entries.iter_mut() {
+            if crate::osc::ai_object_namespace(*id) != Some(namespace) {
+                continue;
+            }
             let Some(anchor) = entry.anchor else {
                 continue;
             };
@@ -897,6 +906,10 @@ impl Plugin for VizPlugin {
                 Update,
                 crate::systems::sync_viz_objects
                     .after(crate::systems::rebuild_viz_objects)
+                    // Reads focus (roots materialize for the focused
+                    // namespace): after the drain, so a flip frame shows
+                    // the newly focused seat's charts.
+                    .after(crate::focus::drain_focus_requests)
                     .run_if(|roots: Query<(), With<VizObjectRoot>>| !roots.is_empty()),
             )
             .add_systems(
@@ -917,7 +930,10 @@ pub fn apply_viz_commands(
     mut registry: ResMut<VizRegistry>,
     mut acks: MessageWriter<AckOutcome>,
     mut diagnostics: DiagnosticsSink,
-    mut redraw: Query<&mut crate::terminal::TerminalRedrawState>,
+    mut seats: Query<(
+        &crate::identity::TerminalIdentity,
+        &mut crate::terminal::TerminalRedrawState,
+    )>,
 ) {
     // Chart-family kinds carry a vello underlay inside the terminal
     // texture, so any mutation that adds, replaces, or removes one must
@@ -931,18 +947,6 @@ pub fn apply_viz_commands(
                 | VizPayload::Timeline(_)
         )
     }
-    let mut redraw = match redraw.single_mut() {
-        Ok(redraw) => redraw,
-        Err(err) => {
-            // Latched once per process: the redraw flag lives on THE terminal
-            // seat, and the miss must name its system (#54's silent-.single()
-            // finding).
-            warn_once!(
-                "apply_viz_commands: the redraw flag needs exactly one terminal seat: {err}"
-            );
-            return;
-        }
-    };
     for AiCommand {
         source,
         ack_token,
@@ -950,6 +954,23 @@ pub fn apply_viz_commands(
         ..
     } in commands.read()
     {
+        // Liveness gates every viz-family commit: a namespace-keyed record
+        // committed for a dead arrival would land after the despawn sweep
+        // and leak into the recycled slot's next tenant (#56 decision 17's
+        // corollary). Foreign families pass through untouched.
+        if matches!(
+            command,
+            RattyAiCommand::VizSet { .. }
+                | RattyAiCommand::VizEffect { .. }
+                | RattyAiCommand::VizRemove { .. }
+        ) && !seats
+            .iter()
+            .any(|(identity, _)| identity.id() == source.terminal())
+        {
+            warn!("ratty-viz: command dropped: its arrival terminal is gone");
+            continue;
+        }
+
         // Every rejection below both warns and lands in the caller's
         // `state.errors` ring; `tok=` commands additionally get their
         // error ack.
@@ -1125,7 +1146,11 @@ pub fn apply_viz_commands(
                     None
                 };
                 let replaced_underlay = live.is_some_and(|entry| has_underlay(&entry.payload));
-                if replaced_underlay || has_underlay(&payload) {
+                if (replaced_underlay || has_underlay(&payload))
+                    && let Some((_, mut redraw)) = seats
+                        .iter_mut()
+                        .find(|(identity, _)| identity.id() == source.terminal())
+                {
                     redraw.request();
                 }
                 registry.upsert(id, payload, anchor);
@@ -1201,7 +1226,11 @@ pub fn apply_viz_commands(
                     .get(id)
                     .is_some_and(|entry| has_underlay(&entry.payload));
                 if registry.remove(id) {
-                    if removed_underlay {
+                    if removed_underlay
+                        && let Some((_, mut redraw)) = seats
+                            .iter_mut()
+                            .find(|(identity, _)| identity.id() == source.terminal())
+                    {
                         redraw.request();
                     }
                     ack_commit(&mut acks, *source, ack_token);
@@ -1222,7 +1251,11 @@ pub fn apply_viz_commands(
                     .iter()
                     .any(|(_, entry)| has_underlay(&entry.payload))
                 {
-                    redraw.request();
+                    // Reset clears every namespace's charts (reset is
+                    // global), so every seat's texture repaints.
+                    for (_, mut redraw) in seats.iter_mut() {
+                        redraw.request();
+                    }
                 }
                 registry.clear_all();
             }
@@ -1499,7 +1532,14 @@ mod tests {
         registry.upsert(ID, decoded_ps(&[1]), anchor(5, 4));
         registry.upsert(ID + 1, decoded_ps(&[2]), anchor(1, 2));
         let revision_before = registry.revision(ID);
-        registry.apply_scroll(3);
+        // A foreign seat's scroll must not move this namespace's anchors.
+        registry.apply_scroll_in(1, 3);
+        assert_eq!(
+            registry.get(ID).expect("entry lives").anchor,
+            anchor(5, 4),
+            "a foreign namespace's scroll leaves the anchor untouched"
+        );
+        registry.apply_scroll_in(0, 3);
         let shifted = registry.get(ID).expect("payload kept");
         assert_eq!(shifted.anchor.expect("still anchored").row, 2);
         let dropped = registry.get(ID + 1).expect("payload kept");
