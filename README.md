@@ -156,6 +156,11 @@ appear on the scene as cursors, names, and floating notes through the
 [Ratty Collaboration Presence Protocol](protocols/presence.md) (the OSC
 777 `user.*`/`note` family): source-agnostic presence rendering with
 leases and per-stream ownership, no networking in the terminal itself.
+Agents holding the right capability can also create, resize, focus and
+close terminals themselves through the
+[Ratty Terminals Protocol](protocols/terminals.md) (the OSC 777 `term.*`
+family) — both of its grants default to denied, a caller may only close
+what it created, and your own terminal can never be killed from the wire.
 
 RGP supports:
 

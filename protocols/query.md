@@ -304,6 +304,26 @@ lists the system sensors plus the caller's **own** wire sensors — never
 another agent's — with `value`, `seq`, `age_secs`, `ttl_secs`, `fresh`,
 `source`, and the count of caller-visible `rules` bound to each.
 
+### 13. `state.terminals` — the terminal roster *(paginated)*
+
+The read side of the [Ratty Terminals Protocol](terminals.md) (OSC 777
+`term.*`). Lists every live terminal in mint order with its handle
+(`id`), lifecycle `state` (`spawning`/`ready`/`closing`), leased namespace
+(`ns`), live grid (`cols`/`rows`), and placement (`x`/`y`/`scale`, which
+this build always reports as `0.0`/`0.0`/`1.0` — see that document's
+honest limitations). Rows are tier-1 scene-global public state: the quads
+are visibly on screen, and knowing a handle grants nothing.
+
+The one own-scoped field is **`creator`** — the creating terminal's
+namespace ordinal, present only when the querier IS the creator, and
+**absent** (never `null`) for everyone else.
+
+`state` is the readiness signal, which is why `term.spawn` is deliberately
+**not** a long-running operation and never acks `code=started`: under the
+absence-means-finished rule above, a started ack on a handle kept out of
+`state.executions` would report a spawn complete while it was still
+spawning.
+
 ## Error codes
 
 Append-only, kebab-case, carried in `code=`: `bad-envelope`,
@@ -313,7 +333,7 @@ Append-only, kebab-case, carried in `code=`: `bad-envelope`,
 `namespace-cap`, `bad-asset`, `bad-mode`, `bad-kind`, `kind-mismatch`,
 `audio-locked`, `deferred`, `rate-limited`, `voice-cap`, `not-permitted`,
 `stale-seq`, `agent-queue-full`, `text-too-long`, `unknown-model`,
-`unknown-anchor`, `unknown-gesture`, `internal` — plus the
+`unknown-anchor`, `unknown-gesture`, `terminal-cap`, `internal` — plus the
 client-side `timeout` and `disposed`. `deferred`, `started`, and `queued`
 are the codes that qualify an `ok=1` ack rather than naming a rejection
 (see Command acks above, [sound.md](sound.md), and the long-running-ack
