@@ -369,10 +369,19 @@ pub fn terminals_state_items(
 /// 3. **Rate.** The live cap bounds how many terminals exist, not how fast
 ///    they are made; one PTY chunk can carry arbitrarily many commands.
 /// 4. **Target resolution**, then ownership, then validation, then commit.
+#[allow(clippy::too_many_arguments)]
 pub fn apply_terminal_commands(
     mut commands: MessageReader<crate::ai::AiCommand>,
     mut spawn: crate::scene::TerminalSpawnParams,
     time: Res<Time>,
+    mut seats: Query<(
+        &mut crate::terminal::TerminalSurface,
+        &mut crate::runtime::TerminalRuntime,
+        &mut crate::scene::TerminalViewport,
+        &mut crate::terminal::TerminalRedrawState,
+    )>,
+    mut plane_query: crate::scene::TerminalPlaneLayoutQuery,
+    mut plane_back_query: crate::scene::TerminalPlaneBackLayoutQuery,
     mut focus_requests: MessageWriter<crate::focus::FocusRequest>,
     mut acks: MessageWriter<crate::query_channel::AckOutcome>,
     mut diagnostics: crate::query_channel::DiagnosticsSink,
@@ -482,6 +491,111 @@ pub fn apply_terminal_commands(
                     continue;
                 }
                 spawn_from_wire(&mut spawn, *source, ack_token, &mut acks, &mut diagnostics);
+            }
+            RattyAiCommand::TermPlace {
+                id,
+                x,
+                y,
+                scale,
+                cols,
+                rows,
+            } => {
+                guard_wire_origin!("term.place");
+                require_capability!(
+                    "term.place",
+                    SceneCapability::TerminalLifecycle,
+                    "terminal placement requires the terminal-lifecycle capability \
+                     ([trust.local] terminal_lifecycle)"
+                );
+                let target = match resolve_target(&spawn.roster, *source, id.as_deref()) {
+                    Ok(target) => target,
+                    Err(message) => {
+                        reject!("term.place", codes::UNKNOWN_ID, "{message}");
+                        continue;
+                    }
+                };
+                // The arrival terminal is always placeable by its own
+                // ingress (arrival is the address); any other handle
+                // needs creator scope.
+                if target != source.terminal()
+                    && let Err(message) = require_creator(&spawn.roster, *source, target)
+                {
+                    reject!("term.place", codes::NOT_OWNER, "{message}");
+                    continue;
+                }
+                // Geometry is refused WHOLE, before any field commits —
+                // the `avatar.set` atomicity rule. Nothing in this build
+                // renders a per-terminal position: the focused seat draws
+                // 1:1 and centered, `sync_terminal_layout` rewrites every
+                // viewport centre to the origin on each pass, and the flat
+                // present path is a fullscreen triangle with no placement
+                // uniform. An `ok=1` here would be a lie.
+                if x.is_some() || y.is_some() || scale.is_some() {
+                    reject!(
+                        "term.place",
+                        codes::UNSUPPORTED,
+                        "terminal placement geometry is not rendered in this build: every \
+                         terminal is centered and drawn 1:1 when focused; cols/rows are \
+                         live (see caps.terminals.place_fields)"
+                    );
+                    continue;
+                }
+                let Some(seat) = spawn.terminals.entity_of(target) else {
+                    reject!(
+                        "term.place",
+                        codes::UNKNOWN_ID,
+                        "that terminal is still spawning; poll state.terminals for state=ready"
+                    );
+                    continue;
+                };
+                let Ok((mut surface, mut runtime, mut viewport, mut redraw)) = seats.get_mut(seat)
+                else {
+                    reject!(
+                        "term.place",
+                        codes::UNKNOWN_ID,
+                        "that terminal is still spawning; poll state.terminals for state=ready"
+                    );
+                    continue;
+                };
+                // Absent keys keep their current value — naming only
+                // `cols` must not silently reset `rows`.
+                let next_cols = cols.unwrap_or_else(|| surface.cols);
+                let next_rows = rows.unwrap_or_else(|| surface.rows);
+                if !crate::identity::grid_is_admissible(next_cols, next_rows) {
+                    reject!(
+                        "term.place",
+                        codes::BAD_COMMAND,
+                        "grid {next_cols}x{next_rows} is outside {}..={} per axis or over \
+                         {} cells; vt100 underflows below two and a wire-chosen grid \
+                         becomes a CPU-side image",
+                        crate::identity::MIN_TERMINAL_AXIS,
+                        crate::identity::MAX_TERMINAL_AXIS,
+                        crate::identity::MAX_TERMINAL_CELLS
+                    );
+                    continue;
+                }
+                if cols.is_some() || rows.is_some() {
+                    // The window-resize path, narrowed to one seat. Every
+                    // step matters: skip `sync_terminal_layout` and the 3D
+                    // planes render the new grid at the old logical size
+                    // while `position_to_cell` divides a stale viewport by
+                    // the new grid, so every mouse cell resolves wrong
+                    // until the next window resize.
+                    let layout = surface.resize_grid(next_cols, next_rows);
+                    let pty = layout.pty_pixels();
+                    runtime.resize(layout.cols, layout.rows, pty.x as u16, pty.y as u16);
+                    crate::scene::sync_terminal_layout(
+                        seat,
+                        layout,
+                        &mut viewport,
+                        &mut plane_query,
+                        &mut plane_back_query,
+                    );
+                    redraw.request();
+                }
+                // An all-absent term.place is a vacuous commit, acked ok
+                // (the `avatar.set` convention).
+                ack_commit(&mut acks, *source, ack_token);
             }
             RattyAiCommand::TermFocus { id } => {
                 guard_wire_origin!("term.focus");
@@ -755,6 +869,11 @@ mod tests {
                 runtime,
                 crate::terminal::TerminalSurface::new(&AppConfig::default())
                     .expect("surface construction is CPU-only"),
+                crate::scene::TerminalViewport {
+                    size: Vec2::new(800.0, 600.0),
+                    center: Vec2::ZERO,
+                },
+                crate::terminal::TerminalRedrawState::default(),
                 crate::identity::terminal_session_state(),
             ))
             .id();
@@ -1116,6 +1235,134 @@ mod tests {
         assert!(acks.is_empty(), "no tok=, no ack — fire and forget");
         assert_eq!(seat_count(&mut world), 2, "seat count asserted (#58 rider)");
         assert_eq!(world.resource::<TerminalRoster>().len(), 2);
+    }
+
+    /// `term.place` is half real and half refused. `cols`/`rows` drive the
+    /// genuine per-seat resize — grid, PTY, viewport and owned planes —
+    /// while `x`/`y`/`scale` have no lowering target at all.
+    #[test]
+    fn place_resizes_the_grid_for_real_and_refuses_the_geometry() {
+        let (mut world, boot) = organ_world();
+        grant(&mut world, true, false);
+        let seat = world
+            .resource::<TerminalRegistry>()
+            .entity_of(boot.id())
+            .expect("the boot seat is bound");
+        let before = world
+            .get::<crate::scene::TerminalViewport>(seat)
+            .expect("viewport")
+            .size;
+
+        let acks = wire(
+            &mut world,
+            boot.ingress(),
+            RattyAiCommand::TermPlace {
+                id: None,
+                x: None,
+                y: None,
+                scale: None,
+                cols: Some(80),
+                rows: Some(24),
+            },
+        );
+        assert!(only_ack(&acks).ok, "the grid is real");
+        let surface = world
+            .get::<crate::terminal::TerminalSurface>(seat)
+            .expect("surface");
+        assert_eq!((surface.cols, surface.rows), (80, 24));
+        // The viewport must move with the grid: skip that and the planes
+        // render the new grid at the old logical size, and every mouse
+        // cell resolves wrong until the next window resize.
+        let after = world
+            .get::<crate::scene::TerminalViewport>(seat)
+            .expect("viewport")
+            .size;
+        assert_ne!(before, after, "sync_terminal_layout ran");
+
+        // Geometry is refused whole, and refusing it changes nothing.
+        let acks = wire(
+            &mut world,
+            boot.ingress(),
+            RattyAiCommand::TermPlace {
+                id: None,
+                x: Some(5.0),
+                y: None,
+                scale: None,
+                cols: Some(100),
+                rows: None,
+            },
+        );
+        let ack = only_ack(&acks);
+        assert!(!ack.ok);
+        assert_eq!(ack.code, Some(codes::UNSUPPORTED));
+        let surface = world
+            .get::<crate::terminal::TerminalSurface>(seat)
+            .expect("surface");
+        assert_eq!(
+            (surface.cols, surface.rows),
+            (80, 24),
+            "a refused command commits none of its fields"
+        );
+    }
+
+    #[test]
+    fn place_bounds_the_grid_and_leaves_absent_axes_alone() {
+        let (mut world, boot) = organ_world();
+        grant(&mut world, true, false);
+        let seat = world
+            .resource::<TerminalRegistry>()
+            .entity_of(boot.id())
+            .expect("bound");
+
+        let place = |world: &mut World, cols, rows| {
+            wire(
+                world,
+                boot.ingress(),
+                RattyAiCommand::TermPlace {
+                    id: None,
+                    x: None,
+                    y: None,
+                    scale: None,
+                    cols,
+                    rows,
+                },
+            )
+        };
+
+        place(&mut world, Some(80), Some(24));
+        // vt100 underflows below two; a wire-chosen grid becomes a
+        // CPU-side image above the ceiling. `u16` is not a bound.
+        for (cols, rows) in [
+            (Some(1), None),
+            (None, Some(1)),
+            (Some(513), None),
+            (Some(512), Some(512)),
+            (Some(u16::MAX), Some(u16::MAX)),
+        ] {
+            let acks = place(&mut world, cols, rows);
+            let ack = only_ack(&acks);
+            assert!(!ack.ok, "{cols:?}x{rows:?}");
+            assert_eq!(ack.code, Some(codes::BAD_COMMAND), "{cols:?}x{rows:?}");
+        }
+        let surface = world
+            .get::<crate::terminal::TerminalSurface>(seat)
+            .expect("surface");
+        assert_eq!((surface.cols, surface.rows), (80, 24), "nothing committed");
+
+        // Naming one axis leaves the other where it was.
+        place(&mut world, Some(100), None);
+        let surface = world
+            .get::<crate::terminal::TerminalSurface>(seat)
+            .expect("surface");
+        assert_eq!((surface.cols, surface.rows), (100, 24));
+
+        // An all-absent place is a vacuous commit, acked ok.
+        let acks = place(&mut world, None, None);
+        assert!(only_ack(&acks).ok);
+        let surface = world
+            .get::<crate::terminal::TerminalSurface>(seat)
+            .expect("surface");
+        assert_eq!((surface.cols, surface.rows), (100, 24));
     }
 
     #[test]

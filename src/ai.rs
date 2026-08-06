@@ -377,11 +377,12 @@ pub fn apply_ai_commands(
             // reads the same AiCommand messages independently and owns the
             // term.spawn/term.focus acks, so this catch-all must never
             // double-ack them.
-            RattyAiCommand::TermSpawn { .. } | RattyAiCommand::TermFocus { .. } => {}
-            // TEMPORARY (M4.5, in flight): the organ does not handle these
-            // two yet, so this arm still owns their acks. Emptied one verb
-            // at a time and deleted with the last.
-            RattyAiCommand::TermPlace { .. } | RattyAiCommand::TermClose { .. } => {
+            RattyAiCommand::TermSpawn { .. }
+            | RattyAiCommand::TermPlace { .. }
+            | RattyAiCommand::TermFocus { .. } => {}
+            // TEMPORARY (M4.5, in flight): the organ does not handle close
+            // yet, so this arm still owns its ack. Deleted with that verb.
+            RattyAiCommand::TermClose { .. } => {
                 debug!("ratty-ai: term command received; the terminals organ is not built yet");
                 reject(
                     &mut diagnostics,

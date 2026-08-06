@@ -199,6 +199,18 @@ impl TerminalSurface {
         self.layout()
     }
 
+    /// Resizes the grid to an explicitly chosen size and returns the new
+    /// layout, for callers that pick a grid rather than fit a window
+    /// (`term.place;cols=&rows=`).
+    ///
+    /// Admissibility is the CALLER's job — [`resize`](Self::resize) guards
+    /// only zero, and `u16` is not a bound on a wire-chosen grid. See
+    /// [`crate::identity::grid_is_admissible`].
+    pub(crate) fn resize_grid(&mut self, cols: u16, rows: u16) -> TerminalLayout {
+        self.resize(cols, rows);
+        self.layout()
+    }
+
     /// Resizes the terminal grid.
     pub fn resize(&mut self, cols: u16, rows: u16) {
         if cols == 0 || rows == 0 {
