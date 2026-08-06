@@ -381,7 +381,11 @@ pub fn answer_queries(
     runtime: Query<&TerminalRuntime>,
     session: Res<QuerySession>,
     inline_objects: Query<&TerminalInlineObjects>,
-    diagnostics: Query<(&crate::identity::TerminalIdentity, &TerminalDiagnostics)>,
+    seat_state: Query<(
+        &crate::identity::TerminalIdentity,
+        &TerminalDiagnostics,
+        &crate::macros::TerminalMacros,
+    )>,
     presentation: Res<TerminalPresentation>,
     plane_warp: Query<&TerminalPlaneWarp>,
     plane_view: Res<TerminalPlaneView>,
@@ -463,12 +467,13 @@ pub fn answer_queries(
                 );
             }
             QueryItem::Query(envelope) => {
-                // The caller's own diagnostics ring, resolved by TerminalId
-                // (the stamp rule) — a query whose arrival terminal died is
-                // dropped loudly, never answered from another seat's ring.
-                let Some((_, seat_diagnostics)) = diagnostics
+                // The caller's own session-half state (diagnostics ring,
+                // session macros), resolved by TerminalId (the stamp rule)
+                // — a query whose arrival terminal died is dropped loudly,
+                // never answered from another seat's state.
+                let Some((_, seat_diagnostics, seat_macros)) = seat_state
                     .iter()
-                    .find(|(identity, _)| identity.id() == source.terminal())
+                    .find(|(identity, ..)| identity.id() == source.terminal())
                 else {
                     warn!(
                         "answer_queries: query dropped: arrival terminal {:?} no longer exists",
@@ -480,6 +485,7 @@ pub fn answer_queries(
                     session: &session,
                     inline_objects,
                     diagnostics: seat_diagnostics,
+                    seat_macros,
                     presentation: &presentation,
                     plane_warp,
                     plane_view: &plane_view,
@@ -570,6 +576,9 @@ struct QueryCtx<'a> {
     session: &'a QuerySession,
     inline_objects: &'a TerminalInlineObjects,
     diagnostics: &'a TerminalDiagnostics,
+    /// The caller's session-half macro state (its session registry and
+    /// active slot); the trusted half stays in `macros`.
+    seat_macros: &'a crate::macros::TerminalMacros,
     presentation: &'a TerminalPresentation,
     plane_warp: &'a TerminalPlaneWarp,
     plane_view: &'a TerminalPlaneView,
@@ -614,14 +623,14 @@ fn answer(
         // and the caller's own active recording/playback.
         "state.macros" => paginate(
             ctx,
-            crate::macros::macros_state_items(ctx.macros, source.namespace()),
+            crate::macros::macros_state_items(ctx.seat_macros, ctx.macros),
             &data,
         ),
         // The caller's own executions: the macro slot plus the caller's
         // avatar utterances (own active and own queued). Private
         // per-agent; absence of a handle is the completion signal (#18).
         "state.executions" => {
-            let mut value = crate::macros::executions_state_value(ctx.macros, source.namespace());
+            let mut value = crate::macros::executions_state_value(ctx.seat_macros);
             if let Some(items) = value["items"].as_array_mut() {
                 items.extend(
                     ctx.avatar

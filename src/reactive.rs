@@ -391,6 +391,7 @@ impl ReactiveRegistry {
         sensor: &str,
         spec: RuleSpec,
         mut action: RattyAiCommand,
+        seat_macros: &crate::macros::TerminalMacros,
         macros: &MacroRegistry,
     ) -> Result<(RuleCmp, f32, f32, Duration, Duration, RattyAiCommand), ReactiveReject> {
         Self::validate_sensor_ref(namespace, sensor)?;
@@ -459,8 +460,8 @@ impl ReactiveRegistry {
                 name, hash, scope, ..
             } => {
                 let resolved = match hash.as_deref() {
-                    Some(hash) => macros.resolve_by_hash(namespace, hash),
-                    None => macros.resolve(namespace, name, *scope),
+                    Some(hash) => macros.resolve_by_hash(seat_macros, hash),
+                    None => macros.resolve(seat_macros, name, *scope),
                 };
                 let Some(resolved) = resolved else {
                     return Err((
@@ -523,6 +524,7 @@ impl ReactiveRegistry {
         spec: RuleSpec,
         action: RattyAiCommand,
         replace: bool,
+        seat_macros: &crate::macros::TerminalMacros,
         macros: &MacroRegistry,
     ) -> Result<(), ReactiveReject> {
         let namespace = source.namespace();
@@ -549,7 +551,7 @@ impl ReactiveRegistry {
             ));
         }
         let (cmp, threshold, clear, debounce, cooldown, action) =
-            Self::validate_rule(namespace, sensor, spec, action, macros)?;
+            Self::validate_rule(namespace, sensor, spec, action, seat_macros, macros)?;
         // Replacement resets the transition state: a replaced rule is a
         // fresh rule.
         self.session.insert(
@@ -743,6 +745,7 @@ impl ReactiveRegistry {
     pub fn insert_trusted_rule(
         &mut self,
         config: &TrustedRuleConfig,
+        seat_macros: &crate::macros::TerminalMacros,
         macros: &MacroRegistry,
         source: IngressSource,
     ) -> Result<(), ReactiveReject> {
@@ -779,7 +782,14 @@ impl ReactiveRegistry {
                 )
             })
             .and_then(|action| {
-                Self::validate_rule(source.namespace(), &config.sensor, spec, action, macros)
+                Self::validate_rule(
+                    source.namespace(),
+                    &config.sensor,
+                    spec,
+                    action,
+                    seat_macros,
+                    macros,
+                )
             });
         match validated {
             Ok((cmp, threshold, clear, debounce, cooldown, action)) => {
@@ -1002,13 +1012,18 @@ pub fn seed_reactive_from_config(
     config: Res<AppConfig>,
     macros: Res<MacroRegistry>,
     mut registry: ResMut<ReactiveRegistry>,
-    seats: Query<&crate::identity::TerminalIdentity>,
+    seats: Query<(
+        &crate::identity::TerminalIdentity,
+        &crate::macros::TerminalMacros,
+    )>,
 ) {
     // Trusted rules seed under the boot terminal's ingress context. This
     // Startup system runs while exactly one seat exists (main()/start()
-    // spawn it pre-run); a world without it is broken, exactly like
-    // setup_scene's seat expect.
-    let identity = seats.single().expect("exactly one terminal seat at boot");
+    // spawn it pre-run, session-half components aboard); a world without
+    // it is broken, exactly like setup_scene's seat expect. The seat's
+    // session macros are empty at seed time, so trusted `do=macro.play`
+    // rules effectively resolve trusted-only — unchanged semantics.
+    let (identity, seat_macros) = seats.single().expect("exactly one terminal seat at boot");
     // The cfg! term wins over config on wasm: an embedder can set the
     // flag, but no adapter exists to grant.
     registry.system_enabled = cfg!(not(target_arch = "wasm32")) && config.reactive.system_sensors;
@@ -1021,7 +1036,7 @@ pub fn seed_reactive_from_config(
             break;
         }
         if let Err((code, message)) =
-            registry.insert_trusted_rule(rule, &macros, identity.ingress())
+            registry.insert_trusted_rule(rule, seat_macros, &macros, identity.ingress())
         {
             error!(
                 "ratty-reactive: trusted rule '{}' is invalid ({code}): {message}; seeded \
@@ -1041,6 +1056,10 @@ pub fn apply_reactive_commands(
     mut commands: MessageReader<AiCommand>,
     mut registry: ResMut<ReactiveRegistry>,
     macros: Res<MacroRegistry>,
+    macro_seats: Query<(
+        &crate::identity::TerminalIdentity,
+        &crate::macros::TerminalMacros,
+    )>,
     mut acks: MessageWriter<AckOutcome>,
     mut diagnostics: DiagnosticsSink,
 ) {
@@ -1103,6 +1122,21 @@ pub fn apply_reactive_commands(
                     debounce: *debounce,
                     cooldown: *cooldown,
                 };
+                // The caller's session macros, for pinning a
+                // `do=macro.play` action — resolved by TerminalId (the
+                // stamp rule); a rule.set whose arrival terminal died is
+                // dropped loudly like every stamped command.
+                let Some((_, seat_macros)) = macro_seats
+                    .iter()
+                    .find(|(identity, _)| identity.id() == source.terminal())
+                else {
+                    warn!(
+                        "apply_reactive_commands: rule.set dropped: arrival terminal {:?} no \
+                         longer exists",
+                        source.terminal()
+                    );
+                    continue;
+                };
                 match registry.set_rule(
                     *source,
                     name,
@@ -1110,6 +1144,7 @@ pub fn apply_reactive_commands(
                     spec,
                     (**action).clone(),
                     *replace,
+                    seat_macros,
                     &macros,
                 ) {
                     Ok(()) => ack_commit(&mut acks, *source, ack_token),
@@ -1483,7 +1518,16 @@ mod tests {
         sensor: &str,
         spec: RuleSpec,
     ) -> Result<(), ReactiveReject> {
-        registry.set_rule(NS0, name, sensor, spec, think(), false, macros)
+        registry.set_rule(
+            NS0,
+            name,
+            sensor,
+            spec,
+            think(),
+            false,
+            &crate::macros::TerminalMacros::default(),
+            macros,
+        )
     }
 
     fn publish(registry: &mut ReactiveRegistry, suffix: &str, value: f32, now: Duration) {
@@ -1576,7 +1620,16 @@ mod tests {
             .expect_err("collision");
         assert_eq!(code, codes::ALREADY_EXISTS);
         registry
-            .set_rule(NS0, "r", "sys.cpu", spec_above(2.0), think(), true, &macros)
+            .set_rule(
+                NS0,
+                "r",
+                "sys.cpu",
+                spec_above(2.0),
+                think(),
+                true,
+                &crate::macros::TerminalMacros::default(),
+                &macros,
+            )
             .expect("replace overwrites");
         for index in 1..MAX_RULES_PER_NAMESPACE {
             set_simple(
@@ -1599,7 +1652,16 @@ mod tests {
         assert_eq!(code, codes::NAMESPACE_CAP);
         // Replacing at the cap is not a new slot.
         registry
-            .set_rule(NS0, "r", "sys.cpu", spec_above(3.0), think(), true, &macros)
+            .set_rule(
+                NS0,
+                "r",
+                "sys.cpu",
+                spec_above(3.0),
+                think(),
+                true,
+                &crate::macros::TerminalMacros::default(),
+                &macros,
+            )
             .expect("registry op ok");
     }
 
@@ -1654,7 +1716,16 @@ mod tests {
             },
         ] {
             let (code, _) = registry
-                .set_rule(NS0, "r", "sys.cpu", spec_above(1.0), denied, false, &macros)
+                .set_rule(
+                    NS0,
+                    "r",
+                    "sys.cpu",
+                    spec_above(1.0),
+                    denied,
+                    false,
+                    &crate::macros::TerminalMacros::default(),
+                    &macros,
+                )
                 .expect_err("denied action");
             assert_eq!(code, codes::NOT_PERMITTED);
         }
@@ -1675,6 +1746,7 @@ mod tests {
                 spec_above(1.0),
                 foreign,
                 false,
+                &crate::macros::TerminalMacros::default(),
                 &macros,
             )
             .expect_err("foreign target");
@@ -1715,6 +1787,7 @@ mod tests {
                     spec_above(1.0),
                     allowed,
                     false,
+                    &crate::macros::TerminalMacros::default(),
                     &macros,
                 )
                 .expect("allowlisted action commits");
@@ -1723,7 +1796,8 @@ mod tests {
 
     #[test]
     fn macro_play_actions_pin_a_rule_safe_macro_by_hash() {
-        let mut macros = MacroRegistry::default();
+        let macros = MacroRegistry::default();
+        let mut seat_macros = crate::macros::TerminalMacros::default();
         let mut registry = ReactiveRegistry::default();
         let play = |name: &str| RattyAiCommand::MacroPlay {
             name: name.to_string(),
@@ -1741,13 +1815,14 @@ mod tests {
                 spec_above(1.0),
                 play("ghost"),
                 false,
+                &seat_macros,
                 &macros,
             )
             .expect_err("no macro");
         assert_eq!(code, codes::UNKNOWN_ID);
         // A rule-safe macro pins by hash; a non-rule-safe one rejects.
-        macros.test_record(NS0, "soft", &[think()]);
-        macros.test_record(
+        seat_macros.test_record(NS0, "soft", &[think()]);
+        seat_macros.test_record(
             NS0,
             "hard",
             &[RattyAiCommand::SpawnObject {
@@ -1769,6 +1844,7 @@ mod tests {
                 spec_above(1.0),
                 play("hard"),
                 false,
+                &seat_macros,
                 &macros,
             )
             .expect_err("not rule-safe");
@@ -1781,6 +1857,7 @@ mod tests {
                 spec_above(1.0),
                 play("soft"),
                 false,
+                &seat_macros,
                 &macros,
             )
             .expect("registry op ok");
@@ -1992,7 +2069,12 @@ mod tests {
             action: "flash;color=%23ff0000&duration=0.4".to_string(),
         };
         registry
-            .insert_trusted_rule(&config, &macros, IngressSource::test_boot())
+            .insert_trusted_rule(
+                &config,
+                &crate::macros::TerminalMacros::default(),
+                &macros,
+                IngressSource::test_boot(),
+            )
             .expect("registry op ok");
         // Wire mutation of a trusted name answers flat unknown-id.
         let (code, _) = registry
@@ -2035,7 +2117,12 @@ mod tests {
             action: "object.add;id=2147483648&path=rat.obj".to_string(),
         };
         let (code, _) = registry
-            .insert_trusted_rule(&bad, &macros, IngressSource::test_boot())
+            .insert_trusted_rule(
+                &bad,
+                &crate::macros::TerminalMacros::default(),
+                &macros,
+                IngressSource::test_boot(),
+            )
             .expect_err("invalid action");
         assert_eq!(code, codes::NOT_PERMITTED);
         let rule = registry.trusted.get("broken").expect("husk seeded");
@@ -2200,10 +2287,20 @@ mod tests {
             ..first.clone()
         };
         registry
-            .insert_trusted_rule(&first, &macros, IngressSource::test_boot())
+            .insert_trusted_rule(
+                &first,
+                &crate::macros::TerminalMacros::default(),
+                &macros,
+                IngressSource::test_boot(),
+            )
             .expect("registry op ok");
         let (code, _) = registry
-            .insert_trusted_rule(&second, &macros, IngressSource::test_boot())
+            .insert_trusted_rule(
+                &second,
+                &crate::macros::TerminalMacros::default(),
+                &macros,
+                IngressSource::test_boot(),
+            )
             .expect_err("duplicate names reject");
         assert_eq!(code, codes::ALREADY_EXISTS);
         assert_eq!(
@@ -2268,6 +2365,7 @@ action = "flash;color=%23ff0000&duration=0.4"
         registry
             .insert_trusted_rule(
                 &config.reactive.rules[0],
+                &crate::macros::TerminalMacros::default(),
                 &macros,
                 IngressSource::test_boot(),
             )

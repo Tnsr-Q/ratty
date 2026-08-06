@@ -91,7 +91,10 @@ impl TerminalIdentity {
 /// it is `Default::default()` at spawn, unconditionally; the session
 /// halves die with the seat entity and can never be inherited.
 pub fn terminal_session_state() -> impl bevy::ecs::bundle::Bundle {
-    (crate::query_channel::TerminalDiagnostics::default(),)
+    (
+        crate::query_channel::TerminalDiagnostics::default(),
+        crate::macros::TerminalMacros::default(),
+    )
 }
 
 /// A live terminal's registry row: the leased namespace plus the seat
