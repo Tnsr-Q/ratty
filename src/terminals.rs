@@ -1092,6 +1092,335 @@ mod tests {
         &acks[0]
     }
 
+    /// M4.5's exit criterion (#58) as one executable story: the `term.*`
+    /// family driven through the real systems, from a stock deny-by-default
+    /// config to a drained roster, with every locked decision it proves
+    /// named in place.
+    ///
+    /// In the root crate's `--lib` suite deliberately: CI runs `--lib`
+    /// only, so an integration test in `tests/` would never gate anything.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn m4_5_the_term_family_end_to_end_under_two_gates() {
+        let (mut world, boot) = organ_world();
+        world.add_observer(crate::scene::sweep_despawned_terminal);
+        world.init_resource::<crate::macros::MacroRegistry>();
+        world.init_resource::<crate::presence::PresenceRegistry>();
+        world.init_resource::<crate::viz::VizRegistry>();
+        world.init_resource::<crate::avatar::AvatarState>();
+        world.init_resource::<crate::sound::SoundState>();
+        world.init_resource::<crate::bookmarks::BookmarkRegistry>();
+        world.init_resource::<crate::bookmarks::PendingBookmarkJumps>();
+        world.init_resource::<crate::ai::AiObjectRegistry>();
+
+        let handle_of = |world: &World, id: TerminalId| {
+            world
+                .resource::<TerminalRoster>()
+                .row(id)
+                .expect("row")
+                .handle
+                .clone()
+        };
+        let identity_of = |world: &World, id: TerminalId| {
+            *world
+                .get::<TerminalIdentity>(
+                    world
+                        .resource::<TerminalRegistry>()
+                        .entity_of(id)
+                        .expect("bound"),
+                )
+                .expect("identity")
+        };
+
+        // ── 1. Boot: one seat, no creator, already addressable ──────────
+        // Terminal #1's creator is `None`, and that is not bookkeeping: it
+        // IS the wire-unkillable construction that phase 6 proves.
+        assert_eq!(seat_count(&mut world), 1, "seat count asserted (#58 rider)");
+        let boot_handle = handle_of(&world, boot.id());
+        assert!(!boot_handle.is_empty(), "every terminal has a handle");
+        assert_eq!(
+            world
+                .resource::<TerminalRoster>()
+                .row(boot.id())
+                .expect("the boot seat has a row")
+                .creator,
+            None
+        );
+
+        // ── 2. Default DENY (#56 decision 18) ───────────────────────────
+        // A stock config refuses the whole family, and refuses it loudly.
+        for command in [
+            spawn_command(),
+            RattyAiCommand::TermPlace {
+                id: None,
+                x: None,
+                y: None,
+                scale: None,
+                cols: Some(80),
+                rows: None,
+            },
+            RattyAiCommand::TermClose { id: None },
+        ] {
+            let acks = wire(&mut world, boot.ingress(), command);
+            assert_eq!(only_ack(&acks).code, Some(codes::NOT_PERMITTED));
+        }
+        assert_eq!(seat_count(&mut world), 1, "seat count asserted (#58 rider)");
+
+        // ── 3. Granted lifecycle: the immediate-commit spawn ack ────────
+        // #56 decision 19: ok=1, NO code=started, handle in data. A
+        // started ack would tell a conforming caller the spawn FINISHED.
+        grant(&mut world, true, false);
+        let acks = wire(&mut world, boot.ingress(), spawn_command());
+        let ack = only_ack(&acks);
+        assert!(ack.ok);
+        assert_eq!(ack.code, None, "never codes::STARTED");
+        let child_handle = ack.payload.as_ref().expect("data payload")["id"]
+            .as_str()
+            .expect("string handle")
+            .to_string();
+        let child = world
+            .resource::<TerminalRoster>()
+            .by_handle(&child_handle)
+            .expect("addressable in the batch that minted it");
+        assert_eq!(seat_count(&mut world), 2, "seat count asserted (#58 rider)");
+
+        // Decision 8: a wire spawn never focuses its child.
+        assert!(
+            world
+                .resource_mut::<Messages<crate::focus::FocusRequest>>()
+                .drain()
+                .next()
+                .is_none(),
+            "the wire never steals focus by spawning"
+        );
+
+        // ── 4. Spawn takes no fields ────────────────────────────────────
+        let acks = wire(
+            &mut world,
+            boot.ingress(),
+            RattyAiCommand::TermSpawn {
+                x: None,
+                y: None,
+                scale: None,
+                cols: Some(80),
+                rows: Some(24),
+            },
+        );
+        assert_eq!(only_ack(&acks).code, Some(codes::UNSUPPORTED));
+        assert_eq!(seat_count(&mut world), 2, "seat count asserted (#58 rider)");
+
+        // ── 5. Focus is a SEPARATE capability (#56 decision 18) ─────────
+        // Lifecycle is granted; focus is not, and the family does not
+        // leak one into the other.
+        let acks = wire(
+            &mut world,
+            boot.ingress(),
+            RattyAiCommand::TermFocus {
+                id: Some(child_handle.clone()),
+            },
+        );
+        assert_eq!(only_ack(&acks).code, Some(codes::NOT_PERMITTED));
+        grant(&mut world, true, true);
+        let acks = wire(
+            &mut world,
+            boot.ingress(),
+            RattyAiCommand::TermFocus {
+                id: Some(child_handle.clone()),
+            },
+        );
+        assert!(only_ack(&acks).ok, "granted separately, it commits");
+        let requests: Vec<_> = world
+            .resource_mut::<Messages<crate::focus::FocusRequest>>()
+            .drain()
+            .collect();
+        assert_eq!(
+            requests[0].origin,
+            crate::focus::FocusOrigin::WireVerb,
+            "wire class — a same-frame user request still beats it"
+        );
+
+        // ── 6. Terminal #1 is wire-unkillable ───────────────────────────
+        // By handle AND from its own ingress, and by the same clause that
+        // covers every user-spawned seat and every orphan.
+        for id in [None, Some(boot_handle.clone())] {
+            let acks = wire(&mut world, boot.ingress(), RattyAiCommand::TermClose { id });
+            let ack = only_ack(&acks);
+            assert!(!ack.ok);
+            assert_eq!(
+                ack.code,
+                Some(codes::NOT_OWNER),
+                "an ownership fact, not a capability one — the demo tells acts \
+                 1 and 9 apart by this code alone"
+            );
+        }
+        assert_eq!(seat_count(&mut world), 2, "seat count asserted (#58 rider)");
+
+        // ── 7. term.place: the real grid, the refused geometry ──────────
+        let acks = wire(
+            &mut world,
+            boot.ingress(),
+            RattyAiCommand::TermPlace {
+                id: Some(child_handle.clone()),
+                x: None,
+                y: None,
+                scale: None,
+                cols: Some(80),
+                rows: Some(24),
+            },
+        );
+        assert!(only_ack(&acks).ok);
+        let child_seat = world
+            .resource::<TerminalRegistry>()
+            .entity_of(child)
+            .expect("bound");
+        let surface = world
+            .get::<crate::terminal::TerminalSurface>(child_seat)
+            .expect("surface");
+        assert_eq!((surface.cols, surface.rows), (80, 24), "a real PTY resize");
+
+        for (x, cols) in [(Some(5.0), None), (None, Some(u16::MAX))] {
+            let acks = wire(
+                &mut world,
+                boot.ingress(),
+                RattyAiCommand::TermPlace {
+                    id: Some(child_handle.clone()),
+                    x,
+                    y: None,
+                    scale: None,
+                    cols,
+                    rows: None,
+                },
+            );
+            let ack = only_ack(&acks);
+            assert!(!ack.ok);
+            assert_eq!(
+                ack.code,
+                Some(if x.is_some() {
+                    codes::UNSUPPORTED
+                } else {
+                    codes::BAD_COMMAND
+                })
+            );
+        }
+
+        // ── 8. Creator scope on the read side (#56 decision 15) ─────────
+        let child_identity = identity_of(&world, child);
+        let rows = |world: &World, source: crate::runtime::IngressSource| {
+            let snapshot: Vec<TerminalRowSnapshot> = world
+                .resource::<TerminalRoster>()
+                .iter()
+                .map(|(id, row)| TerminalRowSnapshot {
+                    id,
+                    handle: row.handle.clone(),
+                    state: row.wire_state(true),
+                    ns: world
+                        .resource::<TerminalRegistry>()
+                        .namespace_of(id)
+                        .expect("lease"),
+                    creator: row.creator,
+                    creator_ns: row.creator.and_then(|creator| {
+                        world.resource::<TerminalRegistry>().namespace_of(creator)
+                    }),
+                    cols: None,
+                    rows: None,
+                })
+                .collect();
+            terminals_state_items(&snapshot, source)
+        };
+        let as_boot = rows(&world, boot.ingress());
+        let child_row = as_boot
+            .iter()
+            .find(|(_, value)| value["id"] == serde_json::json!(child_handle))
+            .expect("listed")
+            .1
+            .clone();
+        assert_eq!(
+            child_row["creator"],
+            serde_json::json!(boot.namespace()),
+            "the creator sees its own namespace ordinal"
+        );
+        let as_child = rows(&world, child_identity.ingress());
+        let child_row = as_child
+            .iter()
+            .find(|(_, value)| value["id"] == serde_json::json!(child_handle))
+            .expect("the ROW is public; only creator is scoped")
+            .1
+            .clone();
+        assert!(
+            child_row.get("creator").is_none(),
+            "absent when foreign, never a null that says 'someone owns this'"
+        );
+
+        // ── 9. The live cap, on the wire ────────────────────────────────
+        world.resource_mut::<AppConfig>().terminal.max_live = 2;
+        let acks = wire(&mut world, boot.ingress(), spawn_command());
+        let ack = only_ack(&acks);
+        assert!(!ack.ok);
+        assert_eq!(ack.code, Some(codes::TERMINAL_CAP));
+        assert_eq!(seat_count(&mut world), 2, "seat count asserted (#58 rider)");
+
+        // ── 10. The close, and the deferral ─────────────────────────────
+        // The applier despawns nothing: the seat must outlive
+        // `answer_queries` or a self-close eats the ack it just committed.
+        let acks = wire(
+            &mut world,
+            boot.ingress(),
+            RattyAiCommand::TermClose {
+                id: Some(child_handle),
+            },
+        );
+        assert!(only_ack(&acks).ok);
+        assert_eq!(
+            seat_count(&mut world),
+            2,
+            "seat count asserted (#58 rider): the despawn is deferred"
+        );
+        assert_eq!(
+            world
+                .resource::<TerminalRoster>()
+                .row(child)
+                .expect("still listed")
+                .wire_state(true),
+            TerminalWireState::Closing
+        );
+        world
+            .run_system_once(despawn_closed_terminals)
+            .expect("the drain runs");
+        world.flush();
+        assert_eq!(seat_count(&mut world), 1, "seat count asserted (#58 rider)");
+        assert!(
+            world.resource::<TerminalRoster>().row(child).is_none(),
+            "the sweep took the row, the budgets and the lease with the seat"
+        );
+
+        // ── 11. The stamp rule under recycling (#56 decision 17) ────────
+        // The freed namespace comes back; the identity never does.
+        world.resource_mut::<AppConfig>().terminal.max_live = 4;
+        let acks = wire(&mut world, boot.ingress(), spawn_command());
+        let next_handle = only_ack(&acks).payload.as_ref().expect("payload")["id"]
+            .as_str()
+            .expect("handle")
+            .to_string();
+        let next = world
+            .resource::<TerminalRoster>()
+            .by_handle(&next_handle)
+            .expect("live");
+        assert_eq!(
+            world.resource::<TerminalRegistry>().namespace_of(next),
+            Some(child_identity.namespace()),
+            "the freed namespace slot is recycled into the next tenant"
+        );
+        assert!(
+            next > child,
+            "but the TerminalId never is, so no stamp can ever alias"
+        );
+        assert_ne!(
+            next_handle,
+            handle_of(&world, boot.id()),
+            "and the handle is fresh"
+        );
+    }
+
     #[test]
     fn both_gates_default_to_denied_and_mutate_nothing() {
         let (mut world, boot) = organ_world();

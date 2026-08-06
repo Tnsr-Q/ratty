@@ -1515,6 +1515,60 @@ mod tests {
         (identity, host, handle)
     }
 
+    /// The M4.5 closed loop on real bytes: one PTY chunk carrying the
+    /// frozen pane surface and its replacement, answering side by side
+    /// over the arrival terminal's own transport.
+    ///
+    /// `term.spawn` is denied here (a stock config), which is the point —
+    /// the two families answer with DIFFERENT codes, so a caller can tell
+    /// "not built" from "not permitted" without reading prose.
+    #[test]
+    fn closed_loop_the_frozen_pane_surface_and_term_answer_side_by_side() {
+        let (mut app, host) = test_app();
+        // `test_app`'s chain omits `apply_ai_commands` (the pane arm's
+        // owner) and the terminals organ; both are added here so the two
+        // families answer through their real appliers.
+        app.add_systems(
+            Update,
+            (
+                crate::ai::apply_ai_commands,
+                crate::terminals::apply_terminal_commands,
+            )
+                .after(pump_pty_output)
+                .before(answer_queries),
+        );
+        app.init_resource::<crate::terminals::PendingTerminalCloses>();
+        app.init_resource::<Assets<Mesh>>();
+        app.init_resource::<Assets<StandardMaterial>>();
+        app.init_resource::<Assets<Image>>();
+        app.init_resource::<crate::scene::MobiusTransition>();
+        app.add_message::<crate::focus::FocusRequest>();
+        app.world_mut()
+            .spawn((Window::default(), bevy::window::PrimaryWindow));
+
+        let chunk = concat!(
+            "\x1b]777;ratty:term.spawn;tok=t1\x07",
+            "\x1b]777;ratty:pane.split;direction=vertical&ratio=0.3&tok=p1\x07",
+        );
+        host.feed_tx
+            .send(chunk.as_bytes().to_vec())
+            .expect("virtual feed accepts bytes");
+        app.update();
+
+        let replies = drain_replies(&host);
+        assert_eq!(replies.len(), 2, "exactly one reply per token, in order");
+        assert_eq!(replies[0].token, "t1");
+        assert!(!replies[0].ok, "the gate defaults to DENY");
+        assert_eq!(replies[0].code.as_deref(), Some(codes::NOT_PERMITTED));
+        assert_eq!(replies[1].token, "p1");
+        assert!(!replies[1].ok);
+        assert_eq!(
+            replies[1].code.as_deref(),
+            Some(codes::UNSUPPORTED),
+            "pane.* stays permanently unsupported (#22) — never re-lowered onto term.*"
+        );
+    }
+
     /// `state.terminals` enumerates every live terminal as tier-1
     /// scene-global state — the quads are visibly on screen — with the
     /// live grid resolved from each seat's own parser.

@@ -1291,12 +1291,8 @@ fn command_to_osc(command: &Commands) -> (String, String) {
                     .opt("rows", *rows)
                     .build(),
             ),
-            TermAction::Focus { id } => {
-                ("term.focus".into(), p().opt("id", id.as_deref()).build())
-            }
-            TermAction::Close { id } => {
-                ("term.close".into(), p().opt("id", id.as_deref()).build())
-            }
+            TermAction::Focus { id } => ("term.focus".into(), p().opt("id", id.as_deref()).build()),
+            TermAction::Close { id } => ("term.close".into(), p().opt("id", id.as_deref()).build()),
         },
     }
 }
