@@ -123,10 +123,17 @@ impl Plugin for TerminalPlugin {
                     .run_if(
                         |presentation: Res<TerminalPresentation>,
                          plane_view: Res<TerminalPlaneView>,
-                         mobius_transition: Res<MobiusTransition>| {
+                         mobius_transition: Res<MobiusTransition>,
+                         focus: Res<FocusedTerminal>| {
+                            // Focus is a presentation input since M4.4:
+                            // plane visibility is focused-1:1, so a focus
+                            // move must re-run the applier (the drain only
+                            // marks the resource changed on real
+                            // transitions).
                             presentation.is_changed()
                                 || plane_view.is_changed()
                                 || mobius_transition.is_changed()
+                                || focus.is_changed()
                         },
                     ),
             )

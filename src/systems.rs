@@ -89,7 +89,7 @@ struct KittyRenderContext<'a> {
     plane_children: &'a mut Vec<Entity>,
 }
 
-struct CursorPoseContext<'a, 'w, 's> {
+struct CursorPoseContext<'a> {
     runtime: &'a TerminalRuntime,
     terminal: &'a TerminalSurface,
     viewport: &'a TerminalViewport,
@@ -97,7 +97,9 @@ struct CursorPoseContext<'a, 'w, 's> {
     plane_warp_amount: f32,
     mobius_progress: f32,
     elapsed_secs: f32,
-    plane_query: &'a Query<'w, 's, &'static Transform, (With<TerminalPlane>, Without<CursorModel>)>,
+    /// The FOCUSED seat's front-plane transform, when it exists — the 3D
+    /// anchor. `None` degrades to a hidden pose.
+    plane_transform: Option<&'a Transform>,
 }
 
 /// Marker for objects that already had instance brightness applied.
@@ -620,6 +622,7 @@ const BLINK_TICK_SECS: f32 = 0.25;
 pub(crate) struct RenderWidgetParams<'w, 's> {
     app_config: Res<'w, AppConfig>,
     cursor_settings: Res<'w, CursorSettings>,
+    focus: Res<'w, crate::focus::FocusedTerminal>,
     // One co-located seat query: the publisher reads each seat's own
     // mailbox (the per-entity exchange), never a shared slot — the shared
     // slot was #54's one-terminal-drawn trap.
@@ -628,6 +631,7 @@ pub(crate) struct RenderWidgetParams<'w, 's> {
         'w,
         's,
         (
+            Entity,
             &'static mut TerminalSurface,
             &'static mut TerminalRedrawState,
             &'static mut TerminalFrameDirty,
@@ -653,6 +657,7 @@ pub(crate) fn render_terminal_widget(mut params: RenderWidgetParams) {
     let RenderWidgetParams {
         app_config,
         cursor_settings,
+        focus,
         seats,
         selection,
         time,
@@ -662,6 +667,10 @@ pub(crate) fn render_terminal_widget(mut params: RenderWidgetParams) {
         presence,
         blink_phase,
     } = &mut params;
+    // The selection is screen-global state until picking lands (M4.6);
+    // it renders only into the FOCUSED seat's texture — highlighting the
+    // same cell range on every terminal would misattribute it.
+    let empty_selection = TerminalSelection::default();
     // The texture content only changes with terminal state or blink phase;
     // warp and camera animations are mesh- and camera-side. Rebuilding on
     // blink ticks instead of every frame keeps idle scene builds at 4Hz.
@@ -674,19 +683,32 @@ pub(crate) fn render_terminal_widget(mut params: RenderWidgetParams) {
     // presence is asserted by the seat-count tests, not warned about here
     // (a latched warn inside a loop would fire once for one seat and
     // never again).
-    for (mut terminal, mut redraw, mut frame_dirty, runtime, exchange) in seats.iter_mut() {
+    for (seat, mut terminal, mut redraw, mut frame_dirty, runtime, exchange) in seats.iter_mut() {
+        let is_focused = focus.is_focused(seat);
         let needs_redraw = redraw.take();
-        frame_dirty.0 = needs_redraw || blink_ticked || !model_load_state.loaded;
+        // Focused-only blink (#51's spine answer, ratified in #56):
+        // blink-driven repaints go to the focused terminal alone, so an
+        // idle unfocused terminal repaints at 0 Hz instead of 4 Hz and
+        // idle-scene texture work stays N-invariant. Output-driven redraw
+        // is untouched — a background tail -f keeps painting its own
+        // texture. Honest cost: SGR blink text on unfocused terminals
+        // freezes mid-phase (the kitty trade).
+        frame_dirty.0 = needs_redraw || (is_focused && blink_ticked) || !model_load_state.loaded;
         if !frame_dirty.0 {
             continue;
         }
 
         let screen = runtime.parser.screen();
+        let seat_selection = if is_focused {
+            &**selection
+        } else {
+            &empty_selection
+        };
         let _ = terminal.tui.draw(|frame| {
             frame.render_widget(
                 TerminalWidget {
                     screen,
-                    selection,
+                    selection: seat_selection,
                     theme: &app_config.theme,
                     font_style: app_config.font.style,
                 },
@@ -715,14 +737,40 @@ pub(crate) fn render_terminal_widget(mut params: RenderWidgetParams) {
 
 #[derive(SystemParam)]
 pub(crate) struct SyncMaterialsParams<'w, 's> {
-    runtime: Query<'w, 's, &'static TerminalRuntime>,
-    terminal: Query<'w, 's, &'static TerminalSurface>,
+    focus: Res<'w, crate::focus::FocusedTerminal>,
+    seats: Query<
+        'w,
+        's,
+        (
+            Entity,
+            &'static TerminalSurface,
+            &'static TerminalRuntime,
+            &'static TerminalFrameDirty,
+        ),
+    >,
     presentation: Res<'w, TerminalPresentation>,
     images: ResMut<'w, Assets<Image>>,
     materials: ResMut<'w, Assets<StandardMaterial>>,
-    plane_materials: Query<'w, 's, &'static MeshMaterial3d<StandardMaterial>, With<TerminalPlane>>,
-    plane_back_materials:
-        Query<'w, 's, &'static MeshMaterial3d<StandardMaterial>, With<TerminalPlaneBack>>,
+    #[allow(clippy::type_complexity)]
+    plane_materials: Query<
+        'w,
+        's,
+        (
+            &'static MeshMaterial3d<StandardMaterial>,
+            &'static crate::scene::TerminalOwner,
+        ),
+        With<TerminalPlane>,
+    >,
+    #[allow(clippy::type_complexity)]
+    plane_back_materials: Query<
+        'w,
+        's,
+        (
+            &'static MeshMaterial3d<StandardMaterial>,
+            &'static crate::scene::TerminalOwner,
+        ),
+        With<TerminalPlaneBack>,
+    >,
     present_materials: ResMut<'w, Assets<TerminalPresentMaterial>>,
     // `With<TerminalSprite>`: the avatar overlay quad carries the same
     // material type but its own texture — rebinding it to the terminal
@@ -733,14 +781,16 @@ pub(crate) struct SyncMaterialsParams<'w, 's> {
         &'static MeshMaterial2d<TerminalPresentMaterial>,
         With<crate::scene::TerminalSprite>,
     >,
-    frame_dirty: Query<'w, 's, &'static TerminalFrameDirty>,
 }
 
-/// Refreshes the debug back texture and plane materials after a redraw.
+/// Refreshes each dirty seat's debug back texture and plane materials
+/// after a redraw, and keeps the single present quad bound to the
+/// FOCUSED seat's texture (decision 12's focused-1:1 scene view — the
+/// rebinding named at the quad's spawn site in `setup_scene`).
 pub(crate) fn sync_terminal_materials(mut params: SyncMaterialsParams) {
     let SyncMaterialsParams {
-        runtime,
-        terminal,
+        focus,
+        seats,
         presentation,
         images,
         materials,
@@ -748,77 +798,62 @@ pub(crate) fn sync_terminal_materials(mut params: SyncMaterialsParams) {
         plane_back_materials,
         present_materials,
         present_query,
-        frame_dirty,
     } = &mut params;
-    let terminal = match terminal.single() {
-        Ok(terminal) => terminal,
-        Err(err) => {
-            // Latched once per process: the surface lives on THE terminal
-            // seat, and the miss must name its system (#54's silent-.single()
-            // finding).
-            warn_once!(
-                "sync_terminal_materials: the surface needs exactly one terminal seat: {err}"
-            );
-            return;
-        }
-    };
-    let frame_dirty = match frame_dirty.single() {
-        Ok(frame_dirty) => frame_dirty,
-        Err(err) => {
-            // Latched once per process: the dirty flag lives on THE terminal
-            // seat, and the miss must name its system (#54's silent-.single()
-            // finding).
-            warn_once!(
-                "sync_terminal_materials: the frame-dirty flag needs exactly one terminal seat: {err}"
-            );
-            return;
-        }
-    };
-    let runtime = match runtime.single() {
-        Ok(runtime) => runtime,
-        Err(err) => {
-            // Latched once per process: the runtime lives on THE terminal
-            // seat, and the miss must name its system (#54's silent-.single()
-            // finding).
-            warn_once!(
-                "sync_terminal_materials: the runtime needs exactly one terminal seat: {err}"
-            );
-            return;
-        }
-    };
-    if !frame_dirty.0 {
-        return;
-    }
-
-    // The present texture's GpuImage is recreated when the terminal resizes (window
-    // resize / font zoom), which invalidates the 2D present material's cached bind
-    // group. Writing the texture handle — not merely touching the asset with
-    // `get_mut` — advances the material's change tick so Bevy re-prepares the bind
-    // group against the current GpuImage; a no-op touch leaves the quad sampling a
-    // stale texture and the flat view freezes. Matches the plane handling.
-    if let Some(present_image) = terminal.image_handle.as_ref() {
-        for present_handle in present_query.iter() {
-            if let Some(mut material) = present_materials.get_mut(&present_handle.0) {
-                material.texture = present_image.clone();
-            }
-        }
-    }
-
+    let focused = focus.get();
     let in_3d = matches!(
         presentation.mode,
         TerminalPresentationMode::Plane3d | TerminalPresentationMode::Mobius3d
     );
-    if in_3d {
-        sync_terminal_debug_image(terminal, images, runtime.parser.screen());
-    }
 
-    sync_plane_texture(terminal.image_handle.as_ref(), plane_materials, materials);
-    if in_3d {
+    for (seat, terminal, runtime, frame_dirty) in seats.iter() {
+        if !frame_dirty.0 {
+            continue;
+        }
+
+        // The present texture's GpuImage is recreated when the terminal resizes (window
+        // resize / font zoom), which invalidates the 2D present material's cached bind
+        // group. Writing the texture handle — not merely touching the asset with
+        // `get_mut` — advances the material's change tick so Bevy re-prepares the bind
+        // group against the current GpuImage; a no-op touch leaves the quad sampling a
+        // stale texture and the flat view freezes. Matches the plane handling.
+        //
+        // Only the FOCUSED seat reaches the quad: a focus transition
+        // dirties both sides (the drain's invariant 5), so the rebind
+        // lands the same frame focus moves — no extra change tracking.
+        if Some(seat) == focused
+            && let Some(present_image) = terminal.image_handle.as_ref()
+        {
+            for present_handle in present_query.iter() {
+                if let Some(mut material) = present_materials.get_mut(&present_handle.0) {
+                    material.texture = present_image.clone();
+                }
+            }
+        }
+
+        if in_3d {
+            sync_terminal_debug_image(terminal, images, runtime.parser.screen());
+        }
+
+        // Each seat re-binds its OWN plane pair's textures (TerminalOwner
+        // join) — never another seat's.
         sync_plane_texture(
-            terminal.back_image_handle.as_ref(),
-            plane_back_materials,
+            terminal.image_handle.as_ref(),
+            plane_materials
+                .iter()
+                .filter(|(_, owner)| owner.0 == seat)
+                .map(|(handle, _)| handle),
             materials,
         );
+        if in_3d {
+            sync_plane_texture(
+                terminal.back_image_handle.as_ref(),
+                plane_back_materials
+                    .iter()
+                    .filter(|(_, owner)| owner.0 == seat)
+                    .map(|(handle, _)| handle),
+                materials,
+            );
+        }
     }
 }
 
@@ -853,37 +888,18 @@ pub(crate) fn finish_terminal_model_load(mut params: ModelLoadParams) {
         asset_server,
         frame_dirty,
     } = &mut params;
-    let frame_dirty = match frame_dirty.single() {
-        Ok(frame_dirty) => frame_dirty,
-        Err(err) => {
-            // Latched once per process: the dirty flag lives on THE terminal
-            // seat, and the miss must name its system (#54's silent-.single()
-            // finding).
-            warn_once!(
-                "finish_terminal_model_load: the frame-dirty flag needs exactly one terminal seat: {err}"
-            );
-            return;
-        }
-    };
-    let mut redraw = match redraw.single_mut() {
-        Ok(redraw) => redraw,
-        Err(err) => {
-            // Latched once per process: the redraw flag lives on THE terminal
-            // seat, and the miss must name its system (#54's silent-.single()
-            // finding).
-            warn_once!(
-                "finish_terminal_model_load: the redraw flag needs exactly one terminal seat: {err}"
-            );
-            return;
-        }
-    };
-    if !frame_dirty.0 {
+    // ANY seat's dirty frame proves upload activity: the model load is
+    // scene-global (one cursor model), so the gate is any-seat, and the
+    // deferral redraw goes to every seat (N=1 identical).
+    if !frame_dirty.iter().any(|frame_dirty| frame_dirty.0) {
         return;
     }
 
     if !model_load_state.first_frame_uploaded {
         model_load_state.first_frame_uploaded = true;
-        redraw.request();
+        for mut redraw in redraw.iter_mut() {
+            redraw.request();
+        }
         return;
     }
 
@@ -3257,90 +3273,82 @@ fn apply_plane_warp(
 pub(crate) struct CursorSyncParams<'w, 's> {
     app_config: Res<'w, AppConfig>,
     cursor_settings: Res<'w, CursorSettings>,
-    runtime: Query<'w, 's, &'static TerminalRuntime>,
-    terminal: Query<'w, 's, &'static TerminalSurface>,
-    viewport: Query<'w, 's, &'static TerminalViewport>,
+    focus: Res<'w, crate::focus::FocusedTerminal>,
+    #[allow(clippy::type_complexity)]
+    seats: Query<
+        'w,
+        's,
+        (
+            &'static TerminalRuntime,
+            &'static TerminalSurface,
+            &'static TerminalViewport,
+            &'static TerminalPlaneWarp,
+        ),
+    >,
     presentation: Res<'w, TerminalPresentation>,
     mobius_transition: Res<'w, MobiusTransition>,
-    plane_warp: Query<'w, 's, &'static TerminalPlaneWarp>,
     time: Res<'w, Time>,
-    plane_query: Query<'w, 's, &'static Transform, (With<TerminalPlane>, Without<CursorModel>)>,
+    #[allow(clippy::type_complexity)]
+    plane_query: Query<
+        'w,
+        's,
+        (&'static Transform, &'static crate::scene::TerminalOwner),
+        (With<TerminalPlane>, Without<CursorModel>),
+    >,
     query: CursorTransformQuery<'w, 's>,
 }
 
-/// Synchronizes the 3D cursor model with the terminal cursor.
+/// Synchronizes the 3D cursor model with the FOCUSED terminal's cursor.
 ///
 /// This runs after [`render_terminal_widget`], once the cursor model has been spawned and the latest
 /// terminal cursor position is available from [`TerminalRuntime`]. It updates the [`CursorModel`]
 /// transform and visibility for both 2D and 3D presentation modes.
 ///
-/// In 3D mode the cursor model is positioned relative to the current [`TerminalPlane`] transform
-/// and warp amount.
+/// One model, embodying the focused terminal: with zero focused the model
+/// hides (a legal state, not a warn). Per-terminal cursor models ride the
+/// scene-composition return to map #42 — unfocused planes are not on the
+/// stage this milestone, so a cursor on them would embody nothing
+/// visible.
+///
+/// In 3D mode the cursor model is positioned relative to the focused
+/// seat's own [`TerminalPlane`] transform and warp amount
+/// ([`crate::scene::TerminalOwner`] join).
 pub(crate) fn sync_asset_to_terminal_cursor(mut params: CursorSyncParams) {
     let CursorSyncParams {
         app_config,
         cursor_settings,
-        runtime,
-        terminal,
-        viewport,
+        focus,
+        seats,
         presentation,
         mobius_transition,
-        plane_warp,
         time,
         plane_query,
         query,
     } = &mut params;
-    let terminal = match terminal.single() {
-        Ok(terminal) => terminal,
-        Err(err) => {
-            // Latched once per process: the surface lives on THE terminal
-            // seat, and the miss must name its system (#54's silent-.single()
-            // finding).
-            warn_once!(
-                "sync_asset_to_terminal_cursor: the surface needs exactly one terminal seat: {err}"
-            );
-            return;
-        }
-    };
-    let viewport = match viewport.single() {
-        Ok(viewport) => viewport,
-        Err(err) => {
-            // Latched once per process: the viewport lives on THE terminal
-            // seat, and the miss must name its system (#54's silent-.single()
-            // finding).
-            warn_once!(
-                "sync_asset_to_terminal_cursor: the viewport needs exactly one terminal seat: {err}"
-            );
-            return;
-        }
-    };
-    let plane_warp = match plane_warp.single() {
-        Ok(plane_warp) => plane_warp,
-        Err(err) => {
-            // Latched once per process: the warp lives on THE terminal
-            // seat, and the miss must name its system (#54's silent-.single()
-            // finding).
-            warn_once!(
-                "sync_asset_to_terminal_cursor: the plane warp needs exactly one terminal seat: {err}"
-            );
-            return;
-        }
-    };
-    let runtime = match runtime.single() {
-        Ok(runtime) => runtime,
-        Err(err) => {
-            // Latched once per process: the runtime lives on THE terminal
-            // seat, and the miss must name its system (#54's silent-.single()
-            // finding).
-            warn_once!(
-                "sync_asset_to_terminal_cursor: the runtime needs exactly one terminal seat: {err}"
-            );
-            return;
-        }
-    };
     if query.is_empty() {
         return;
     }
+
+    let hide_model = |query: &mut CursorTransformQuery| {
+        for (_, mut visibility) in query.iter_mut() {
+            *visibility = Visibility::Hidden;
+        }
+    };
+
+    let Some(focused) = focus.get() else {
+        hide_model(query);
+        return;
+    };
+    let Ok((runtime, terminal, viewport, plane_warp)) = seats.get(focused) else {
+        // Latched once per process: the authority validated liveness, so a
+        // focused entity without the seat bundle is a broken dress and
+        // must be loud (#54's silent-miss finding).
+        warn_once!(
+            "sync_asset_to_terminal_cursor: the focused entity is not a dressed terminal seat"
+        );
+        hide_model(query);
+        return;
+    };
 
     let pose_ctx = CursorPoseContext {
         runtime,
@@ -3350,7 +3358,10 @@ pub(crate) fn sync_asset_to_terminal_cursor(mut params: CursorSyncParams) {
         plane_warp_amount: plane_warp.amount,
         mobius_progress: active_mobius_progress(presentation.mode, mobius_transition),
         elapsed_secs: time.elapsed_secs(),
-        plane_query,
+        plane_transform: plane_query
+            .iter()
+            .find(|(_, owner)| owner.0 == focused)
+            .map(|(transform, _)| transform),
     };
     let (translation, rotation, scale, cursor_visibility) =
         cursor_pose(app_config, cursor_settings, &pose_ctx);
@@ -3365,7 +3376,7 @@ pub(crate) fn sync_asset_to_terminal_cursor(mut params: CursorSyncParams) {
 fn cursor_pose(
     app_config: &AppConfig,
     settings: &CursorSettings,
-    ctx: &CursorPoseContext<'_, '_, '_>,
+    ctx: &CursorPoseContext<'_>,
 ) -> (Vec3, Quat, f32, Visibility) {
     let cols = ctx.terminal.cols.max(1) as f32;
     let rows = ctx.terminal.rows.max(1) as f32;
@@ -3401,14 +3412,14 @@ fn cursor_pose(
             },
         ),
         TerminalPresentationMode::Plane3d | TerminalPresentationMode::Mobius3d => {
-            let plane_transform = match ctx.plane_query.single() {
-                Ok(plane_transform) => plane_transform,
-                Err(err) => {
-                    warn_once!(
-                        "sync_asset_to_terminal_cursor: the cursor model needs exactly one terminal plane: {err}"
-                    );
-                    return (Vec3::ZERO, Quat::IDENTITY, scale, Visibility::Hidden);
-                }
+            let Some(plane_transform) = ctx.plane_transform else {
+                // Latched once per process: a focused, dressed seat with no
+                // owned front plane is a broken dress (#54's silent-miss
+                // finding).
+                warn_once!(
+                    "sync_asset_to_terminal_cursor: the focused terminal has no owned plane anchor"
+                );
+                return (Vec3::ZERO, Quat::IDENTITY, scale, Visibility::Hidden);
             };
             let plane_local_x = cursor_x / cols - 0.5;
             let plane_local_y = 0.5 - (cursor_row + 0.5) / rows + plane_bob;
@@ -4307,21 +4318,53 @@ mod single_plane_degrade_tests {
     }
 
     #[test]
-    fn cursor_sync_warns_once_and_hides_without_a_unique_plane() {
+    fn cursor_sync_hides_without_focus_and_warns_once_without_an_owned_plane() {
         let config = AppConfig::default();
         let mut world = World::new();
         world.insert_resource(AppConfig::default());
         world.init_resource::<CursorSettings>();
-        world.spawn(
-            TerminalRuntime::virtual_channel(&config, crate::runtime::IngressSource::test_boot()).0,
-        );
+        world.init_resource::<crate::focus::FocusedTerminal>();
         base_resources(&mut world, TerminalPresentationMode::Plane3d);
         world.init_resource::<MobiusTransition>();
         let cursor = world
             .spawn((CursorModel, Transform::default(), Visibility::Visible))
             .id();
+        // Two planes, neither owned by the seat the focus will point at —
+        // the owner join must never anchor to a foreign plane.
         world.spawn((TerminalPlane, Transform::default()));
         world.spawn((TerminalPlane, Transform::default()));
+
+        // Zero focused (invariant 1's legal state): the model hides, with
+        // no warn — there is nothing broken about an unfocused scene.
+        let warns = capture_warns(|| {
+            world
+                .run_system_once(sync_asset_to_terminal_cursor)
+                .expect("the system should run");
+        });
+        assert_eq!(
+            warns_naming(&warns, "sync_asset_to_terminal_cursor"),
+            0,
+            "no focus is legal, never a warn: {warns:?}"
+        );
+        assert_eq!(
+            world.get::<Visibility>(cursor).copied(),
+            Some(Visibility::Hidden),
+            "the cursor model hides while nothing is focused"
+        );
+
+        // Focus the dressed seat: 3D pose needs the seat's OWNED plane
+        // anchor, and none exists — loud, once, hidden.
+        let seat = world
+            .query_filtered::<Entity, With<TerminalSurface>>()
+            .single(&world)
+            .expect("base_resources spawns one seat");
+        let runtime =
+            TerminalRuntime::virtual_channel(&config, crate::runtime::IngressSource::test_boot()).0;
+        world.entity_mut(seat).insert(runtime);
+        world
+            .resource_mut::<crate::focus::FocusedTerminal>()
+            .set_for_test(Some(seat));
+        world.entity_mut(cursor).insert(Visibility::Visible);
 
         let warns = capture_warns(|| {
             world
@@ -4336,12 +4379,12 @@ mod single_plane_degrade_tests {
         assert_eq!(
             warns_naming(&warns, "sync_asset_to_terminal_cursor"),
             1,
-            "two wrong-plane frames must produce exactly one latched warn: {warns:?}"
+            "two anchorless frames must produce exactly one latched warn: {warns:?}"
         );
         assert_eq!(
             world.get::<Visibility>(cursor).copied(),
             Some(Visibility::Hidden),
-            "the cursor model hides while the plane count is wrong"
+            "the cursor model hides while the focused seat has no owned plane"
         );
     }
 }

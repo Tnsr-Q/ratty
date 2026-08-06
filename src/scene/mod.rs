@@ -210,9 +210,10 @@ pub struct ModelLoadState {
 }
 
 type SpriteVisibilityQuery<'w, 's> = Query<'w, 's, &'static mut Visibility, With<TerminalSprite>>;
-type PlaneVisibilityQuery<'w, 's> = Query<'w, 's, &'static mut Visibility, With<TerminalPlane>>;
+type PlaneVisibilityQuery<'w, 's> =
+    Query<'w, 's, (&'static mut Visibility, &'static TerminalOwner), With<TerminalPlane>>;
 type PlaneBackVisibilityQuery<'w, 's> =
-    Query<'w, 's, &'static mut Visibility, With<TerminalPlaneBack>>;
+    Query<'w, 's, (&'static mut Visibility, &'static TerminalOwner), With<TerminalPlaneBack>>;
 type PlaneMaterialQuery<'w, 's> =
     Query<'w, 's, &'static MeshMaterial3d<StandardMaterial>, With<TerminalPlane>>;
 type PlaneTransformQuery<'w, 's> = Query<'w, 's, &'static mut Transform, With<TerminalPlane>>;
@@ -845,6 +846,7 @@ pub(crate) fn apply_terminal_presentation(
     presentation: Res<TerminalPresentation>,
     plane_view: Res<TerminalPlaneView>,
     mobius_transition: Res<MobiusTransition>,
+    focus: Res<crate::focus::FocusedTerminal>,
     mut params: PresentationParams,
 ) {
     let PresentationParams {
@@ -877,24 +879,29 @@ pub(crate) fn apply_terminal_presentation(
     } else {
         Visibility::Visible
     };
-    let plane_visibility = if is_3d {
-        Visibility::Visible
-    } else {
-        Visibility::Hidden
-    };
 
     for mut visibility in &mut visibility_queries.p0() {
         *visibility = sprite_visibility;
     }
 
-    for mut visibility in &mut visibility_queries.p1() {
-        *visibility = plane_visibility;
+    // Focused-1:1 (#56 decision 12's scene view): only the FOCUSED seat's
+    // plane pair is on the stage — the quad shows the focused terminal in
+    // flat mode, its planes show it in the 3D modes. What non-focused
+    // terminals display in free 3D is map #42's scene-composition return,
+    // deliberately unbuilt here; with one terminal it is focused by boot
+    // policy, so N=1 is byte-identical.
+    for (mut visibility, owner) in &mut visibility_queries.p1() {
+        *visibility = if is_3d && focus.is_focused(owner.0) {
+            Visibility::Visible
+        } else {
+            Visibility::Hidden
+        };
     }
 
-    for mut visibility in &mut visibility_queries.p2() {
+    for (mut visibility, owner) in &mut visibility_queries.p2() {
         // A Mobius strip is one continuous ribbon, so the separate back sheet model does not map
         // cleanly. Render the front material double-sided instead.
-        *visibility = if is_3d && !is_mobius {
+        *visibility = if is_3d && !is_mobius && focus.is_focused(owner.0) {
             Visibility::Visible
         } else {
             Visibility::Hidden
@@ -1291,6 +1298,179 @@ mod tests {
             world.resource::<FocusedTerminal>().get(),
             Some(seat_a),
             "decision 8: MRU succession after the focused child dies"
+        );
+    }
+
+    /// Focused-1:1 (#56 decision 12's scene view) plus focused-only blink
+    /// (the #51 spine answer): plane visibility and the present quad
+    /// follow focus through the real applier and materials systems, and a
+    /// blink tick dirties only the focused seat while the unfocused one
+    /// stays clean.
+    #[test]
+    fn focused_1_1_visibility_quad_and_blink_follow_focus() {
+        use bevy::ecs::message::Messages;
+        use bevy::ecs::system::RunSystemOnce;
+
+        use crate::focus::{
+            FocusGained, FocusLost, FocusOrigin, FocusRequest, FocusedTerminal,
+            drain_focus_requests,
+        };
+
+        let mut world = spawner_world();
+        world.init_resource::<FocusedTerminal>();
+        world.init_resource::<Messages<FocusRequest>>();
+        world.init_resource::<Messages<FocusGained>>();
+        world.init_resource::<Messages<FocusLost>>();
+        world.init_resource::<Assets<TerminalPresentMaterial>>();
+        world.insert_resource(TerminalPresentation {
+            mode: TerminalPresentationMode::Plane3d,
+        });
+        world.insert_resource(TerminalPlaneView::default());
+        world.insert_resource(MobiusTransition::default());
+        world.init_resource::<Time>();
+        world.init_resource::<crate::model::CursorSettings>();
+        world.insert_resource(ModelLoadState {
+            loaded: true,
+            first_frame_uploaded: true,
+        });
+        world.init_resource::<crate::viz::VizRegistry>();
+        world.init_resource::<crate::presence::PresenceRegistry>();
+        world.init_resource::<crate::mouse::TerminalSelection>();
+
+        let (seat_a, _id_a) = world
+            .run_system_once(spawn_virtual_terminal)
+            .expect("spawner system runs");
+        let (seat_b, _id_b) = world
+            .run_system_once(spawn_virtual_terminal)
+            .expect("spawner system runs");
+        assert_eq!(
+            world.query::<&TerminalIdentity>().iter(&world).count(),
+            2,
+            "seat count asserted (#58 rider)"
+        );
+
+        let handle_of = |world: &mut World, seat: Entity| {
+            world
+                .get::<TerminalSurface>(seat)
+                .expect("dressed seat")
+                .image_handle
+                .clone()
+                .expect("dress created the present texture")
+        };
+        let handle_a = handle_of(&mut world, seat_a);
+        let handle_b = handle_of(&mut world, seat_b);
+
+        // The single present quad, bound to A's texture the way setup_scene
+        // binds the boot seat's.
+        let quad_material =
+            world
+                .resource_mut::<Assets<TerminalPresentMaterial>>()
+                .add(TerminalPresentMaterial {
+                    texture: handle_a.clone(),
+                });
+        world.spawn((TerminalSprite, MeshMaterial2d(quad_material.clone())));
+
+        let focus = |world: &mut World, target: Entity| {
+            world
+                .resource_mut::<Messages<FocusRequest>>()
+                .write(FocusRequest {
+                    target: Some(target),
+                    origin: FocusOrigin::SpawnPolicy,
+                });
+            world
+                .run_system_once(drain_focus_requests)
+                .expect("drain runs");
+            world.resource_mut::<Messages<FocusRequest>>().clear();
+        };
+        let plane_visibilities = |world: &mut World| {
+            let mut query = world.query::<(&Visibility, &TerminalOwner, &TerminalPlane)>();
+            let mut by_owner: Vec<(Entity, Visibility)> = query
+                .iter(world)
+                .map(|(visibility, owner, _)| (owner.0, *visibility))
+                .collect();
+            by_owner.sort_by_key(|(owner, _)| *owner);
+            by_owner
+        };
+
+        // Focus A: A's plane visible in 3D, B's hidden.
+        focus(&mut world, seat_a);
+        world
+            .run_system_once(apply_terminal_presentation)
+            .expect("applier runs");
+        for (owner, visibility) in plane_visibilities(&mut world) {
+            assert_eq!(
+                visibility,
+                if owner == seat_a {
+                    Visibility::Visible
+                } else {
+                    Visibility::Hidden
+                },
+                "focused-1:1: only the focused seat's plane is on the stage"
+            );
+        }
+
+        // Focus B: visibility flips, and the quad rebinds to B's texture on
+        // B's next dirty frame (the drain dirtied both sides).
+        focus(&mut world, seat_b);
+        world
+            .run_system_once(apply_terminal_presentation)
+            .expect("applier runs");
+        for (owner, visibility) in plane_visibilities(&mut world) {
+            assert_eq!(
+                visibility,
+                if owner == seat_b {
+                    Visibility::Visible
+                } else {
+                    Visibility::Hidden
+                },
+                "focus moved: the stage follows it"
+            );
+        }
+        world
+            .get_mut::<crate::systems::TerminalFrameDirty>(seat_b)
+            .expect("dressed seat")
+            .0 = true;
+        world
+            .run_system_once(crate::systems::sync_terminal_materials)
+            .expect("materials sync runs");
+        assert_eq!(
+            world
+                .resource::<Assets<TerminalPresentMaterial>>()
+                .get(&quad_material)
+                .expect("quad material lives")
+                .texture,
+            handle_b,
+            "the present quad samples the FOCUSED seat's texture"
+        );
+        assert_ne!(handle_a, handle_b, "the two seats own distinct textures");
+
+        // Focused-only blink: with both redraw flags clean, a blink tick
+        // dirties the focused seat alone.
+        {
+            let mut redraws = world.query::<&mut TerminalRedrawState>();
+            for mut redraw in redraws.iter_mut(&mut world) {
+                redraw.take();
+            }
+        }
+        world
+            .resource_mut::<Time>()
+            .advance_by(std::time::Duration::from_millis(300));
+        world
+            .run_system_once(crate::systems::render_terminal_widget)
+            .expect("widget render runs");
+        let dirty_of = |world: &mut World, seat: Entity| {
+            world
+                .get::<crate::systems::TerminalFrameDirty>(seat)
+                .expect("dressed seat")
+                .0
+        };
+        assert!(
+            dirty_of(&mut world, seat_b),
+            "the focused seat blink-repaints"
+        );
+        assert!(
+            !dirty_of(&mut world, seat_a),
+            "an idle unfocused terminal repaints at 0 Hz, not 4 Hz"
         );
     }
 
@@ -1919,6 +2099,7 @@ mod tests {
         });
         world.insert_resource(TerminalPlaneView::default());
         world.insert_resource(MobiusTransition::default());
+        world.init_resource::<crate::focus::FocusedTerminal>();
         world.init_resource::<Assets<StandardMaterial>>();
         let (first, second) = {
             let mut materials = world.resource_mut::<Assets<StandardMaterial>>();
@@ -1980,6 +2161,7 @@ mod tests {
         });
         app.insert_resource(TerminalPlaneView::default());
         app.insert_resource(MobiusTransition::default());
+        app.init_resource::<crate::focus::FocusedTerminal>();
         app.init_resource::<Assets<StandardMaterial>>();
         app.add_systems(Update, apply_terminal_presentation);
 

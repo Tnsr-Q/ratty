@@ -130,6 +130,14 @@ impl FocusedTerminal {
         self.current == Some(entity)
     }
 
+    /// Test-only direct write, bypassing the drain — for worlds that
+    /// assert a consumer's behavior rather than drain policy. Production
+    /// writes go through [`drain_focus_requests`] alone (invariant 2).
+    #[cfg(test)]
+    pub(crate) fn set_for_test(&mut self, entity: Option<Entity>) {
+        self.current = entity;
+    }
+
     /// The focus-cycle target (#56 decision 10's rider): the
     /// least-recently-focused live seat, so repeated cycling visits
     /// every terminal round-robin off pure MRU data. Never-focused seats
