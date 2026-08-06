@@ -208,6 +208,13 @@ impl TerminalRoster {
         self.rows.get(&id)
     }
 
+    /// The mutable row for a live terminal. The only field a caller may
+    /// change after the mint is `closing` — everything else is either a
+    /// mint-time fact or the sweep's to clear.
+    pub(crate) fn row_mut(&mut self, id: TerminalId) -> Option<&mut TerminalRow> {
+        self.rows.get_mut(&id)
+    }
+
     /// Resolves a wire handle to its terminal.
     ///
     /// A closed terminal's handle, a handle minted by a previous process,
@@ -382,6 +389,7 @@ pub fn apply_terminal_commands(
     )>,
     mut plane_query: crate::scene::TerminalPlaneLayoutQuery,
     mut plane_back_query: crate::scene::TerminalPlaneBackLayoutQuery,
+    mut pending_closes: ResMut<PendingTerminalCloses>,
     mut focus_requests: MessageWriter<crate::focus::FocusRequest>,
     mut acks: MessageWriter<crate::query_channel::AckOutcome>,
     mut diagnostics: crate::query_channel::DiagnosticsSink,
@@ -650,7 +658,128 @@ pub fn apply_terminal_commands(
                 });
                 ack_commit(&mut acks, *source, ack_token);
             }
+            RattyAiCommand::TermClose { id } => {
+                guard_wire_origin!("term.close");
+                require_capability!(
+                    "term.close",
+                    SceneCapability::TerminalLifecycle,
+                    "terminal lifecycle requires the terminal-lifecycle capability \
+                     ([trust.local] terminal_lifecycle)"
+                );
+                let target = match resolve_target(&spawn.roster, *source, id.as_deref()) {
+                    Ok(target) => target,
+                    Err(message) => {
+                        reject!("term.close", codes::UNKNOWN_ID, "{message}");
+                        continue;
+                    }
+                };
+                // Close authority, in this order. Note that a creator-less
+                // row refuses even the BARE self-form: terminal #1, every
+                // chord-spawned seat and every orphan are wire-unkillable
+                // by construction, and that must hold from their own
+                // ingress too or "wire-unkillable" is only half true.
+                let Some(row) = spawn.roster.row(target) else {
+                    reject!(
+                        "term.close",
+                        codes::UNKNOWN_ID,
+                        "that terminal is no longer live"
+                    );
+                    continue;
+                };
+                match row.creator {
+                    None => {
+                        reject!(
+                            "term.close",
+                            codes::NOT_OWNER,
+                            "that terminal has no wire creator and cannot be closed from the \
+                             wire (the boot terminal, user-spawned terminals, and orphans)"
+                        );
+                        continue;
+                    }
+                    // The creator closes its creation; a wire-born
+                    // terminal closes itself (this is what the reply-flush
+                    // deferral below exists for).
+                    Some(creator)
+                        if creator == source.terminal() || target == source.terminal() => {}
+                    Some(_) => {
+                        reject!(
+                            "term.close",
+                            codes::NOT_OWNER,
+                            "that terminal was created by another agent"
+                        );
+                        continue;
+                    }
+                }
+                // Closing a still-`spawning` row is legal and cancels the
+                // spawn — one verb covers mid-flight cancellation, and
+                // there is no `term.cancel`.
+                spawn
+                    .roster
+                    .row_mut(target)
+                    .expect("the row was just read")
+                    .closing = true;
+                pending_closes.push(target);
+                ack_commit(&mut acks, *source, ack_token);
+            }
             _ => {}
+        }
+    }
+}
+
+/// Terminals whose close has committed, awaiting the despawn.
+///
+/// The despawn must not happen in the applier. `answer_queries` writes a
+/// reply into the ARRIVAL terminal's own transport and drops it with a
+/// warn when that terminal is gone, and Bevy inserts a command flush at
+/// every ordering edge — so a `Commands::despawn` in an applier ordered
+/// before the query channel flushes *before* the reply is written, and a
+/// self-close would silently eat its own ack, every time.
+#[derive(Resource, Default)]
+pub struct PendingTerminalCloses(Vec<TerminalId>);
+
+impl PendingTerminalCloses {
+    /// Queues a close. Idempotent by construction: a second close on an
+    /// already-`closing` row must not push again, or a close loop against
+    /// one row would grow this vector without bound — the only unbounded
+    /// resource in the design.
+    fn push(&mut self, id: TerminalId) {
+        if !self.0.contains(&id) {
+            self.0.push(id);
+        }
+    }
+
+    /// Despawn sweep: a terminal that died by another path between the
+    /// applier and the drain must not be despawned again.
+    pub(crate) fn sweep_terminal(&mut self, id: TerminalId) {
+        self.0.retain(|pending| *pending != id);
+    }
+
+    /// Test-only: the queued closes.
+    #[cfg(test)]
+    pub(crate) fn test_pending(&self) -> &[TerminalId] {
+        &self.0
+    }
+}
+
+/// Despawns terminals whose close committed, after this frame's replies
+/// have been written.
+///
+/// Registered `.after(answer_queries)` — that edge is the whole point of
+/// the deferral. The `Remove<TerminalIdentity>` observer then does every
+/// teardown: the scene lock, pending jumps, the roster row and its orphan
+/// pass, the namespace-keyed globals, the owned planes, and the lease as
+/// its last act.
+pub(crate) fn despawn_closed_terminals(
+    mut pending: ResMut<PendingTerminalCloses>,
+    registry: Res<crate::identity::TerminalRegistry>,
+    mut commands: Commands,
+) {
+    for id in pending.0.drain(..) {
+        // The honest resolver: an id whose terminal already died by
+        // another path resolves `None` and nothing aliases, because ids
+        // never recycle.
+        if let Some(seat) = registry.entity_of(id) {
+            commands.entity(seat).despawn();
         }
     }
 }
@@ -803,19 +932,31 @@ pub struct TerminalsPlugin;
 
 impl Plugin for TerminalsPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<TerminalRoster>().add_systems(
-            Update,
-            apply_terminal_commands
-                .after(crate::systems::pump_pty_output)
-                // The user's chord beats the wire for the shared spawner
-                // bundle — honest arbitration of a real conflict, not a
-                // tiebreak.
-                .after(crate::scene::spawn_requested_terminals)
-                // The edge auto-inserts a command flush, so a same-chunk
-                // spawn-then-focus finds a LIVE seat rather than being
-                // dropped at the drain's liveness door.
-                .before(crate::focus::drain_focus_requests),
-        );
+        app.init_resource::<TerminalRoster>()
+            .init_resource::<PendingTerminalCloses>()
+            .add_systems(
+                Update,
+                apply_terminal_commands
+                    .after(crate::systems::pump_pty_output)
+                    // The user's chord beats the wire for the shared
+                    // spawner bundle — honest arbitration of a real
+                    // conflict, not a tiebreak.
+                    .after(crate::scene::spawn_requested_terminals)
+                    // The edge auto-inserts a command flush, so a
+                    // same-chunk spawn-then-focus finds a LIVE seat rather
+                    // than being dropped at the drain's liveness door.
+                    .before(crate::focus::drain_focus_requests),
+            )
+            // THE deferral: replies are written into the arrival
+            // terminal's own transport by `answer_queries`, so a
+            // self-close's seat must outlive that system or the ack it
+            // just committed is dropped with a warn.
+            .add_systems(
+                Update,
+                despawn_closed_terminals
+                    .after(crate::query_channel::answer_queries)
+                    .run_if(|pending: Res<PendingTerminalCloses>| !pending.0.is_empty()),
+            );
     }
 }
 
@@ -848,6 +989,7 @@ mod tests {
         world.init_resource::<Assets<Image>>();
         world.init_resource::<QuerySession>();
         world.init_resource::<TerminalRoster>();
+        world.init_resource::<PendingTerminalCloses>();
         world.init_resource::<Time>();
         world.init_resource::<crate::focus::FocusedTerminal>();
         world.init_resource::<Messages<AiCommand>>();
@@ -1363,6 +1505,287 @@ mod tests {
             .get::<crate::terminal::TerminalSurface>(seat)
             .expect("surface");
         assert_eq!((surface.cols, surface.rows), (100, 24));
+    }
+
+    /// Terminal #1 is wire-unkillable by construction, and so is every
+    /// other creator-less seat — from a third party AND from its own
+    /// ingress. The bare self-form is the case the locked doc left open,
+    /// and leaving it open would make "wire-unkillable" only half true.
+    #[test]
+    fn a_creator_less_terminal_refuses_every_close_including_its_own() {
+        let (mut world, boot) = organ_world();
+        grant(&mut world, true, false);
+        let boot_handle = world
+            .resource::<TerminalRoster>()
+            .row(boot.id())
+            .expect("row")
+            .handle
+            .clone();
+
+        for id in [None, Some(boot_handle)] {
+            let acks = wire(
+                &mut world,
+                boot.ingress(),
+                RattyAiCommand::TermClose { id: id.clone() },
+            );
+            let ack = only_ack(&acks);
+            assert!(!ack.ok, "{id:?}");
+            assert_eq!(ack.code, Some(codes::NOT_OWNER), "{id:?}");
+            assert_eq!(seat_count(&mut world), 1, "seat count asserted (#58 rider)");
+            assert!(
+                world
+                    .resource::<PendingTerminalCloses>()
+                    .test_pending()
+                    .is_empty(),
+                "a refused close queues nothing"
+            );
+        }
+    }
+
+    /// The creator closes its creation; a third party cannot. Close is an
+    /// ownership fact, so it answers `not-owner` even when the caller
+    /// holds the capability.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn only_the_creator_or_the_terminal_itself_may_close_it() {
+        let (mut world, boot) = organ_world();
+        grant(&mut world, true, false);
+        let acks = wire(&mut world, boot.ingress(), spawn_command());
+        let child_handle = only_ack(&acks).payload.as_ref().expect("payload")["id"]
+            .as_str()
+            .expect("handle")
+            .to_string();
+        let child = world
+            .resource::<TerminalRoster>()
+            .by_handle(&child_handle)
+            .expect("live");
+        let child_identity = *world
+            .get::<TerminalIdentity>(
+                world
+                    .resource::<TerminalRegistry>()
+                    .entity_of(child)
+                    .expect("bound"),
+            )
+            .expect("identity");
+
+        // A third party — here the child naming its own SIBLING would be
+        // the same shape; the child naming ITSELF is permitted below.
+        let acks = wire(&mut world, boot.ingress(), spawn_command());
+        let sibling_handle = only_ack(&acks).payload.as_ref().expect("payload")["id"]
+            .as_str()
+            .expect("handle")
+            .to_string();
+        let acks = wire(
+            &mut world,
+            child_identity.ingress(),
+            RattyAiCommand::TermClose {
+                id: Some(sibling_handle),
+            },
+        );
+        let ack = only_ack(&acks);
+        assert!(!ack.ok);
+        assert_eq!(
+            ack.code,
+            Some(codes::NOT_OWNER),
+            "a sibling is not a creator"
+        );
+        assert_eq!(seat_count(&mut world), 3, "seat count asserted (#58 rider)");
+
+        // The creator may.
+        let acks = wire(
+            &mut world,
+            boot.ingress(),
+            RattyAiCommand::TermClose {
+                id: Some(child_handle),
+            },
+        );
+        assert!(only_ack(&acks).ok);
+        assert_eq!(
+            world
+                .resource::<TerminalRoster>()
+                .row(child)
+                .expect("still listed while closing")
+                .wire_state(true),
+            TerminalWireState::Closing,
+            "the row reads `closing` before the despawn runs"
+        );
+        // The applier despawned nothing — that is the whole deferral.
+        assert_eq!(seat_count(&mut world), 3, "seat count asserted (#58 rider)");
+        assert_eq!(
+            world.resource::<PendingTerminalCloses>().test_pending(),
+            &[child]
+        );
+
+        // A second close is idempotent and queues nothing new: this
+        // buffer is the design's only unbounded resource.
+        let still_listed = world
+            .resource::<TerminalRoster>()
+            .row(child)
+            .expect("row")
+            .handle
+            .clone();
+        let acks = wire(
+            &mut world,
+            boot.ingress(),
+            RattyAiCommand::TermClose {
+                id: Some(still_listed),
+            },
+        );
+        assert!(only_ack(&acks).ok, "closing an already-closing row acks ok");
+        assert_eq!(
+            world
+                .resource::<PendingTerminalCloses>()
+                .test_pending()
+                .len(),
+            1,
+            "and pushes nothing"
+        );
+
+        // The drain despawns it.
+        world
+            .run_system_once(despawn_closed_terminals)
+            .expect("the drain runs");
+        world.flush();
+        assert_eq!(seat_count(&mut world), 2, "seat count asserted (#58 rider)");
+        // The row goes with the seat through the despawn observer, which
+        // this world deliberately does not register — the orphan test
+        // below installs it and proves that half.
+    }
+
+    /// A wire-born terminal may close itself — the case the reply-flush
+    /// deferral exists for.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn a_wire_born_terminal_can_close_itself_and_the_despawn_is_deferred() {
+        let (mut world, boot) = organ_world();
+        grant(&mut world, true, false);
+        let acks = wire(&mut world, boot.ingress(), spawn_command());
+        let handle = only_ack(&acks).payload.as_ref().expect("payload")["id"]
+            .as_str()
+            .expect("handle")
+            .to_string();
+        let child = world
+            .resource::<TerminalRoster>()
+            .by_handle(&handle)
+            .expect("live");
+        let child_identity = *world
+            .get::<TerminalIdentity>(
+                world
+                    .resource::<TerminalRegistry>()
+                    .entity_of(child)
+                    .expect("bound"),
+            )
+            .expect("identity");
+
+        let acks = wire(
+            &mut world,
+            child_identity.ingress(),
+            RattyAiCommand::TermClose { id: None },
+        );
+        assert!(only_ack(&acks).ok, "a wire-born terminal closes itself");
+        assert_eq!(
+            seat_count(&mut world),
+            2,
+            "seat count asserted (#58 rider): the seat outlives the applier so its \
+             own ack can still be written to its own transport"
+        );
+        world
+            .run_system_once(despawn_closed_terminals)
+            .expect("the drain runs");
+        world.flush();
+        assert_eq!(seat_count(&mut world), 1, "seat count asserted (#58 rider)");
+    }
+
+    /// A creator's death orphans its children rather than cascading, and
+    /// an orphan is wire-unaddressable — the same clause that protects
+    /// terminal #1, with no second rule.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn an_orphan_becomes_unaddressable_rather_than_being_cascade_closed() {
+        let (mut world, boot) = organ_world();
+        world.add_observer(crate::scene::sweep_despawned_terminal);
+        world.init_resource::<crate::macros::MacroRegistry>();
+        world.init_resource::<crate::presence::PresenceRegistry>();
+        world.init_resource::<crate::viz::VizRegistry>();
+        world.init_resource::<crate::avatar::AvatarState>();
+        world.init_resource::<crate::sound::SoundState>();
+        world.init_resource::<crate::bookmarks::BookmarkRegistry>();
+        world.init_resource::<crate::bookmarks::PendingBookmarkJumps>();
+        world.init_resource::<crate::ai::AiObjectRegistry>();
+        grant(&mut world, true, false);
+
+        // boot -> X, then X -> Y.
+        let acks = wire(&mut world, boot.ingress(), spawn_command());
+        let x_handle = only_ack(&acks).payload.as_ref().expect("payload")["id"]
+            .as_str()
+            .expect("handle")
+            .to_string();
+        let x = world
+            .resource::<TerminalRoster>()
+            .by_handle(&x_handle)
+            .expect("live");
+        let x_identity = *world
+            .get::<TerminalIdentity>(
+                world
+                    .resource::<TerminalRegistry>()
+                    .entity_of(x)
+                    .expect("bound"),
+            )
+            .expect("identity");
+        let acks = wire(&mut world, x_identity.ingress(), spawn_command());
+        let y_handle = only_ack(&acks).payload.as_ref().expect("payload")["id"]
+            .as_str()
+            .expect("handle")
+            .to_string();
+        let y = world
+            .resource::<TerminalRoster>()
+            .by_handle(&y_handle)
+            .expect("live");
+        assert_eq!(seat_count(&mut world), 3, "seat count asserted (#58 rider)");
+
+        // boot closes X. Y survives — it is a principal, possibly with a
+        // user inside — but loses its creator.
+        wire(
+            &mut world,
+            boot.ingress(),
+            RattyAiCommand::TermClose { id: Some(x_handle) },
+        );
+        world
+            .run_system_once(despawn_closed_terminals)
+            .expect("the drain runs");
+        world.flush();
+        assert_eq!(
+            seat_count(&mut world),
+            2,
+            "seat count asserted (#58 rider): a creator's death does not cascade"
+        );
+        assert_eq!(
+            world
+                .resource::<TerminalRoster>()
+                .row(y)
+                .expect("Y survives")
+                .creator,
+            None,
+            "the orphan is creator-less in the DATA, so no second rule is needed"
+        );
+
+        // And now nobody can close it — not its grandparent, not itself.
+        let y_identity = *world
+            .get::<TerminalIdentity>(
+                world
+                    .resource::<TerminalRegistry>()
+                    .entity_of(y)
+                    .expect("bound"),
+            )
+            .expect("identity");
+        for (source, id) in [
+            (boot.ingress(), Some(y_handle.clone())),
+            (y_identity.ingress(), None),
+        ] {
+            let acks = wire(&mut world, source, RattyAiCommand::TermClose { id });
+            assert_eq!(only_ack(&acks).code, Some(codes::NOT_OWNER));
+        }
+        assert_eq!(seat_count(&mut world), 2, "seat count asserted (#58 rider)");
     }
 
     #[test]

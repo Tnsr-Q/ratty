@@ -379,21 +379,8 @@ pub fn apply_ai_commands(
             // double-ack them.
             RattyAiCommand::TermSpawn { .. }
             | RattyAiCommand::TermPlace { .. }
-            | RattyAiCommand::TermFocus { .. } => {}
-            // TEMPORARY (M4.5, in flight): the organ does not handle close
-            // yet, so this arm still owns its ack. Deleted with that verb.
-            RattyAiCommand::TermClose { .. } => {
-                debug!("ratty-ai: term command received; the terminals organ is not built yet");
-                reject(
-                    &mut diagnostics,
-                    &mut acks,
-                    *source,
-                    ack_token,
-                    "term",
-                    codes::UNSUPPORTED,
-                    "the terminals organ is not built yet".to_string(),
-                );
-            }
+            | RattyAiCommand::TermFocus { .. }
+            | RattyAiCommand::TermClose { .. } => {}
             RattyAiCommand::SplitPane { .. }
             | RattyAiCommand::FocusPane { .. }
             | RattyAiCommand::ResizePane { .. }

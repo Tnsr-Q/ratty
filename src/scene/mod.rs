@@ -822,6 +822,7 @@ pub(crate) fn sweep_despawned_terminal(
     mut pending_jumps: ResMut<crate::bookmarks::PendingBookmarkJumps>,
     mut object_ids: ResMut<crate::ai::AiObjectRegistry>,
     mut roster: ResMut<crate::terminals::TerminalRoster>,
+    mut pending_closes: ResMut<crate::terminals::PendingTerminalCloses>,
 ) {
     let seat = remove.entity;
     // During OnRemove the dying entity's components are still readable.
@@ -845,6 +846,12 @@ pub(crate) fn sweep_despawned_terminal(
     // id, never the namespace: the namespace returns to the pool as this
     // observer's last act, and its next tenant must inherit nothing.
     roster.sweep_terminal(id);
+    // A close committed for a terminal that died by another path (its
+    // creator's chord, the window closing) must not despawn a stranger
+    // next frame. Ids never recycle, so this is belt-and-suspenders over
+    // `entity_of` already resolving `None` — but the buffer must not grow
+    // either.
+    pending_closes.sweep_terminal(id);
     // The namespace-keyed globals that lawfully remain (wire-facing
     // address axes): rendered-is-public presence rows, viz entries whose
     // ids embed the namespace, the avatar speech queue and its active
@@ -1324,6 +1331,7 @@ mod tests {
         world.init_resource::<crate::bookmarks::BookmarkRegistry>();
         world.init_resource::<crate::bookmarks::PendingBookmarkJumps>();
         world.init_resource::<crate::ai::AiObjectRegistry>();
+        world.init_resource::<crate::terminals::PendingTerminalCloses>();
         world.add_observer(sweep_despawned_terminal);
 
         let (seat_a, id_a) = world
@@ -2170,6 +2178,7 @@ mod tests {
         world.init_resource::<crate::bookmarks::BookmarkRegistry>();
         world.init_resource::<crate::bookmarks::PendingBookmarkJumps>();
         world.init_resource::<crate::ai::AiObjectRegistry>();
+        world.init_resource::<crate::terminals::PendingTerminalCloses>();
         world.add_observer(sweep_despawned_terminal);
 
         let (seat_a, id_a) = world
@@ -2419,6 +2428,7 @@ mod tests {
         world.init_resource::<crate::bookmarks::BookmarkRegistry>();
         world.init_resource::<crate::bookmarks::PendingBookmarkJumps>();
         world.init_resource::<crate::ai::AiObjectRegistry>();
+        world.init_resource::<crate::terminals::PendingTerminalCloses>();
         world.add_observer(sweep_despawned_terminal);
 
         // ── Coexistence ──
