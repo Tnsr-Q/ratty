@@ -68,7 +68,21 @@ REPLY_TIMEOUT="${TERMINALS_DEMO_TIMEOUT:-5000}"
 beat() { sleep "$(awk -v a="${1:-0.9}" -v s="$BEAT_SCALE" 'BEGIN{printf "%.2f", a*s}')"; }
 
 FAILURES=0
-fail() { FAILURES=$((FAILURES + 1)); echo "    !! $*"; }
+# Announcements go to STDERR, never stdout: `spawn_capture` reads a
+# handle out of stdout with `$(...)`, and a failure printed there would be
+# captured AS the handle — which then travels into a later `term.close;id=`
+# as a garbage string. (It did, on the first live run.)
+fail() { FAILURES=$((FAILURES + 1)); echo "    !! $*" >&2; }
+note() { echo "    $*" >&2; }
+
+# Whether the terminal reports the lifecycle grant. Set by preflight;
+# act 1 branches on it, because "prove the default is DENY" and "drive the
+# whole family" cannot both hold in one run.
+GRANTED=unknown
+
+# Every handle this script created, so the cleanup drains all of them
+# rather than the three it happens to hold in named variables.
+SPAWNED=()
 
 # One mutation, acked or not depending on the mode; never fatal.
 emit() {
@@ -95,7 +109,7 @@ expect_refusal() {
   output=$(ratty-ai --ack --json --timeout "$REPLY_TIMEOUT" "$@" 2>&1)
   status=$?
   case "$status" in
-    5) echo "    refused, as it must be — $what"; echo "    $output" ;;
+    5) note "refused, as it must be — $what"; note "$output" ;;
     0) fail "$what was ACCEPTED; it must be refused" ;;
     3) fail "$what timed out — transport, not a verdict; rerun before believing it" ;;
     *) fail "$what exited $status (expected 5)" ;;
@@ -115,10 +129,16 @@ show() {
   esac
 }
 
-# Captures a spawn's handle from its ack payload. Echoes the handle on
-# stdout, or nothing if the spawn did not commit.
+# Spawns one terminal and leaves its handle in HANDLE, appending it to
+# SPAWNED so the cleanup drains it. Returns non-zero if nothing committed.
+#
+# Deliberately NOT `HANDLE=$(spawn_capture)`: command substitution runs in
+# a subshell, so the SPAWNED append would be silently lost and act 10
+# would leak every terminal after the first.
+HANDLE=
 spawn_capture() {
-  local output status
+  local output status handle
+  HANDLE=
   output=$(ratty-ai --ack --json --timeout "$REPLY_TIMEOUT" term spawn 2>/dev/null)
   status=$?
   if [ "$status" -ne 0 ]; then
@@ -127,7 +147,16 @@ spawn_capture() {
   fi
   # The handle is data.id in the reply. Kept to sed so the demo has no jq
   # dependency; the shape is <hex>-<seq>, base64url-safe by construction.
-  printf '%s' "$output" | sed -n 's/.*"id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1
+  handle=$(printf '%s' "$output" | sed -n 's/.*"id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+  # Shape-check before anyone can send it back as `id=`. A handle is
+  # base64url plus one dash; anything else means the reply was not what we
+  # think it was, and passing it on would produce a nonsense close.
+  case "$handle" in
+    '' ) fail "term spawn committed but no handle could be read from its ack"; return 1 ;;
+    *[!0-9a-zA-Z_-]* ) fail "term spawn returned a malformed handle: '$handle'"; return 1 ;;
+  esac
+  SPAWNED+=("$handle")
+  HANDLE="$handle"
 }
 
 # ── Preflight ────────────────────────────────────────────────────────────
@@ -161,8 +190,10 @@ preflight() {
   esac
   case "$caps" in
     *'"terminal_lifecycle":true'*|*'"terminal_lifecycle": true'*)
+      GRANTED=yes
       echo "    trust.terminal_lifecycle is GRANTED — acts 2-10 will commit." ;;
     *)
+      GRANTED=no
       echo "    trust.terminal_lifecycle is DENIED (the default). Act 1 proves"
       echo "    that; acts 2-10 will be refused until you grant it in ratty.toml." ;;
   esac
@@ -176,17 +207,35 @@ beat 1.2
 
 echo
 echo "── act 1: both gates default DENY ───────────────────────────────────"
-echo "    A spawn without the grant must be refused, not ignored. Watch the"
-echo "    code: not-permitted (a capability fact), NOT not-owner."
-expect_refusal "an ungranted term.spawn" term spawn
+if [ "$GRANTED" = "yes" ]; then
+  # The two halves of this demo want opposite configs, and only one can
+  # be true per run. Attempting the spawn anyway would not "prove" the
+  # default — it would COMMIT, leaking a terminal the cleanup does not
+  # know about and reporting a failure that is really this script's
+  # premise being wrong. So: say so, and point at the run that does
+  # prove it.
+  echo "    SKIPPED — this run grants terminal_lifecycle, so a spawn here would"
+  echo "    (correctly) commit. The default-DENY proof is this same act in an"
+  echo "    ungranted run, plus terminals.rs's"
+  echo "    both_gates_default_to_denied_and_mutate_nothing."
+  echo
+  echo "    What this run still proves about the gates: act 7 exercises the"
+  echo "    focus capability independently, and act 9's not-owner shows a"
+  echo "    granted caller still cannot close what it does not own."
+else
+  echo "    A spawn without the grant must be refused, not ignored. Watch the"
+  echo "    code: not-permitted (a capability fact), NOT not-owner."
+  expect_refusal "an ungranted term.spawn" term spawn
+fi
 beat 1.5
 
 echo
 echo "── act 2: the spawn handle ──────────────────────────────────────────"
 echo "    ok=1 with the handle in data.id — and NO code=started. A terminal"
 echo "    is not a long-running operation; readiness is the row's state."
-FIRST=$(spawn_capture)
-if [ -z "${FIRST:-}" ]; then
+spawn_capture
+FIRST="$HANDLE"
+if [ -z "$FIRST" ]; then
   echo
   echo "    No handle captured — the rest of the demo needs one."
   echo "    Grant [trust.local] terminal_lifecycle = true and rerun."
@@ -245,9 +294,9 @@ echo
 echo "── act 8: the live cap ──────────────────────────────────────────────"
 echo "    max_live defaults to 4 and binds every spawn path — this chord's"
 echo "    too. Spawning past it answers terminal-cap, never silence."
-SECOND=$(spawn_capture)
+spawn_capture
 beat 0.6
-THIRD=$(spawn_capture)
+spawn_capture
 beat 0.6
 echo "    now at or near the cap; the next spawn should refuse:"
 expect_refusal "a spawn past the live cap" term spawn
@@ -263,9 +312,11 @@ beat 2.0
 
 echo
 echo "── act 10: the creator closes its creations ─────────────────────────"
-for handle in "$THIRD" "$SECOND" "$FIRST"; do
-  [ -n "${handle:-}" ] || continue
-  emit term close --id "$handle"
+# Everything this run created, newest first — not the named variables,
+# which miss any spawn that happened outside them and hold empty strings
+# for the ones the cap refused.
+for (( i=${#SPAWNED[@]}-1 ; i>=0 ; i-- )); do
+  emit term close --id "${SPAWNED[i]}"
   beat 0.8
 done
 beat 1.0
