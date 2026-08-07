@@ -189,7 +189,8 @@ impl Plugin for RattyAiPlugin {
                     .after(crate::reactive::evaluate_rules)
                     .after(crate::avatar::drive_avatar_speech)
                     .after(crate::avatar::apply_avatar_commands)
-                    .after(crate::presence::apply_presence_commands),
+                    .after(crate::presence::apply_presence_commands)
+                    .after(crate::terminals::apply_terminal_commands),
             );
     }
 }
@@ -224,6 +225,13 @@ pub fn apply_ai_commands(
         ..
     } in commands.read()
     {
+        // Deliberately wildcard-free (#49 §5's hardening): every variant is
+        // named, so a new `RattyAiCommand` stops this crate compiling until
+        // its ack ownership is decided here — exactly one handler per
+        // command, checked by the compiler rather than by comments and
+        // tests. The idiom is the codebase's own:
+        // `SceneCapability::granted_to`'s inner match breaks the same way
+        // when an `IngressSource` variant lands.
         match command {
             RattyAiCommand::SetMode { mode } => {
                 let Some(target) = parse_mode(mode) else {
@@ -357,8 +365,27 @@ pub fn apply_ai_commands(
             | RattyAiCommand::UserLeave { .. }
             | RattyAiCommand::Note { .. }
             | RattyAiCommand::NoteRemove { .. } => {}
-            other => {
-                debug!("ratty-ai: command received, handler not yet built: {other:?}");
+            // The frozen split-tree surface (#22): these four parse exactly
+            // as committed and reject `unsupported` forever — no re-lowering
+            // onto `term.*`, because `SplitPane` carries no pane id and the
+            // other three carry a positional `u8` that binds to nothing.
+            // Only the message changes: "not built yet" becomes a lie the
+            // day the subsystem exists. The message is `state.errors` prose
+            // (`reject` records it; the ack carries only `code`), so this is
+            // not a wire change.
+            // The terminals organ (crate::terminals::apply_terminal_commands)
+            // reads the same AiCommand messages independently and owns the
+            // term.spawn/term.focus acks, so this catch-all must never
+            // double-ack them.
+            RattyAiCommand::TermSpawn { .. }
+            | RattyAiCommand::TermPlace { .. }
+            | RattyAiCommand::TermFocus { .. }
+            | RattyAiCommand::TermClose { .. } => {}
+            RattyAiCommand::SplitPane { .. }
+            | RattyAiCommand::FocusPane { .. }
+            | RattyAiCommand::ResizePane { .. }
+            | RattyAiCommand::ClosePane { .. } => {
+                debug!("ratty-ai: pane command received; superseded by term.* (#22)");
                 reject(
                     &mut diagnostics,
                     &mut acks,
@@ -366,7 +393,7 @@ pub fn apply_ai_commands(
                     ack_token,
                     "command",
                     codes::UNSUPPORTED,
-                    "command parsed but its subsystem is not built yet".to_string(),
+                    "pane splitting is superseded by term.*: placement, not splits".to_string(),
                 );
             }
         }
@@ -752,6 +779,92 @@ mod tests {
     use bevy::ecs::message::Messages;
 
     use crate::inline::{InlineObject, RgpInlineObject};
+
+    /// A world carrying everything [`apply_ai_commands`] reads, with one
+    /// terminal seat so the diagnostics sink resolves an arrival ring.
+    fn presentation_app() -> App {
+        let mut app = App::new();
+        app.insert_resource(AppConfig::default());
+        app.insert_resource(TerminalPresentation {
+            mode: TerminalPresentationMode::Flat2d,
+        });
+        app.init_resource::<TerminalPlaneView>();
+        app.init_resource::<MobiusTransition>();
+        app.init_resource::<StageTween>();
+        app.add_message::<AiCommand>();
+        app.add_message::<crate::query_channel::AckOutcome>();
+        app.world_mut().spawn((
+            crate::identity::TerminalIdentity::test_boot(),
+            TerminalPlaneWarp::default(),
+            crate::terminal::TerminalRedrawState::default(),
+            crate::identity::terminal_session_state(),
+        ));
+        app.add_systems(Update, apply_ai_commands);
+        app
+    }
+
+    fn send_presentation(app: &mut App, ack: Option<&str>, command: RattyAiCommand) {
+        app.world_mut()
+            .resource_mut::<Messages<AiCommand>>()
+            .write(AiCommand {
+                source: IngressSource::test_boot(),
+                ack_token: ack.map(str::to_string),
+                origin: CommandOrigin::Wire,
+                command,
+            });
+        app.update();
+    }
+
+    fn drain_acks(app: &mut App) -> Vec<crate::query_channel::AckOutcome> {
+        app.world_mut()
+            .resource_mut::<Messages<crate::query_channel::AckOutcome>>()
+            .drain()
+            .collect()
+    }
+
+    /// The four frozen pane verbs (#22) each reject `unsupported`, exactly
+    /// once, from their own explicit arm. The arm exists so
+    /// `apply_ai_commands`' match is wildcard-free: adding a
+    /// [`RattyAiCommand`] variant now fails to compile here until its ack
+    /// owner is declared — the M4.0 exit criterion, which the next commit's
+    /// four `Term*` variants exercise for real.
+    #[test]
+    fn the_frozen_pane_verbs_reject_unsupported_exactly_once() {
+        use crate::query::codes;
+
+        let mut app = presentation_app();
+        let frozen = [
+            RattyAiCommand::SplitPane {
+                direction: "vertical".to_string(),
+                ratio: 0.5,
+            },
+            RattyAiCommand::FocusPane { pane: 1 },
+            RattyAiCommand::ResizePane {
+                pane: 1,
+                width: Some(40),
+                height: None,
+            },
+            RattyAiCommand::ClosePane { pane: 2 },
+        ];
+        for command in frozen {
+            send_presentation(&mut app, Some("p1"), command.clone());
+            let acks = drain_acks(&mut app);
+            assert_eq!(acks.len(), 1, "{command:?} acks exactly once");
+            assert!(!acks[0].ok, "{command:?} never commits");
+            // The CODE is the contract (#22's `unsupported` disposition);
+            // the message is `state.errors` prose and may change.
+            assert_eq!(acks[0].code, Some(codes::UNSUPPORTED));
+        }
+    }
+
+    /// Rejection stays `tok=`-gated: a token-less pane command is
+    /// fire-and-forget, its failure visible only in `state.errors`.
+    #[test]
+    fn a_token_less_pane_command_acks_nothing() {
+        let mut app = presentation_app();
+        send_presentation(&mut app, None, RattyAiCommand::ClosePane { pane: 1 });
+        assert!(drain_acks(&mut app).is_empty());
+    }
 
     #[test]
     fn mode_strings_map_to_presentation_modes() {

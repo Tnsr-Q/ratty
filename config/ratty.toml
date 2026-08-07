@@ -8,6 +8,12 @@ opacity = 0.8
 default_cols = 104
 default_rows = 32
 scrollback = 2000
+# How many terminals may live at once, across every spawn path (the
+# Ctrl+Alt+T chord and the wire's term.spawn alike). Clamped to 1..=128 —
+# 128 is the protocol's hard ceiling, since object ids carry the agent
+# namespace in seven bits. Raising this past 4 waits on a shared font
+# context: every live terminal carries its own font stack today.
+max_live = 4
 
 # [shell]
 # program = "/bin/bash" 
@@ -97,3 +103,23 @@ white = "#ffffff"
 # debounce = 3.0
 # cooldown = 30.0
 # action = "flash;color=%23ff0000&duration=0.4"
+
+# Scene-level capability grants (#23/#49). Config-only: no wire command
+# can write these, and there is no hot reload, so a grant is fixed for the
+# process lifetime. One PTY is one principal — a grant here reaches EVERY
+# process writing this terminal, which ratty cannot split finer and does
+# not pretend to.
+#
+# [trust.local]
+# # Avatar scene control. Defaults to true: a single-tenant session
+# # directs its own scene.
+# avatar_scene = true
+# # Terminals on the wire: term.spawn / term.place / term.close. Defaults
+# # to FALSE — these fork processes and destroy live sessions. Granting it
+# # still does not let a caller close a terminal it did not create, and
+# # your own terminal is unkillable from the wire either way.
+# terminal_lifecycle = false
+# # term.focus alone. Defaults to FALSE, and separately from lifecycle:
+# # focus is the keystroke-capture primitive, so granting this means the
+# # wire may redirect where your typing lands — continuously, not once.
+# terminal_focus = false

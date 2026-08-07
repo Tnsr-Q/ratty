@@ -291,12 +291,18 @@ pub struct TerminalOwner(pub Entity);
 #[derive(SystemParam)]
 pub struct TerminalSpawnParams<'w, 's> {
     pub(crate) commands: Commands<'w, 's>,
-    terminals: ResMut<'w, TerminalRegistry>,
-    app_config: Res<'w, AppConfig>,
+    pub(crate) terminals: ResMut<'w, TerminalRegistry>,
+    pub(crate) app_config: Res<'w, AppConfig>,
     pub(crate) meshes: ResMut<'w, Assets<Mesh>>,
     materials: ResMut<'w, Assets<StandardMaterial>>,
     images: ResMut<'w, Assets<Image>>,
     primary_window: Query<'w, 's, &'static Window, With<PrimaryWindow>>,
+    /// The wire roster, so a handle is minted in the same synchronous
+    /// step the seat is dressed in. The wire applier reads it back through
+    /// this same bundle rather than taking a second `ResMut` — Bevy would
+    /// reject the conflict.
+    pub(crate) roster: ResMut<'w, crate::terminals::TerminalRoster>,
+    session: ResMut<'w, crate::query_channel::QuerySession>,
 }
 
 #[derive(SystemParam)]
@@ -334,7 +340,19 @@ pub(crate) fn setup_scene(mut params: SetupSceneParams) {
     let mut runtime = runtime.single_mut().expect("exactly one terminal seat");
 
     setup_scene_stage(&mut spawn.commands);
-    let present_handle = dress_terminal_seat(spawn, host, identity, &mut terminal, &mut runtime);
+    // Terminal #1 has no creator and was not wire-born. That is not
+    // bookkeeping — it IS the construction that makes the boot terminal
+    // wire-unkillable: close authority is creator-scoped, and a row with
+    // no creator has nobody who may close it.
+    let present_handle = dress_terminal_seat(
+        spawn,
+        host,
+        identity,
+        None,
+        false,
+        &mut terminal,
+        &mut runtime,
+    );
 
     // Present the terminal texture 1:1 with physical pixels via a fullscreen quad
     // whose shader fetches each texel by pixel coordinate (no resampling), rather
@@ -441,6 +459,8 @@ pub(crate) fn dress_terminal_seat(
     params: &mut TerminalSpawnParams,
     seat: Entity,
     identity: TerminalIdentity,
+    creator: Option<crate::identity::TerminalId>,
+    wire_born: bool,
     surface: &mut TerminalSurface,
     runtime: &mut TerminalRuntime,
 ) -> Handle<Image> {
@@ -452,10 +472,20 @@ pub(crate) fn dress_terminal_seat(
         materials,
         images,
         primary_window,
+        roster,
+        session,
     } = params;
     terminals
         .bind(identity.id(), seat)
         .expect("the dressed seat's identity was minted by this registry");
+    // Every seat gets a wire row here — boot, chord and wire alike — so
+    // `state.terminals` enumerates the whole world rather than lying by
+    // omission, and so the boot terminal has a handle for "wire-unkillable"
+    // to aim at. Minted synchronously: the seat entity is a deferred
+    // `Commands` spawn, but the handle must be addressable inside the very
+    // batch that created it.
+    let handle = session.mint_execution_id();
+    roster.insert(identity.id(), handle, creator, wire_born);
 
     let terminal_opacity = app_config.window.opacity.clamp(0.0, 1.0);
     let window = primary_window.single().expect("primary window");
@@ -567,6 +597,16 @@ pub(crate) fn dress_terminal_seat(
 /// Failure modes of [`spawn_terminal`].
 #[derive(Debug)]
 pub enum SpawnTerminalError<E> {
+    /// The configured live cap (`[terminal] max_live`) is full. Distinct
+    /// from [`Self::Alloc`]: this is an operator budget that can be
+    /// raised, that one is the protocol's hard wall. Both answer the wire
+    /// with `terminal-cap` — the caller's remedy is the same either way.
+    LiveCap {
+        /// Terminals live when the spawn was refused.
+        live: usize,
+        /// The cap in force.
+        cap: usize,
+    },
     /// The 128-slot namespace pool is exhausted — reported explicitly,
     /// never masked by minting past the wire's `& 0x7F` width.
     Alloc(crate::identity::TerminalAllocError),
@@ -594,12 +634,27 @@ pub enum SpawnTerminalError<E> {
 ///
 /// # Errors
 ///
+/// [`SpawnTerminalError::LiveCap`] when `[terminal] max_live` is full;
 /// [`SpawnTerminalError::Alloc`] on pool exhaustion;
 /// [`SpawnTerminalError::Build`] when `build` fails (lease restored).
 pub fn spawn_terminal<E>(
     params: &mut TerminalSpawnParams,
+    creator: Option<crate::identity::TerminalId>,
+    wire_born: bool,
     build: impl FnOnce(IngressSource) -> Result<(TerminalSurface, TerminalRuntime), E>,
 ) -> Result<(Entity, TerminalIdentity), SpawnTerminalError<E>> {
+    // The cap binds every spawn path — the chord and the wire alike —
+    // because this is the one place a seat is created. Checked BEFORE the
+    // lease so a refusal needs no rollback and adds no release site; the
+    // despawn sweep stays the only one. It cannot live inside
+    // `TerminalRegistry::allocate`: main()/start() call that directly to
+    // mint the boot identity, and a cap there would have to special-case
+    // the boot terminal.
+    let cap = crate::identity::max_live_terminals(&params.app_config.terminal);
+    let live = params.terminals.live_count();
+    if live >= cap {
+        return Err(SpawnTerminalError::LiveCap { live, cap });
+    }
     let identity = params
         .terminals
         .allocate()
@@ -623,7 +678,15 @@ pub fn spawn_terminal<E>(
         .commands
         .spawn((identity, crate::identity::terminal_session_state()))
         .id();
-    dress_terminal_seat(params, seat, identity, &mut surface, &mut runtime);
+    dress_terminal_seat(
+        params,
+        seat,
+        identity,
+        creator,
+        wire_born,
+        &mut surface,
+        &mut runtime,
+    );
     params.commands.entity(seat).insert((surface, runtime));
     Ok((seat, identity))
 }
@@ -639,8 +702,12 @@ pub struct TerminalSpawnRequested;
 /// [`crate::focus::FocusOrigin::SpawnPolicy`] request for its child —
 /// decision 8's user-spawn half in one place, shared by the production
 /// PTY closure and the virtual-transport tests. Failures are loud, never
-/// swallowed: pool exhaustion and transport failure both land in the log
-/// with the lease already restored by [`spawn_terminal`]'s rollback.
+/// swallowed: the live cap, pool exhaustion and transport failure all
+/// land in the log with the lease already restored by [`spawn_terminal`]'s
+/// rollback.
+///
+/// A chord-spawned terminal has no wire creator, exactly like the boot
+/// seat: the user made it, and no wire caller may close it.
 ///
 /// The wasm build never calls it — the page API owns lifecycle there —
 /// but the policy stays compiled on both targets so it cannot drift.
@@ -650,7 +717,7 @@ pub(crate) fn spawn_focused_terminal<E: std::fmt::Debug>(
     focus_requests: &mut MessageWriter<crate::focus::FocusRequest>,
     build: impl FnOnce(IngressSource) -> Result<(TerminalSurface, TerminalRuntime), E>,
 ) {
-    match spawn_terminal(params, build) {
+    match spawn_terminal(params, None, false, build) {
         Ok((seat, identity)) => {
             info!(
                 "spawned terminal {:?} on namespace {}",
@@ -754,6 +821,8 @@ pub(crate) fn sweep_despawned_terminal(
     mut bookmarks: ResMut<crate::bookmarks::BookmarkRegistry>,
     mut pending_jumps: ResMut<crate::bookmarks::PendingBookmarkJumps>,
     mut object_ids: ResMut<crate::ai::AiObjectRegistry>,
+    mut roster: ResMut<crate::terminals::TerminalRoster>,
+    mut pending_closes: ResMut<crate::terminals::PendingTerminalCloses>,
 ) {
     let seat = remove.entity;
     // During OnRemove the dying entity's components are still readable.
@@ -772,6 +841,17 @@ pub(crate) fn sweep_despawned_terminal(
     // A jump relowered between the applier and the drain must not fire
     // as a dead terminal's scene mutation next frame.
     pending_jumps.sweep_terminal(id);
+    // The wire row, its rate budgets, and — the orphan rule (#49 §2) —
+    // the creator field of everything this terminal created. Keyed on the
+    // id, never the namespace: the namespace returns to the pool as this
+    // observer's last act, and its next tenant must inherit nothing.
+    roster.sweep_terminal(id);
+    // A close committed for a terminal that died by another path (its
+    // creator's chord, the window closing) must not despawn a stranger
+    // next frame. Ids never recycle, so this is belt-and-suspenders over
+    // `entity_of` already resolving `None` — but the buffer must not grow
+    // either.
+    pending_closes.sweep_terminal(id);
     // The namespace-keyed globals that lawfully remain (wire-facing
     // address axes): rendered-is-public presence rows, viz entries whose
     // ids embed the namespace, the avatar speech queue and its active
@@ -1068,6 +1148,8 @@ mod tests {
             ))
             .id();
         world.insert_resource(registry);
+        world.init_resource::<crate::query_channel::QuerySession>();
+        world.init_resource::<crate::terminals::TerminalRoster>();
         world.spawn((Window::default(), bevy::window::PrimaryWindow));
 
         world
@@ -1205,6 +1287,13 @@ mod tests {
         world.init_resource::<Assets<StandardMaterial>>();
         world.init_resource::<Assets<Image>>();
         world.insert_resource(TerminalRegistry::default());
+        // The spawner mints a wire handle for every seat it dresses, so
+        // both halves of that must exist. Production gets them from
+        // `RattyAiPlugin` and `TerminalsPlugin` before Startup; a bare
+        // `World` would fail SystemParam validation at run time rather
+        // than compile time, so they belong in the scaffold.
+        world.init_resource::<crate::query_channel::QuerySession>();
+        world.init_resource::<crate::terminals::TerminalRoster>();
         world.spawn((Window::default(), bevy::window::PrimaryWindow));
         world
     }
@@ -1213,7 +1302,7 @@ mod tests {
     /// the `TerminalSpawnParams` bundle is exercised exactly as M4.5's
     /// wire loop will exercise it.
     fn spawn_virtual_terminal(mut params: TerminalSpawnParams) -> (Entity, TerminalIdentity) {
-        spawn_terminal(&mut params, |source| {
+        spawn_terminal(&mut params, None, false, |source| {
             let (runtime, _host) = TerminalRuntime::virtual_channel(&AppConfig::default(), source);
             Ok::<_, std::convert::Infallible>((
                 TerminalSurface::new(&AppConfig::default())
@@ -1222,6 +1311,164 @@ mod tests {
             ))
         })
         .expect("the scaffold spawn succeeds")
+    }
+
+    /// Every seat is born with a wire row, and the stamp rule holds under
+    /// namespace recycling: a recycled slot's next tenant inherits nothing
+    /// from the corpse — not its id, not its handle, not its creator.
+    #[test]
+    fn every_seat_gets_a_row_and_a_recycled_slot_inherits_nothing() {
+        use bevy::ecs::system::RunSystemOnce;
+
+        use crate::terminals::{TerminalRoster, TerminalWireState};
+
+        let mut world = spawner_world();
+        world.init_resource::<crate::macros::MacroRegistry>();
+        world.init_resource::<crate::presence::PresenceRegistry>();
+        world.init_resource::<crate::viz::VizRegistry>();
+        world.init_resource::<crate::avatar::AvatarState>();
+        world.init_resource::<crate::sound::SoundState>();
+        world.init_resource::<crate::bookmarks::BookmarkRegistry>();
+        world.init_resource::<crate::bookmarks::PendingBookmarkJumps>();
+        world.init_resource::<crate::ai::AiObjectRegistry>();
+        world.init_resource::<crate::terminals::PendingTerminalCloses>();
+        world.add_observer(sweep_despawned_terminal);
+
+        let (seat_a, id_a) = world
+            .run_system_once(spawn_virtual_terminal)
+            .expect("spawner system runs");
+        let (_seat_b, id_b) = world
+            .run_system_once(spawn_virtual_terminal)
+            .expect("spawner system runs");
+        assert_eq!(
+            world.query::<&TerminalIdentity>().iter(&world).count(),
+            2,
+            "seat count asserted (#58 rider)"
+        );
+
+        let handle_a = {
+            let roster = world.resource::<TerminalRoster>();
+            assert_eq!(roster.len(), 2, "a row per seat, minted at the dressing");
+            let row_a = roster.row(id_a.id()).expect("seat A has a row");
+            let row_b = roster.row(id_b.id()).expect("seat B has a row");
+            assert_ne!(row_a.handle, row_b.handle, "handles are unique");
+            assert!(!row_a.handle.is_empty());
+            // Neither is wire-born here: this path is the chord/boot
+            // shape, which is exactly what makes them wire-unkillable.
+            assert_eq!(row_a.creator, None);
+            assert!(!row_a.wire_born);
+            // Readiness is derived from the seat, so the seat entity
+            // being live IS the answer — no promotion step to get wrong.
+            assert_eq!(row_a.wire_state(true), TerminalWireState::Ready);
+            row_a.handle.clone()
+        };
+
+        // A dies; its slot recycles into C.
+        world.despawn(seat_a);
+        world.flush();
+        assert!(
+            world.resource::<TerminalRoster>().row(id_a.id()).is_none(),
+            "the row dies with the seat"
+        );
+        assert_eq!(
+            world.resource::<TerminalRoster>().by_handle(&handle_a),
+            None,
+            "a closed terminal's handle resolves nothing"
+        );
+
+        let (_seat_c, id_c) = world
+            .run_system_once(spawn_virtual_terminal)
+            .expect("spawner system runs");
+        assert_eq!(
+            id_c.namespace(),
+            id_a.namespace(),
+            "the freed namespace slot is recycled"
+        );
+        assert!(
+            id_c.id() > id_a.id(),
+            "but the TerminalId never is — the stamp rule's whole point"
+        );
+        let roster = world.resource::<TerminalRoster>();
+        let row_c = roster.row(id_c.id()).expect("the new tenant has a row");
+        assert_ne!(
+            row_c.handle, handle_a,
+            "and the new tenant gets a fresh handle, never the corpse's"
+        );
+        assert!(roster.row(id_a.id()).is_none());
+    }
+
+    /// The live cap binds at the one allocation site, so every spawn path
+    /// honors it — the chord and M4.5's wire loop alike. A refusal costs
+    /// nothing: no lease is taken and no `TerminalId` is burned.
+    #[test]
+    fn the_live_cap_refuses_at_the_allocation_site_and_costs_nothing() {
+        use bevy::ecs::system::RunSystemOnce;
+
+        fn try_spawn(
+            mut params: TerminalSpawnParams,
+        ) -> Result<(Entity, TerminalIdentity), SpawnTerminalError<std::convert::Infallible>>
+        {
+            spawn_terminal(&mut params, None, false, |source| {
+                let (runtime, _host) =
+                    TerminalRuntime::virtual_channel(&AppConfig::default(), source);
+                Ok((
+                    TerminalSurface::new(&AppConfig::default())
+                        .expect("surface construction is CPU-only"),
+                    runtime,
+                ))
+            })
+        }
+
+        let mut world = spawner_world();
+        world.resource_mut::<AppConfig>().terminal.max_live = 2;
+
+        let (_seat_a, id_a) = world
+            .run_system_once(try_spawn)
+            .expect("system runs")
+            .expect("first spawn is under the cap");
+        let (_seat_b, id_b) = world
+            .run_system_once(try_spawn)
+            .expect("system runs")
+            .expect("second spawn fills the cap");
+        assert_eq!(
+            world.query::<&TerminalIdentity>().iter(&world).count(),
+            2,
+            "seat count asserted (#58 rider)"
+        );
+
+        let refused = world.run_system_once(try_spawn).expect("system runs");
+        assert!(
+            matches!(
+                refused,
+                Err(SpawnTerminalError::LiveCap { live: 2, cap: 2 })
+            ),
+            "the third spawn is refused by the cap, not by the pool"
+        );
+        assert_eq!(
+            world.query::<&TerminalIdentity>().iter(&world).count(),
+            2,
+            "seat count asserted (#58 rider): a refusal creates nothing"
+        );
+        assert_eq!(
+            world.resource::<TerminalRegistry>().live_count(),
+            2,
+            "a capped spawn takes no lease"
+        );
+
+        // The refusal is checked before the mint, so it burns no id: the
+        // next admitted spawn is the immediate successor of the last one.
+        // (A failed *build* does skip an id — that is a different path.)
+        world.resource_mut::<AppConfig>().terminal.max_live = 3;
+        let (_seat_c, id_c) = world
+            .run_system_once(try_spawn)
+            .expect("system runs")
+            .expect("raising the cap admits the next spawn");
+        assert!(id_a.id() < id_b.id() && id_b.id() < id_c.id());
+        assert_eq!(
+            world.resource::<TerminalRegistry>().namespace_of(id_c.id()),
+            Some(2),
+            "and it leases the next free slot, not a skipped one"
+        );
     }
 
     /// Decision 8's user-spawn half through the real spawner: the child
@@ -1534,6 +1781,7 @@ mod tests {
         world.init_resource::<Messages<FocusLost>>();
         world.init_resource::<Messages<KeyboardInput>>();
         world.init_resource::<Messages<TerminalSpawnRequested>>();
+        world.init_resource::<crate::terminals::PendingTerminalCloses>();
         world.init_resource::<Messages<crate::ai::AiCommand>>();
         world.init_resource::<Messages<crate::query_channel::AckOutcome>>();
         let bindings = {
@@ -1568,7 +1816,7 @@ mod tests {
             mut params: TerminalSpawnParams,
         ) -> (Entity, TerminalIdentity, VirtualTerminalHost) {
             let mut host_slot = None;
-            let (seat, identity) = spawn_terminal(&mut params, |source| {
+            let (seat, identity) = spawn_terminal(&mut params, None, false, |source| {
                 let (runtime, host) =
                     TerminalRuntime::virtual_channel(&AppConfig::default(), source);
                 host_slot = Some(host);
@@ -1880,7 +2128,7 @@ mod tests {
         let mut world = spawner_world();
         let result = world
             .run_system_once(|mut params: TerminalSpawnParams| {
-                spawn_terminal(&mut params, |_source| {
+                spawn_terminal(&mut params, None, false, |_source| {
                     Err::<(TerminalSurface, TerminalRuntime), &str>("transport refused")
                 })
             })
@@ -1931,6 +2179,7 @@ mod tests {
         world.init_resource::<crate::bookmarks::BookmarkRegistry>();
         world.init_resource::<crate::bookmarks::PendingBookmarkJumps>();
         world.init_resource::<crate::ai::AiObjectRegistry>();
+        world.init_resource::<crate::terminals::PendingTerminalCloses>();
         world.add_observer(sweep_despawned_terminal);
 
         let (seat_a, id_a) = world
@@ -2180,6 +2429,7 @@ mod tests {
         world.init_resource::<crate::bookmarks::BookmarkRegistry>();
         world.init_resource::<crate::bookmarks::PendingBookmarkJumps>();
         world.init_resource::<crate::ai::AiObjectRegistry>();
+        world.init_resource::<crate::terminals::PendingTerminalCloses>();
         world.add_observer(sweep_despawned_terminal);
 
         // ── Coexistence ──

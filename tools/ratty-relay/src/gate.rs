@@ -478,6 +478,31 @@ mod tests {
     }
 
     #[test]
+    fn terminal_lifecycle_is_excised() {
+        // A spectator replaying `term.spawn` would fork a process on the
+        // primary's machine, and `term.close` would kill a session someone
+        // is typing into. The family is control-plane, so the existing
+        // classification excises it — this pins that it stays that way.
+        for cmd in [
+            "term.spawn",
+            "term.place;id=h&cols=80&rows=24",
+            "term.focus;id=h",
+            "term.close",
+        ] {
+            assert!(
+                osc::parse_control(&format!("ratty:{cmd}"))
+                    .and_then(|c| c.command)
+                    .is_some_and(|c| c.is_terminal_control()),
+                "{cmd} must be a well-formed term command for this test to mean anything"
+            );
+            let seq = format!("\x1b]777;ratty:{cmd}\x07");
+            let (segs, stats) = gate_all(&[seq.as_bytes()]);
+            assert!(flat_data(&segs).is_empty(), "{cmd} leaked");
+            assert_eq!(stats.excised_control, 1, "{cmd}");
+        }
+    }
+
+    #[test]
     fn macro_reactive_and_execution_control_are_excised() {
         for cmd in [
             "macro.record;name=m",

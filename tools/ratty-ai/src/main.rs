@@ -445,6 +445,62 @@ enum Commands {
     /// Caller-owned wire sensors feeding reactive rules.
     #[command(subcommand)]
     Sensor(SensorAction),
+    /// Terminals on the wire (#49). Both capabilities default DENY —
+    /// check `ratty-ai query caps` for `trust.terminal_lifecycle` and
+    /// `trust.terminal_focus` before expecting any of these to commit.
+    #[command(subcommand)]
+    Term(TermAction),
+}
+
+#[derive(Subcommand)]
+enum TermAction {
+    /// Create a terminal running the config-default shell.
+    ///
+    /// Takes no arguments at all: the wire can never choose a command, a
+    /// working directory, a position or a grid. With `--ack --json` the
+    /// reply's `data.id` is the new terminal's handle — capture it, since
+    /// `term.place`/`focus`/`close` address by handle.
+    Spawn,
+    /// Resize a terminal's grid.
+    ///
+    /// `--x`/`--y`/`--scale` are the frozen wire shape and are REFUSED by
+    /// the terminal: nothing renders a per-terminal position in this
+    /// build. They stay on the CLI so the refusal is exercisable.
+    Place {
+        /// Target handle; omit to target the carrying terminal.
+        #[arg(short, long)]
+        id: Option<String>,
+        /// World-space x (refused: not rendered).
+        #[arg(long)]
+        x: Option<f32>,
+        /// World-space y (refused: not rendered).
+        #[arg(long)]
+        y: Option<f32>,
+        /// Uniform scale (refused: not rendered).
+        #[arg(long)]
+        scale: Option<f32>,
+        /// PTY grid columns.
+        #[arg(long)]
+        cols: Option<u16>,
+        /// PTY grid rows.
+        #[arg(long)]
+        rows: Option<u16>,
+    },
+    /// Aim the user's keyboard at a terminal (needs the terminal-focus
+    /// capability, which is separate from lifecycle).
+    Focus {
+        /// Target handle; omit to target the carrying terminal.
+        #[arg(short, long)]
+        id: Option<String>,
+    },
+    /// Close a terminal. Only its creator may, and terminals with no wire
+    /// creator — the boot terminal, user-spawned ones, orphans — refuse
+    /// every close.
+    Close {
+        /// Target handle; omit to target the carrying terminal.
+        #[arg(short, long)]
+        id: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1212,6 +1268,31 @@ fn command_to_osc(command: &Commands) -> (String, String) {
             SensorAction::Remove { name } => {
                 ("sensor.remove".into(), p().field("name", name).build())
             }
+        },
+        // Every key is optional and only present ones are emitted: the
+        // terminal parses numerics strictly, so an absent field must never
+        // become `=0` — that would be a different command, not a default.
+        Commands::Term(action) => match action {
+            TermAction::Spawn => ("term.spawn".into(), String::new()),
+            TermAction::Place {
+                id,
+                x,
+                y,
+                scale,
+                cols,
+                rows,
+            } => (
+                "term.place".into(),
+                p().opt("id", id.as_deref())
+                    .opt("x", *x)
+                    .opt("y", *y)
+                    .opt("scale", *scale)
+                    .opt("cols", *cols)
+                    .opt("rows", *rows)
+                    .build(),
+            ),
+            TermAction::Focus { id } => ("term.focus".into(), p().opt("id", id.as_deref()).build()),
+            TermAction::Close { id } => ("term.close".into(), p().opt("id", id.as_deref()).build()),
         },
     }
 }
@@ -3356,6 +3437,105 @@ mod tests {
         let control = osc::parse_control(inner).expect("ratty namespace");
         assert_eq!(control.ack_token.as_deref(), Some("t1"));
         assert_eq!(control.command, Some(RattyAiCommand::ClearObjects));
+    }
+
+    /// The `term` subtree round-trips through the terminal's own parser:
+    /// the CLI emits only the keys the caller gave, and the terminal
+    /// recovers exactly the command that was meant.
+    #[test]
+    fn the_term_subtree_round_trips_through_the_terminal_parser() {
+        let parse = |command: &Commands| {
+            let (action, payload) = command_to_osc(command);
+            let sequence = osc::osc_sequence(&action, &payload);
+            let inner = sequence
+                .strip_prefix("\x1b]777;")
+                .and_then(|s| s.strip_suffix('\x07'))
+                .expect("well-framed sequence");
+            osc::parse_control(inner)
+                .expect("ratty namespace")
+                .command
+                .expect("the terminal parses it")
+        };
+
+        // Spawn takes nothing, ever: #12's no-runtime-arguments is
+        // structural, and the terminal refuses the geometry keys anyway.
+        let (action, payload) = command_to_osc(&Commands::Term(TermAction::Spawn));
+        assert_eq!(action, "term.spawn");
+        assert!(payload.is_empty(), "spawn emits no keys at all");
+        assert_eq!(
+            parse(&Commands::Term(TermAction::Spawn)),
+            RattyAiCommand::TermSpawn {
+                x: None,
+                y: None,
+                scale: None,
+                cols: None,
+                rows: None,
+            }
+        );
+
+        // Absent optionals must never become `=0`: the terminal parses
+        // numerics strictly, so that would be a different command.
+        let (_, payload) = command_to_osc(&Commands::Term(TermAction::Place {
+            id: None,
+            x: None,
+            y: None,
+            scale: None,
+            cols: Some(80),
+            rows: Some(24),
+        }));
+        assert_eq!(payload, "cols=80&rows=24");
+        assert_eq!(
+            parse(&Commands::Term(TermAction::Place {
+                id: Some("h1".into()),
+                x: None,
+                y: None,
+                scale: None,
+                cols: Some(80),
+                rows: None,
+            })),
+            RattyAiCommand::TermPlace {
+                id: Some("h1".into()),
+                x: None,
+                y: None,
+                scale: None,
+                cols: Some(80),
+                rows: None,
+            }
+        );
+
+        // The bare self-form survives the CLI: no `--id` means no `id=`
+        // key, which the terminal reads as "the carrying terminal".
+        for (command, expected) in [
+            (
+                Commands::Term(TermAction::Focus { id: None }),
+                RattyAiCommand::TermFocus { id: None },
+            ),
+            (
+                Commands::Term(TermAction::Close { id: None }),
+                RattyAiCommand::TermClose { id: None },
+            ),
+            (
+                Commands::Term(TermAction::Close {
+                    id: Some("h2".into()),
+                }),
+                RattyAiCommand::TermClose {
+                    id: Some("h2".into()),
+                },
+            ),
+        ] {
+            assert_eq!(parse(&command), expected);
+        }
+
+        // And a tok= rides orthogonally, as on every command.
+        let (action, payload) = command_to_osc(&Commands::Term(TermAction::Spawn));
+        let sequence = osc::osc_sequence(&action, &format!("{}=s1", osc::ACK_TOKEN_KEY));
+        assert!(payload.is_empty());
+        let inner = sequence
+            .strip_prefix("\x1b]777;")
+            .and_then(|s| s.strip_suffix('\x07'))
+            .expect("well-framed sequence");
+        let control = osc::parse_control(inner).expect("ratty namespace");
+        assert_eq!(control.ack_token.as_deref(), Some("s1"));
     }
 
     /// The query builder emits exactly what the terminal's 778 gate
