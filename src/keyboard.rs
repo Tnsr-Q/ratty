@@ -1130,44 +1130,69 @@ fn is_modifier_key(key: KeyCode) -> bool {
     )
 }
 
+/// Resolves a config key name to a physical key.
+///
+/// Two spellings are accepted for every key that has them: the short
+/// friendly one (`a`, `0`, `up`) and Bevy's own [`KeyCode`] variant name
+/// (`KeyA`, `Digit0`, `ArrowUp`), case-insensitively.
+///
+/// The variant spellings are not decoration. A binding that fails to
+/// parse is dropped with one `warn!` at startup and is then simply dead,
+/// so reaching for the name Bevy's own docs show must not cost a user
+/// their keybinding — and the evidence that people do reach for it is
+/// that ratty's OWN shipped config bound `Digit0` and silently lost
+/// `Ctrl+Alt+0` for as long as it has existed.
 fn parse_key_code(key: &str) -> Option<KeyCode> {
     match key.trim().to_ascii_lowercase().as_str() {
-        "a" => Some(KeyCode::KeyA),
-        "b" => Some(KeyCode::KeyB),
-        "c" => Some(KeyCode::KeyC),
-        "d" => Some(KeyCode::KeyD),
-        "e" => Some(KeyCode::KeyE),
-        "f" => Some(KeyCode::KeyF),
-        "g" => Some(KeyCode::KeyG),
-        "h" => Some(KeyCode::KeyH),
-        "i" => Some(KeyCode::KeyI),
-        "j" => Some(KeyCode::KeyJ),
-        "k" => Some(KeyCode::KeyK),
-        "l" => Some(KeyCode::KeyL),
-        "m" => Some(KeyCode::KeyM),
-        "n" => Some(KeyCode::KeyN),
-        "o" => Some(KeyCode::KeyO),
-        "p" => Some(KeyCode::KeyP),
-        "q" => Some(KeyCode::KeyQ),
-        "r" => Some(KeyCode::KeyR),
-        "s" => Some(KeyCode::KeyS),
-        "t" => Some(KeyCode::KeyT),
-        "u" => Some(KeyCode::KeyU),
-        "v" => Some(KeyCode::KeyV),
-        "w" => Some(KeyCode::KeyW),
-        "x" => Some(KeyCode::KeyX),
-        "y" => Some(KeyCode::KeyY),
-        "z" => Some(KeyCode::KeyZ),
-        "0" => Some(KeyCode::Digit0),
-        "1" => Some(KeyCode::Digit1),
-        "2" => Some(KeyCode::Digit2),
-        "3" => Some(KeyCode::Digit3),
-        "4" => Some(KeyCode::Digit4),
-        "5" => Some(KeyCode::Digit5),
-        "6" => Some(KeyCode::Digit6),
-        "7" => Some(KeyCode::Digit7),
-        "8" => Some(KeyCode::Digit8),
-        "9" => Some(KeyCode::Digit9),
+        "a" | "keya" => Some(KeyCode::KeyA),
+        "b" | "keyb" => Some(KeyCode::KeyB),
+        "c" | "keyc" => Some(KeyCode::KeyC),
+        "d" | "keyd" => Some(KeyCode::KeyD),
+        "e" | "keye" => Some(KeyCode::KeyE),
+        "f" | "keyf" => Some(KeyCode::KeyF),
+        "g" | "keyg" => Some(KeyCode::KeyG),
+        "h" | "keyh" => Some(KeyCode::KeyH),
+        "i" | "keyi" => Some(KeyCode::KeyI),
+        "j" | "keyj" => Some(KeyCode::KeyJ),
+        "k" | "keyk" => Some(KeyCode::KeyK),
+        "l" | "keyl" => Some(KeyCode::KeyL),
+        "m" | "keym" => Some(KeyCode::KeyM),
+        "n" | "keyn" => Some(KeyCode::KeyN),
+        "o" | "keyo" => Some(KeyCode::KeyO),
+        "p" | "keyp" => Some(KeyCode::KeyP),
+        "q" | "keyq" => Some(KeyCode::KeyQ),
+        "r" | "keyr" => Some(KeyCode::KeyR),
+        "s" | "keys" => Some(KeyCode::KeyS),
+        "t" | "keyt" => Some(KeyCode::KeyT),
+        "u" | "keyu" => Some(KeyCode::KeyU),
+        "v" | "keyv" => Some(KeyCode::KeyV),
+        "w" | "keyw" => Some(KeyCode::KeyW),
+        "x" | "keyx" => Some(KeyCode::KeyX),
+        "y" | "keyy" => Some(KeyCode::KeyY),
+        "z" | "keyz" => Some(KeyCode::KeyZ),
+        "0" | "digit0" => Some(KeyCode::Digit0),
+        "1" | "digit1" => Some(KeyCode::Digit1),
+        "2" | "digit2" => Some(KeyCode::Digit2),
+        "3" | "digit3" => Some(KeyCode::Digit3),
+        "4" | "digit4" => Some(KeyCode::Digit4),
+        "5" | "digit5" => Some(KeyCode::Digit5),
+        "6" | "digit6" => Some(KeyCode::Digit6),
+        "7" | "digit7" => Some(KeyCode::Digit7),
+        "8" | "digit8" => Some(KeyCode::Digit8),
+        "9" | "digit9" => Some(KeyCode::Digit9),
+        // The numpad digits have no friendly spelling, and until now no
+        // spelling at all: the built-in `ResetFontSize` default binds
+        // `Numpad0`, which no config could express.
+        "numpad0" | "numpad_0" => Some(KeyCode::Numpad0),
+        "numpad1" | "numpad_1" => Some(KeyCode::Numpad1),
+        "numpad2" | "numpad_2" => Some(KeyCode::Numpad2),
+        "numpad3" | "numpad_3" => Some(KeyCode::Numpad3),
+        "numpad4" | "numpad_4" => Some(KeyCode::Numpad4),
+        "numpad5" | "numpad_5" => Some(KeyCode::Numpad5),
+        "numpad6" | "numpad_6" => Some(KeyCode::Numpad6),
+        "numpad7" | "numpad_7" => Some(KeyCode::Numpad7),
+        "numpad8" | "numpad_8" => Some(KeyCode::Numpad8),
+        "numpad9" | "numpad_9" => Some(KeyCode::Numpad9),
         "f1" => Some(KeyCode::F1),
         "f2" => Some(KeyCode::F2),
         "f3" => Some(KeyCode::F3),
@@ -1180,11 +1205,12 @@ fn parse_key_code(key: &str) -> Option<KeyCode> {
         "f10" => Some(KeyCode::F10),
         "f11" => Some(KeyCode::F11),
         "f12" => Some(KeyCode::F12),
-        "up" => Some(KeyCode::ArrowUp),
-        "down" => Some(KeyCode::ArrowDown),
-        "left" => Some(KeyCode::ArrowLeft),
-        "right" => Some(KeyCode::ArrowRight),
+        "up" | "arrowup" | "arrow_up" => Some(KeyCode::ArrowUp),
+        "down" | "arrowdown" | "arrow_down" => Some(KeyCode::ArrowDown),
+        "left" | "arrowleft" | "arrow_left" => Some(KeyCode::ArrowLeft),
+        "right" | "arrowright" | "arrow_right" => Some(KeyCode::ArrowRight),
         "enter" => Some(KeyCode::Enter),
+        "numpadenter" | "numpad_enter" => Some(KeyCode::NumpadEnter),
         "tab" => Some(KeyCode::Tab),
         "space" => Some(KeyCode::Space),
         "backspace" => Some(KeyCode::Backspace),
@@ -1247,6 +1273,103 @@ fn ctrl_keycode_byte(key: KeyCode) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Both spellings of every key that has two resolve to the same
+    /// physical key: the short friendly one and Bevy's own `KeyCode`
+    /// variant name.
+    #[test]
+    fn key_names_accept_both_the_friendly_and_the_keycode_spelling() {
+        for (friendly, variant) in [
+            ("a", "KeyA"),
+            ("z", "keyz"),
+            ("0", "Digit0"),
+            ("9", "digit9"),
+            ("up", "ArrowUp"),
+            ("down", "arrow_down"),
+            ("left", "ArrowLeft"),
+            ("right", "ArrowRight"),
+        ] {
+            let expected = parse_key_code(friendly);
+            assert!(expected.is_some(), "`{friendly}` must resolve");
+            assert_eq!(
+                parse_key_code(variant),
+                expected,
+                "`{variant}` must mean the same key as `{friendly}`"
+            );
+        }
+
+        // The numpad digits had no spelling at all until now, which made
+        // the built-in `Numpad0` ResetFontSize default inexpressible in
+        // config — there was no string a user could write for it.
+        assert_eq!(parse_key_code("Numpad0"), Some(KeyCode::Numpad0));
+        assert_eq!(parse_key_code("numpad_9"), Some(KeyCode::Numpad9));
+        assert_eq!(parse_key_code("NumpadEnter"), Some(KeyCode::NumpadEnter));
+
+        // Still closed: an unknown name resolves to nothing rather than
+        // to some near-miss key.
+        for unknown in ["", "keyaa", "digit10", "numpad", "arrow", "meta"] {
+            assert_eq!(
+                parse_key_code(unknown),
+                None,
+                "`{unknown}` must not resolve"
+            );
+        }
+    }
+
+    /// Every binding in the SHIPPED config resolves.
+    ///
+    /// This is the test that would have caught the original defect:
+    /// `config/ratty.toml` bound `Digit0`, `parse_key_code` knew only
+    /// `0`, and the mismatch cost `Ctrl+Alt+0` for the life of the file
+    /// while announcing itself only as one `warn!` in a log nobody reads.
+    /// A dropped binding is silent by construction, so the shipped
+    /// artifact needs an explicit assertion rather than a startup log.
+    #[test]
+    fn the_shipped_config_has_no_unparseable_bindings() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/config/ratty.toml");
+        let contents = std::fs::read_to_string(path).expect("the shipped config is readable");
+        let config = AppConfig::from_toml_str(&contents).expect("the shipped config parses");
+        assert!(
+            !config.bindings.keys.is_empty(),
+            "the shipped config binds keys — an empty list would make this vacuous"
+        );
+        let rejected: Vec<String> = config
+            .bindings
+            .keys
+            .iter()
+            .filter(|binding| KeyBinding::from_config(binding).is_none())
+            .map(|binding| format!("key={} with={}", binding.key, binding.with))
+            .collect();
+        assert!(
+            rejected.is_empty(),
+            "the shipped config carries bindings ratty drops at startup: {rejected:?}"
+        );
+    }
+
+    /// The end of the chain, not just the parse: `Ctrl+Alt+0` resolves to
+    /// `ResetFontSize` on both the main row and the numpad. This is what
+    /// was actually dead — the binding parsed to nothing, so the chord did
+    /// nothing, and the only symptom was a startup line.
+    #[test]
+    fn ctrl_alt_zero_resolves_to_reset_font_size() {
+        use bevy::ecs::world::FromWorld;
+
+        let mut world = World::new();
+        world.insert_resource(AppConfig::default());
+        let bindings = TerminalKeyBindings::from_world(&mut world);
+        let chord = BindingModifiers {
+            control: true,
+            alt: true,
+            ..Default::default()
+        };
+        for key in [KeyCode::Digit0, KeyCode::Numpad0] {
+            assert_eq!(
+                bindings.action_for(key, chord),
+                Some(BindingAction::ResetFontSize),
+                "{key:?} with Ctrl+Alt resets the font size"
+            );
+        }
+    }
 
     #[test]
     fn paste_without_bracketed_mode_sends_bare_bytes() {
