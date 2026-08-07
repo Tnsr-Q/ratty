@@ -41,6 +41,12 @@ spin_speed = 1.4
 bob_speed = 2.2
 bob_amplitude = 0.08
 
+# Key bindings. `key` accepts either the short name (`C`, `0`, `Up`) or
+# Bevy's own KeyCode variant name (`KeyC`, `Digit0`, `ArrowUp`),
+# case-insensitively; `Numpad0`..`Numpad9` and `NumpadEnter` are spelled
+# in full. `with` combines `Control`, `Alt`, `Shift` and `Super` with `|`.
+# An entry whose trigger matches a built-in default replaces it, and
+# `action = "none"` disables a default outright.
 [bindings]
 keys = [
   { key = "C", with = "Control | alt", action = "Copy" },
