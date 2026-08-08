@@ -8,7 +8,7 @@
 
 #![cfg(target_arch = "wasm32")]
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -47,6 +47,9 @@ struct WebControlQueue(Arc<Mutex<WebControlState>>);
 
 /// A `RattySession.query()` promise awaiting its OSC 778 reply.
 struct PendingQuery {
+    /// The JS handle whose disposal sweeps this entry. Reply routing never
+    /// consults it — replies stay token-keyed.
+    owner: u64,
     resolve: Function,
     reject: Function,
     timeout_ms: f64,
@@ -58,9 +61,15 @@ struct PendingQuery {
 thread_local! {
     // Wasm is single-threaded: RattySession methods and the Bevy schedule
     // interleave on the JS main thread, so a thread-local map is the whole
-    // synchronization story. One map per page — sessions are not expected
-    // to coexist (one `start()` per page), and disposal rejects everything.
+    // synchronization story. The map stays page-global and token-keyed —
+    // `try_resolve_pending` is a flat token lookup, and whether that
+    // intercept must itself become per-seat is #86's open decision 7 —
+    // but each entry carries its owner, so disposal rejects only the
+    // disposing handle's promises (#86's chartered pre-work).
     static PENDING_QUERIES: RefCell<HashMap<String, PendingQuery>> = RefCell::new(HashMap::new());
+    /// Mints one owner id per JS handle that can issue queries — today
+    /// only [`RattySession`]; a page API would mint one per pane handle.
+    static NEXT_QUERY_OWNER: Cell<u64> = const { Cell::new(0) };
 }
 
 /// Builds the JS `Error` a failed query rejects with; the stable error
@@ -154,6 +163,9 @@ fn expire_query_promises(time: Res<Time>) {
 /// A running browser terminal session.
 #[wasm_bindgen]
 pub struct RattySession {
+    /// Scopes this handle's entries in [`PENDING_QUERIES`], so `free()`
+    /// rejects only its own promises.
+    owner: u64,
     feed: Sender<Vec<u8>>,
     input: Receiver<Vec<u8>>,
     controls: Arc<Mutex<WebControlState>>,
@@ -234,6 +246,7 @@ impl RattySession {
                 map.borrow_mut().insert(
                     token.clone(),
                     PendingQuery {
+                        owner: self.owner,
                         resolve,
                         reject,
                         timeout_ms,
@@ -290,16 +303,24 @@ impl RattySession {
 }
 
 impl Drop for RattySession {
-    /// Session disposal (`free()` from JS) rejects every outstanding query
-    /// promise; nothing hangs unresolved.
+    /// Session disposal (`free()` from JS) rejects this handle's
+    /// outstanding query promises; nothing hangs unresolved. Disposal is
+    /// owner-scoped — entries owned by other handles stay pending —
+    /// because under #86's fork a disposed pane must not drain the page.
+    /// Rejecting inside the borrow is safe: the reject capability only
+    /// settles the promise, and reactions wait on the microtask queue.
     fn drop(&mut self) {
         PENDING_QUERIES.with(|map| {
-            for (_, entry) in map.borrow_mut().drain() {
+            map.borrow_mut().retain(|_, entry| {
+                if entry.owner != self.owner {
+                    return true;
+                }
                 let _ = entry.reject.call1(
                     &JsValue::NULL,
                     &query_error(crate::query::codes::DISPOSED, "session disposed"),
                 );
-            }
+                false
+            });
         });
     }
 }
@@ -334,6 +355,11 @@ pub fn start(canvas_selector: &str, config_toml: Option<String>) -> Result<Ratty
         .map_err(|error| JsValue::from_str(&format!("{error:#}")))?;
     let controls = WebControlQueue::default();
     let session = RattySession {
+        owner: NEXT_QUERY_OWNER.with(|next| {
+            let id = next.get() + 1;
+            next.set(id);
+            id
+        }),
         feed: host.feed_tx,
         input: host.input_rx,
         controls: Arc::clone(&controls.0),
