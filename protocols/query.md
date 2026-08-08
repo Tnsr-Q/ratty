@@ -369,9 +369,11 @@ const near = await session.query("state.neighbors", { object: id, radius: 8 }, 2
 
 Failures reject with an `Error` carrying a `code` property. Locked
 pending-map semantics: duplicate active token is an internal error;
-disposal rejects all pending promises; timeout removes and rejects; late
-or unmatched replies are ignored. `query()` adds no authority — session
-identity, namespace, projection rules, and size limits all still apply.
+disposing a handle rejects its own pending promises — owner-scoped per
+#86's chartered pre-work, and today the page's single session owns every
+entry; timeout removes and rejects; late or unmatched replies are
+ignored. `query()` adds no authority — session identity, namespace,
+projection rules, and size limits all still apply.
 
 ## Example session
 
