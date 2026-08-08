@@ -550,6 +550,11 @@ pub(crate) fn dress_terminal_seat(
             center: viewport_center,
         },
         TerminalPlaneWarp::default(),
+        // Per-seat pointer state (#56 decision 3's promotions): the
+        // forward capture keyed by its press-target seat, and the wheel
+        // remainder denominated in this seat's own char height.
+        crate::mouse::ForwardedMouseState::default(),
+        crate::mouse::LocalScrollState::default(),
         TerminalInlineObjects::default(),
         // A FRESH mailbox per seat, born with the dress — never a clone
         // of another seat's exchange (an Arc clone shares the one slot:
@@ -561,6 +566,13 @@ pub(crate) fn dress_terminal_seat(
         TerminalPlane,
         TerminalOwner(seat),
         Mesh3d(front_mesh),
+        // ALWAYS on, not mirroring the render `cull_mode` (#56 decision
+        // 10): Möbius needs backface picking or the far half of the strip
+        // is unpickable. The render-side policy flips per mode in
+        // `apply_terminal_presentation` — the two sites are the #58
+        // cross-check pair, pinned together by
+        // `raycast_backfaces_is_always_on_for_terminal_planes`.
+        bevy::picking::mesh_picking::ray_cast::RayCastBackfaces,
         MeshMaterial3d(materials.add(StandardMaterial {
             base_color: Color::srgba(1.0, 1.0, 1.0, terminal_opacity),
             base_color_texture: surface.image_handle.clone(),
@@ -996,6 +1008,11 @@ pub(crate) fn apply_terminal_presentation(
         };
     }
 
+    // The render half of #58's cross-check pair: picking's
+    // `RayCastBackfaces` (inserted at the plane spawn in
+    // `dress_terminal_seat`) is ALWAYS on, while this cull flips per mode
+    // — the two deliberately differ in Plane3d (a strictly-behind pick
+    // yields a mirrored cell: accepted cost, #56 decision 10).
     let cull_mode = if is_mobius { None } else { Some(Face::Back) };
     for front_material in plane_materials.iter() {
         // `get_mut` marks the material modified and re-prepares it on the
@@ -1068,7 +1085,7 @@ pub(crate) fn apply_terminal_presentation(
     }
 }
 
-fn terminal_plane_mesh(x_segments: u32, y_segments: u32) -> Mesh {
+pub(crate) fn terminal_plane_mesh(x_segments: u32, y_segments: u32) -> Mesh {
     let x_segments = x_segments.max(2);
     let y_segments = y_segments.max(2);
     let vertex_count = ((x_segments + 1) * (y_segments + 1)) as usize;
@@ -1189,6 +1206,22 @@ mod tests {
             world.query::<&TerminalPlaneWarp>().iter(&world).count(),
             1,
             "exactly one seat carries the plane warp"
+        );
+        assert_eq!(
+            world
+                .query::<&crate::mouse::ForwardedMouseState>()
+                .iter(&world)
+                .count(),
+            1,
+            "exactly one seat carries the forward-capture state (#56 decision 3)"
+        );
+        assert_eq!(
+            world
+                .query::<&crate::mouse::LocalScrollState>()
+                .iter(&world)
+                .count(),
+            1,
+            "exactly one seat carries the wheel remainder (#56 decision 3)"
         );
         assert_eq!(
             world.query::<&TerminalInlineObjects>().iter(&world).count(),
@@ -2677,6 +2710,71 @@ mod tests {
                 "leaving Mobius restores back-face culling on every plane"
             );
         }
+    }
+
+    /// The #58 cross-check rider, pinned: picking's `RayCastBackfaces` is
+    /// ALWAYS on for every front terminal plane (set at the plane spawn in
+    /// `dress_terminal_seat`), while the render `cull_mode` flips per mode
+    /// (the test above). The two policies are set in different places and
+    /// deliberately DIFFER in Plane3d — a strictly-behind pick hits the
+    /// front sheet's backface and yields a mirrored cell (#56 decision
+    /// 10's accepted cost). The back sheet is never a pick target, so it
+    /// carries no marker.
+    #[test]
+    fn raycast_backfaces_is_always_on_for_terminal_planes() {
+        use bevy::ecs::system::RunSystemOnce;
+        use bevy::picking::mesh_picking::ray_cast::RayCastBackfaces;
+
+        let mut world = World::new();
+        world.insert_resource(AppConfig::default());
+        world.init_resource::<Assets<Mesh>>();
+        world.init_resource::<Assets<StandardMaterial>>();
+        world.init_resource::<Assets<Image>>();
+        world.init_resource::<Assets<TerminalPresentMaterial>>();
+        let mut registry = TerminalRegistry::default();
+        let identity = registry.allocate().expect("a fresh registry has slots");
+        let (runtime, _host) =
+            TerminalRuntime::virtual_channel(&AppConfig::default(), identity.ingress());
+        world.spawn((
+            TerminalSurface::new(&AppConfig::default()).expect("surface construction is CPU-only"),
+            runtime,
+            identity,
+        ));
+        world.insert_resource(registry);
+        world.init_resource::<crate::query_channel::QuerySession>();
+        world.init_resource::<crate::terminals::TerminalRoster>();
+        world.spawn((Window::default(), bevy::window::PrimaryWindow));
+
+        world
+            .run_system_once(setup_scene)
+            .expect("setup_scene should run");
+
+        assert_eq!(
+            world.query::<&TerminalSurface>().iter(&world).count(),
+            1,
+            "seat count asserted (#58 rider)"
+        );
+        let front_planes = world
+            .query_filtered::<Entity, With<TerminalPlane>>()
+            .iter(&world)
+            .count();
+        assert!(front_planes > 0, "the dressed seat staged a front plane");
+        assert_eq!(
+            world
+                .query_filtered::<Entity, (With<TerminalPlane>, With<RayCastBackfaces>)>()
+                .iter(&world)
+                .count(),
+            front_planes,
+            "every front plane raycasts backfaces, regardless of render cull_mode"
+        );
+        assert_eq!(
+            world
+                .query_filtered::<Entity, (With<TerminalPlaneBack>, With<RayCastBackfaces>)>()
+                .iter(&world)
+                .count(),
+            0,
+            "the back sheet is never a pick target and carries no marker"
+        );
     }
 
     fn back_translation(app: &App, entity: Entity) -> Vec3 {

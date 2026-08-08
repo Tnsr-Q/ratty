@@ -666,9 +666,10 @@ pub(crate) fn render_terminal_widget(mut params: RenderWidgetParams) {
         presence,
         blink_phase,
     } = &mut params;
-    // The selection is screen-global state until picking lands (M4.6);
-    // it renders only into the FOCUSED seat's texture — highlighting the
-    // same cell range on every terminal would misattribute it.
+    // The selection is one screen-global resource (scene composition is
+    // #42's return); it renders only into the seat that both OWNS it and
+    // holds focus — highlighting the same cell range on every terminal
+    // would misattribute it.
     let empty_selection = TerminalSelection::default();
     // The texture content only changes with terminal state or blink phase;
     // warp and camera animations are mesh- and camera-side. Rebuilding on
