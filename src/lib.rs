@@ -29,6 +29,7 @@ pub mod model;
 pub mod mouse;
 pub mod osc;
 pub mod paths;
+mod pick;
 pub mod plugin;
 pub mod presence;
 pub mod present;
