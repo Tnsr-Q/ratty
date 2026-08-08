@@ -312,6 +312,17 @@ impl Callbacks for TerminalParserCallbacks {
     }
 
     fn unhandled_escape(&mut self, _: &mut Screen, i1: Option<u8>, i2: Option<u8>, b: u8) {
+        // #84: vte ends a two-byte-ST-terminated string on the ESC half and
+        // hands the trailing backslash here (vt100's esc_dispatch has no
+        // arm for it), so this callback sees the ST tail of every
+        // well-formed OSC/DCS/APC string — and a genuinely bare ST in
+        // ground state is an ECMA-48 no-op. The two cases are
+        // indistinguishable at this callback; neither is warn-worthy, and
+        // warning here burned the dedup slot that keeps this channel
+        // meaningful for genuinely unknown escapes.
+        if i1.is_none() && i2.is_none() && b == b'\\' {
+            return;
+        }
         let mut sequence = String::from("\u{1b}");
         if let Some(i1) = i1 {
             sequence.push(i1 as char);
@@ -822,6 +833,33 @@ mod tests {
         );
         assert!(parser.callbacks_mut().take_queries().is_empty());
         assert!(parser.callbacks_mut().take_wire_errors().is_empty());
+    }
+
+    #[test]
+    fn st_tails_are_not_unhandled_escapes() {
+        // #84 — see the ST-tail arm in unhandled_escape: the terminator of
+        // every well-formed ST-terminated string arrives there, and a bare
+        // ground-state ST is an ECMA-48 no-op; neither may warn.
+        let mut parser = Parser::new_with_callbacks(
+            24,
+            80,
+            0,
+            TerminalParserCallbacks::new(IngressSource::test_boot()),
+        );
+        // The relay's exact startup frame shape: an ST-terminated 778 query.
+        parser.process(crate::query::query_sequence("tok1", "state.presence", None).as_bytes());
+        assert!(!parser.callbacks_mut().take_queries().is_empty());
+        // A genuinely bare ST in ground state is an ECMA-48 no-op too.
+        parser.process(b"\x1b\\");
+        assert!(
+            parser.callbacks().seen_escape.is_empty(),
+            "ST tails must not be recorded as unhandled escapes: {:?}",
+            parser.callbacks().seen_escape
+        );
+        // The arm must not widen: an intermediate-bearing escape ending in
+        // backslash is still unknown and still records.
+        parser.process(b"\x1b(\\");
+        assert!(parser.callbacks().seen_escape.contains("\u{1b}(\\"));
     }
 
     #[test]
