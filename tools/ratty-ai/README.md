@@ -106,6 +106,51 @@ untrusted bytes cannot ask the terminal to read your processes, your
 filesystem or your shell history. They can only ask it to *draw* data that a
 trusted collector already gathered.
 
+## Your shell, driving the scene
+
+The reactive organ watches **sensors** and fires **rules** — but nothing
+shipped that published what your shell was doing. `shell/` does:
+
+```bash
+./tools/ratty-ai/examples/shell-effects.sh          # register the rules, once
+source tools/ratty-ai/shell/ratty-lifecycle.zsh     # or .bash
+```
+
+Then just use the shell. A command that fails flashes red, one that succeeds
+flashes green, and a build still running after twenty seconds turns the mood
+focused. Nothing else to type.
+
+Three sensors carry it, published into your terminal's own namespace:
+
+| Sensor | Meaning |
+| --- | --- |
+| `shell.running` | `1` while a command runs, `0` at the prompt |
+| `shell.ok` | pulses to `1` when a command exits zero |
+| `shell.fail` | pulses to `1` when a command exits non-zero |
+
+**Only those three numbers leave.** The hook sees your command line — zsh
+hands it to `preexec` — and never sends it, or any part of it, anywhere. A
+sensor carries a name and a float; there is no wire shape that could carry
+the text even if it wanted to.
+
+`ok` and `fail` are separate sensors rather than one exit code because rules
+activate on a threshold **crossing**. A value that stays put fires once and
+goes quiet, so two consecutive failures need two edges — which is what the
+reset at `preexec` is for. For the same reason "long-running command" needs
+no duration sensor and no timer: `--debounce 20` on `shell.running` already
+means *held for twenty seconds*.
+
+Costs, honestly: five short-lived processes per command, on the path that
+runs before every prompt. That sits inside the terminal's 16/sec sensor
+budget for normal use; a tight loop of fast commands can outrun it, and the
+terminal then answers `rate-limited` and drops the sample rather than lying.
+`export RATTY_LIFECYCLE_OFF=1` disables the hook without unsourcing it.
+
+To extend it, publish your own sensors from the same hooks — classifying
+commands (a `shell.danger` that pulses before an `rm -rf`), timing them, or
+counting them. Any name you like: the terminal prefixes `agent.<ns>.` and
+registers it on first use, with no wire change and no capability grant.
+
 ## Terminals on the wire
 
 `term.*` spawns and addresses real terminals, and both of its capabilities
