@@ -613,6 +613,52 @@ mod tests {
         assert!(!valid_token(&"x".repeat(MAX_TOKEN_BYTES + 1)));
     }
 
+    /// The wasm promise intercept's key space is JOINTLY OWNED — pinned
+    /// here because the whole safety argument turns on knowing that.
+    ///
+    /// `web::try_resolve_pending` is keyed by correlation token alone, and
+    /// three caller-supplied routes reach it: `id=` on a raw 778 query, the
+    /// recovered token of a malformed one, and `tok=` on any 777 command.
+    /// `web::generate_token` mints 32 hex chars, which is a strict SUBSET of
+    /// every one of those spaces — so the wire can name a minted token, and
+    /// the spaces are not separate.
+    ///
+    /// What protects a pending `query()` promise is instead that `query()`
+    /// is the pending map's sole inserter and mints a token that never
+    /// returns to JS: the wire can only ever remove a key it already knows.
+    /// Safety is population closure first, secrecy and 128-bit entropy
+    /// second — never key-space separation.
+    ///
+    /// If you make this assertion fail (say, by giving minted tokens a
+    /// reserved prefix), you have changed that argument, not tightened it:
+    /// see #86 decision 7 and update `protocols/query.md`'s pending-map
+    /// clause in the same commit.
+    #[test]
+    fn wire_token_space_contains_the_wasm_mint_space() {
+        // The exact shape `web::generate_token` produces: 16 random bytes,
+        // lowercase hex, 32 chars. Written out rather than generated — the
+        // minting function is wasm-only and cannot be called from here.
+        let minted = "0123456789abcdef0123456789abcdef";
+        assert_eq!(minted.len(), 32);
+
+        // Route 1 and 2: a raw 778 `id=`, well-formed or malformed, is
+        // filtered only by `valid_token`.
+        assert!(
+            valid_token(minted),
+            "a raw 778 id= accepts a minted token verbatim"
+        );
+
+        // Route 3: `tok=` on any 777 command, filtered independently in
+        // `osc.rs` against its own alphabet.
+        let control = crate::osc::parse_control(&format!("ratty:mode;flat2d&tok={minted}"))
+            .expect("a well-formed 777 control parses");
+        assert_eq!(
+            control.ack_token.as_deref(),
+            Some(minted),
+            "a 777 tok= accepts a minted token verbatim"
+        );
+    }
+
     #[test]
     fn query_sequence_parses_back_through_the_terminal_gate() {
         let sequence = query_sequence("tok123", "state.scene", Some(b"{\"a\":1}"));
