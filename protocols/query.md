@@ -45,7 +45,8 @@ reply:  ESC ] 778 ; v=1 ; t=r ; id=<token> [; kind=ack] ; ok=1|0 [; code=<error>
 - Correlation is by (session, agent, token); the session is the transport
   (one PTY = one session), the agent is the ingress namespace, and the
   reply goes **only** to the originating transport. Clients match on the
-  token.
+  token. (The wasm `query()` promise intercept correlates one step wider —
+  (page, token) — see the locked pending-map semantics under **Wasm**.)
 - Replies are size-bounded (≤ 4 KiB framed); queries are refused above
   8 KiB (`too-large`), decoded payloads above 4 KiB.
 - `t=e` is **reserved**: no unsolicited events in v1. A future
@@ -374,6 +375,23 @@ disposing a handle rejects its own pending promises — owner-scoped per
 entry; timeout removes and rejects; late or unmatched replies are
 ignored. `query()` adds no authority — session identity, namespace,
 projection rules, and size limits all still apply.
+
+Resolution is by token alone and deliberately page-global (#86 decision 7,
+ratified): the intercept's correlation domain is (page, token), one step
+wider than the wire's (session, agent, token), and it takes no pane or
+owner scope under either browser-fork shape. Its key space is **not**
+closed — the same 1–64-char base64url space is reachable from `id=` on a
+raw 778 query, from the recovered token of a malformed one, and from
+`tok=` on any 777 command, and the minted 32-hex space is a strict subset
+of all three. What protects a pending promise is that `query()` is the
+map's sole inserter and mints a 128-bit token that never returns to JS:
+the wire can only ever remove a key it already knows, never insert or
+enumerate one. Population closure first, token secrecy and entropy
+second — never key-space separation. The overlap is pinned by the native
+test `wire_token_space_contains_the_wasm_mint_space`; the invariant fails
+the moment a correlation token becomes predictable, reused, or readable
+by any party that can feed bytes, and transport scoping then becomes
+required rather than optional.
 
 ## Example session
 
