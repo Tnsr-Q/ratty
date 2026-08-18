@@ -135,14 +135,25 @@ rows now carry `rule_safe` alongside `privileged`.
 
 ## Sensors
 
-- **Native adapter** (`sys.cpu`, `sys.memory`, `sys.battery` — percent
-  values 0..=100): config-gated **off by default**; enabling it is a
-  trusted-config act (`[reactive] system_sensors = true`), sampled at a
-  config-bounded cadence (default ~2 s, sample TTL 3× cadence). Platform
-  sensors that cannot be supplied honestly are **absent, never
-  fabricated** — a desktop without a battery simply never publishes
-  `sys.battery`, and the first CPU sample is skipped rather than
-  published as a meaningless 0 %.
+- **Native adapter** (`sys.cpu`, `sys.memory`, `sys.battery`,
+  `sys.network` — percent values 0..=100): config-gated **off by
+  default**; enabling it is a trusted-config act
+  (`[reactive] system_sensors = true`), sampled at a config-bounded
+  cadence (default ~2 s, sample TTL 3× cadence). Platform sensors that
+  cannot be supplied honestly are **absent, never fabricated** — a
+  desktop without a battery simply never publishes `sys.battery`, and
+  the first CPU sample is skipped rather than published as a
+  meaningless 0 %.
+- **`sys.network` is link presence, not reachability.** It reads 100
+  when some interface carries a routable address (loopback, link-local,
+  and unspecified addresses do not count — a host with its wifi down
+  still carries all three) and 0 when none does; an empty interface
+  table is the honest value 0, not an absent sensor. The adapter reads
+  the local interface table and **sends nothing off-host** — probing
+  whether the internet actually answers is deliberately not the
+  terminal's act. A caller that wants the stronger signal probes under
+  its own agency and publishes a wire sensor beside it
+  (`examples/net-watch.sh`).
 - **Wire sensors**: typed (finite f32), rate-limited (token-bucket per
   namespace), only inside the caller's own `agent.<ns>.*` namespace
   (canonically spelled). Browser-equal by construction.

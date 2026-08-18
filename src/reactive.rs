@@ -139,8 +139,13 @@ pub const MAX_SYSTEM_SAMPLE_SECS: f32 = 60.0;
 
 /// The sensor names the native adapter may supply. `sys.battery` is
 /// published only on hosts that actually report a battery — honest
-/// absence, never fabricated.
-pub const SYSTEM_SENSOR_NAMES: &[&str] = &["sys.cpu", "sys.memory", "sys.battery"];
+/// absence, never fabricated. `sys.network` is passive link presence
+/// (100 when some interface carries a routable address, 0 when none
+/// does), never probed reachability: the adapter reads the interface
+/// table and sends nothing off-host — see `examples/net-watch.sh` in
+/// ratty-ai for the caller-owned probe that answers the stronger
+/// question under the user's own agency (#70 item 2).
+pub const SYSTEM_SENSOR_NAMES: &[&str] = &["sys.cpu", "sys.memory", "sys.battery", "sys.network"];
 
 /// Where a sensor's samples come from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1381,6 +1386,7 @@ pub mod system_adapter {
     /// Owns the platform handles and the cadence clock.
     pub struct SystemSampler {
         sys: sysinfo::System,
+        networks: sysinfo::Networks,
         battery: Option<starship_battery::Manager>,
         last: Option<Duration>,
         /// CPU usage needs two refreshes before the first honest reading;
@@ -1400,6 +1406,7 @@ pub mod system_adapter {
         pub fn new() -> Self {
             Self {
                 sys: sysinfo::System::new(),
+                networks: sysinfo::Networks::new_with_refreshed_list(),
                 battery: starship_battery::Manager::new().ok(),
                 last: None,
                 cpu_primed: false,
@@ -1421,7 +1428,7 @@ pub mod system_adapter {
         /// Takes one sample of every honestly-available sensor, as
         /// `(name, percent 0..=100)` pairs.
         pub fn sample(&mut self) -> Vec<(&'static str, f32)> {
-            let mut samples = Vec::with_capacity(3);
+            let mut samples = Vec::with_capacity(4);
             self.sys.refresh_cpu_usage();
             if self.cpu_primed {
                 samples.push(("sys.cpu", self.sys.global_cpu_usage()));
@@ -1439,7 +1446,39 @@ pub mod system_adapter {
             {
                 samples.push(("sys.battery", battery.state_of_charge().value * 100.0));
             }
+            // Link presence, never probed reachability: the interface
+            // table is a local read and nothing is sent off-host. Unlike
+            // `sys.battery`, this one always publishes — an empty table
+            // IS the honest value 0, not an absent sensor.
+            self.networks.refresh(true);
+            let present = self
+                .networks
+                .list()
+                .values()
+                .flat_map(|data| data.ip_networks())
+                .any(|net| routable(&net.addr));
+            samples.push(("sys.network", if present { 100.0 } else { 0.0 }));
             samples
+        }
+    }
+
+    /// Whether an address is evidence of a network beyond this host.
+    /// Loopback, unspecified, and link-local addresses are not — a
+    /// machine with its wifi down still carries `127.0.0.1`, `::1`, and
+    /// usually a self-assigned `169.254.*` or `fe80::*`, so counting any
+    /// of those would pin `sys.network` at 100 forever.
+    pub fn routable(addr: &std::net::IpAddr) -> bool {
+        match addr {
+            std::net::IpAddr::V4(v4) => {
+                !v4.is_loopback() && !v4.is_unspecified() && !v4.is_link_local()
+            }
+            std::net::IpAddr::V6(v6) => {
+                // `fe80::/10` by hand: the first 10 bits are 1111111010.
+                // (`Ipv6Addr::is_unicast_link_local` is newer than this
+                // needs to be, and ten bits are not worth an MSRV story.)
+                let link_local = (v6.segments()[0] & 0xffc0) == 0xfe80;
+                !v6.is_loopback() && !v6.is_unspecified() && !link_local
+            }
         }
     }
 }
@@ -1584,6 +1623,59 @@ mod tests {
     use bevy::ecs::message::Messages;
 
     const NS0: IngressSource = IngressSource::test_boot();
+
+    /// The `sys.network` classifier: what a host still carries with its
+    /// network down must read as offline, and real assignments — LAN,
+    /// VPN, CGNAT, global v6 — as online.
+    #[test]
+    fn routable_addresses_exclude_the_offline_locals() {
+        use super::system_adapter::routable;
+        for offline in [
+            "127.0.0.1",
+            "0.0.0.0",
+            "169.254.7.9",
+            "::1",
+            "::",
+            "fe80::1c2f:abcd",
+            "febf::1", // top of fe80::/10 — the mask, not the prefix literal
+        ] {
+            let addr = offline.parse().expect("test literal parses");
+            assert!(!routable(&addr), "{offline} is not evidence of a network");
+        }
+        for online in [
+            "192.168.1.20",
+            "10.8.0.2",
+            "100.64.3.1",
+            "8.8.8.8",
+            "2601:645:8a00::5",
+            "fec0::1", // just past fe80::/10 — site-local, deprecated but routable here
+        ] {
+            let addr = online.parse().expect("test literal parses");
+            assert!(routable(&addr), "{online} is evidence of a network");
+        }
+    }
+
+    /// `sys.network` always publishes — an empty interface table is the
+    /// honest value 0, not an absent sensor — and only ever 0 or 100.
+    #[test]
+    fn network_sensor_always_publishes_a_binary_percent() {
+        let samples = system_adapter::SystemSampler::new().sample();
+        let network: Vec<f32> = samples
+            .iter()
+            .filter(|(name, _)| *name == "sys.network")
+            .map(|(_, value)| *value)
+            .collect();
+        assert_eq!(
+            network.len(),
+            1,
+            "exactly one sys.network sample: {samples:?}"
+        );
+        assert!(
+            network[0] == 0.0 || network[0] == 100.0,
+            "binary percent, got {}",
+            network[0]
+        );
+    }
 
     fn t(secs: f32) -> Duration {
         Duration::from_secs_f32(secs)
