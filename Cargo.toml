@@ -106,7 +106,7 @@ portable-pty = "0.8"
 shellexpand = "3.1"
 # Native system sensors for the reactive organ (#21): sys.cpu/sys.memory.
 # The "system" component only — no disk, network, process, or user probing.
-sysinfo = { version = "0.39", default-features = false, features = ["system"] }
+sysinfo = { version = "0.39", default-features = false, features = ["system", "network"] }
 # sys.battery for the reactive organ. Hosts without a battery simply never
 # publish the sensor — honest absence, never fabricated.
 starship-battery = "0.11"
