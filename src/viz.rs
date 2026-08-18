@@ -168,7 +168,8 @@ pub enum VizPaletteSlot {
     Active,
     /// Alive but idle (sleeping process).
     Idle,
-    /// A state worth attention (zombie/stopped process, interface down).
+    /// A state worth attention (zombie/stopped process, interface down,
+    /// checked-out branch with unmerged paths).
     Alert,
     /// A container of other things (directory).
     Container,
@@ -369,9 +370,9 @@ pub(crate) fn line_series_palette(series: &ChartSeries, index: usize) -> VizPale
 /// Lowers a decoded payload onto the shared render vocabulary, in item
 /// order. Grid magnitudes are normalized within the snapshot (cpu for
 /// `ps`, log-scaled size for `fs`, log-scaled rx+tx for `net`; `git`
-/// branches weight the checked-out branch); chart kinds normalize against
-/// their axis (`bar_axis_max`, `line_chart_ranges`, gauge ranges,
-/// `timeline_window`).
+/// branches weight the checked-out branch, which alerts while the tree
+/// is conflicted); chart kinds normalize against their axis
+/// (`bar_axis_max`, `line_chart_ranges`, gauge ranges, `timeline_window`).
 pub fn viz_child_specs(payload: &VizPayload) -> Vec<VizChildSpec> {
     match payload {
         VizPayload::Ps(ps) => {
@@ -406,20 +407,25 @@ pub fn viz_child_specs(payload: &VizPayload) -> Vec<VizChildSpec> {
                 })
                 .collect()
         }
-        VizPayload::Git(git) => git
-            .branches
-            .iter()
-            .map(|branch| VizChildSpec {
-                key: branch.name.clone(),
-                magnitude: if branch.current { 1.0 } else { 0.55 },
-                palette: if branch.current {
-                    VizPaletteSlot::Active
-                } else {
-                    VizPaletteSlot::Neutral
-                },
-                slot: VizSlot::Grid,
-            })
-            .collect(),
+        VizPayload::Git(git) => {
+            // A conflicted tree is a state of the checkout, not of any
+            // one branch entry, so it colors the checked-out branch:
+            // that is the bar the user is standing on.
+            let conflicted = git.status.conflicted > 0;
+            git.branches
+                .iter()
+                .map(|branch| VizChildSpec {
+                    key: branch.name.clone(),
+                    magnitude: if branch.current { 1.0 } else { 0.55 },
+                    palette: match (branch.current, conflicted) {
+                        (true, true) => VizPaletteSlot::Alert,
+                        (true, false) => VizPaletteSlot::Active,
+                        (false, _) => VizPaletteSlot::Neutral,
+                    },
+                    slot: VizSlot::Grid,
+                })
+                .collect()
+        }
         VizPayload::Net(net) => {
             let max_total = net
                 .items
@@ -1450,8 +1456,69 @@ mod tests {
         assert!(git.branches[0].current);
         assert!(!git.branches[1].current);
         assert_eq!(git.status.staged, 0);
+        assert_eq!(git.status.conflicted, 0);
         assert_eq!(git.ahead, 0);
+        assert_eq!(git.stashes, 0);
         assert_eq!(VizPayload::Git(git).item_count(), 2, "git counts branches");
+    }
+
+    /// #70 item 5: `status.conflicted` is the one count the renderer
+    /// reads. Nonzero, the checked-out branch renders as an alert; the
+    /// other branches keep their palette, and a clean or merely dirty
+    /// tree keeps the checked-out branch active. `stashes` decodes and,
+    /// like `ahead`/`behind`, colors nothing. The dirty fixture is the
+    /// exact shape every `ratty-ai git` before this field emitted —
+    /// `status` present, `conflicted` and `stashes` absent — pinning
+    /// the additive claim rather than resting it on the attribute.
+    #[test]
+    fn git_v1_conflicted_tree_alerts_the_checked_out_branch() {
+        let dirty = json!({
+            "capture": { "source": "test", "ts": "now" },
+            "repo": "ratty",
+            "branches": [{ "name": "main", "current": true }, { "name": "dev" }],
+            "status": { "staged": 3, "unstaged": 2, "untracked": 1 },
+        });
+        let dirty = decode_viz_payload("git.v1", &encode(dirty)).expect("an old emitter decodes");
+        let VizPayload::Git(git) = &dirty else {
+            panic!("expected git.v1");
+        };
+        assert_eq!(git.status.staged, 3, "old fields still read");
+        assert_eq!(git.status.conflicted, 0, "absent conflicted reads as 0");
+        assert_eq!(git.stashes, 0, "absent stashes reads as 0");
+        let specs = viz_child_specs(&dirty);
+        assert_eq!(
+            specs[0].palette,
+            VizPaletteSlot::Active,
+            "dirt alone is not an alert"
+        );
+        assert_eq!(specs[1].palette, VizPaletteSlot::Neutral);
+
+        let merging = json!({
+            "capture": { "source": "test", "ts": "now" },
+            "repo": "ratty",
+            "branches": [{ "name": "main", "current": true }, { "name": "dev" }],
+            "status": { "staged": 3, "unstaged": 2, "untracked": 1, "conflicted": 1 },
+            "stashes": 5,
+        });
+        let merging = decode_viz_payload("git.v1", &encode(merging)).expect("decodes");
+        let VizPayload::Git(git) = &merging else {
+            panic!("expected git.v1");
+        };
+        assert_eq!(git.status.conflicted, 1);
+        assert_eq!(git.stashes, 5);
+        let specs = viz_child_specs(&merging);
+        assert_eq!(specs[0].key, "main");
+        assert_eq!(
+            specs[0].palette,
+            VizPaletteSlot::Alert,
+            "a conflict alerts the checkout"
+        );
+        assert_eq!(specs[0].magnitude, 1.0, "still the tallest bar");
+        assert_eq!(
+            specs[1].palette,
+            VizPaletteSlot::Neutral,
+            "other branches untouched"
+        );
     }
 
     #[test]

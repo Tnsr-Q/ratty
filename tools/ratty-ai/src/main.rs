@@ -261,9 +261,10 @@ enum Commands {
     },
     /// Collect a repository snapshot and publish it as a `git.v1` viz.
     ///
-    /// Shells out to `git` (branch list, porcelain status counts,
-    /// ahead/behind from rev-list) under the invoking user's own
-    /// permissions. A missing repo or git binary exits 2.
+    /// Shells out to `git` (branch list, porcelain status counts
+    /// including unmerged paths, ahead/behind from rev-list, stash
+    /// count) under the invoking user's own permissions. A missing repo
+    /// or git binary exits 2.
     Git {
         /// Repository path.
         #[arg(long, default_value = ".")]
@@ -1921,9 +1922,22 @@ struct GitCounts {
     staged: u32,
     unstaged: u32,
     untracked: u32,
+    /// Unmerged paths — a merge, or anything else on the merge machinery
+    /// (rebase, cherry-pick, stash pop, `am`, `revert`), stopped on a
+    /// conflict. Counted here and *only* here: an unmerged entry has a
+    /// non-space letter in both columns, so without this class it would
+    /// double-count as one staged plus one unstaged change and a
+    /// conflicted tree would be indistinguishable from ordinary dirt.
+    conflicted: u32,
 }
 
-/// Parses porcelain-v1 status lines: `??` is untracked; otherwise a
+/// The seven porcelain-v1 `XY` codes for an unmerged path, verbatim from
+/// `git-status(1)`: both deleted, added by us, deleted by them, added by
+/// them, deleted by us, both added, both modified.
+const GIT_UNMERGED_CODES: [&[u8; 2]; 7] = [b"DD", b"AU", b"UD", b"UA", b"DU", b"AA", b"UU"];
+
+/// Parses porcelain-v1 status lines: `??` is untracked; an unmerged
+/// `XY` code (see [`GIT_UNMERGED_CODES`]) is conflicted; otherwise a
 /// non-space index column counts staged and a non-space worktree column
 /// counts unstaged (one line can count both).
 fn parse_git_porcelain(text: &str) -> GitCounts {
@@ -1933,8 +1947,13 @@ fn parse_git_porcelain(text: &str) -> GitCounts {
         if bytes.len() < 2 {
             continue;
         }
-        if &bytes[..2] == b"??" {
+        let code = &bytes[..2];
+        if code == b"??" {
             counts.untracked += 1;
+            continue;
+        }
+        if GIT_UNMERGED_CODES.iter().any(|unmerged| *unmerged == code) {
+            counts.conflicted += 1;
             continue;
         }
         if bytes[0] != b' ' {
@@ -1945,6 +1964,13 @@ fn parse_git_porcelain(text: &str) -> GitCounts {
         }
     }
     counts
+}
+
+/// Counts stash entries from `git stash list --format=%gd` — one reflog
+/// selector per line, so a stash message can never split or join a
+/// count. No stash is empty output and exit 0, not an error.
+fn parse_git_stash_list(text: &str) -> u32 {
+    u32::try_from(text.lines().filter(|line| !line.trim().is_empty()).count()).unwrap_or(u32::MAX)
 }
 
 /// Parses `git rev-list --left-right --count @{upstream}...HEAD` output:
@@ -1974,12 +2000,14 @@ fn gather_git(repo: &std::path::Path) -> Result<serde_json::Value, String> {
     )
     .map(|text| parse_ahead_behind(&text))
     .unwrap_or((0, 0));
+    let stashes = parse_git_stash_list(&git_output(repo, &["stash", "list", "--format=%gd"])?);
     Ok(git_snapshot(
         &repo.display().to_string(),
         branches,
         counts,
         ahead,
         behind,
+        stashes,
     ))
 }
 
@@ -1991,6 +2019,7 @@ fn git_snapshot(
     counts: GitCounts,
     ahead: u32,
     behind: u32,
+    stashes: u32,
 ) -> serde_json::Value {
     let total = branches.len();
     branches.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
@@ -2011,9 +2040,11 @@ fn git_snapshot(
             "staged": counts.staged,
             "unstaged": counts.unstaged,
             "untracked": counts.untracked,
+            "conflicted": counts.conflicted,
         },
         "ahead": ahead,
         "behind": behind,
+        "stashes": stashes,
     })
 }
 
@@ -3908,8 +3939,39 @@ mod tests {
                 staged: 3,
                 unstaged: 2,
                 untracked: 1,
+                conflicted: 0,
             }
         );
+    }
+
+    /// The #70 item-5 defect: an unmerged path has a letter in both
+    /// columns, so before the conflicted class it counted as one staged
+    /// plus one unstaged change and a merge looked like ordinary dirt.
+    /// All seven `git-status(1)` unmerged codes land in `conflicted`
+    /// and nowhere else; the ordinary codes are untouched beside them.
+    #[test]
+    fn git_porcelain_classifies_unmerged_as_conflicted_only() {
+        let text = "UU both.rs\nAA added-both.rs\nDD deleted-both.rs\nAU by-us.rs\n\
+                    UA by-them.rs\nDU deleted-by-us.rs\nUD deleted-by-them.rs\n\
+                    M  staged.rs\n M unstaged.rs\n?? new.rs\n";
+        assert_eq!(
+            parse_git_porcelain(text),
+            GitCounts {
+                staged: 1,
+                unstaged: 1,
+                untracked: 1,
+                conflicted: 7,
+            }
+        );
+    }
+
+    #[test]
+    fn git_stash_list_counts_selectors_per_line() {
+        assert_eq!(parse_git_stash_list(""), 0);
+        assert_eq!(parse_git_stash_list("stash@{0}\n"), 1);
+        assert_eq!(parse_git_stash_list("stash@{0}\nstash@{1}\nstash@{2}\n"), 3);
+        // Trailing blank lines never count.
+        assert_eq!(parse_git_stash_list("stash@{0}\n\n"), 1);
     }
 
     #[test]
@@ -3930,9 +3992,13 @@ mod tests {
                 ("main".into(), true),
                 ("alpha".into(), false),
             ],
-            GitCounts::default(),
+            GitCounts {
+                conflicted: 4,
+                ..GitCounts::default()
+            },
             1,
             2,
+            3,
         );
         let names: Vec<&str> = snapshot["branches"]
             .as_array()
@@ -3944,6 +4010,9 @@ mod tests {
         assert_eq!(snapshot["branches"][0]["current"], true);
         assert_eq!(snapshot["ahead"], 1);
         assert_eq!(snapshot["behind"], 2);
+        assert_eq!(snapshot["stashes"], 3);
+        assert_eq!(snapshot["status"]["conflicted"], 4);
+        assert_eq!(snapshot["status"]["staged"], 0);
     }
 
     #[test]
@@ -4037,7 +4106,9 @@ mod tests {
                 staged: u32::MAX,
                 unstaged: u32::MAX,
                 untracked: u32::MAX,
+                conflicted: u32::MAX,
             },
+            u32::MAX,
             u32::MAX,
             u32::MAX,
         );

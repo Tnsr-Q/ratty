@@ -166,6 +166,10 @@ pub struct GitV1 {
     /// Commits behind upstream.
     #[serde(default)]
     pub behind: u32,
+    /// Stash entries (`refs/stash` reflog length). Additive since #70
+    /// item 5; an emitter that predates it reads as 0.
+    #[serde(default)]
+    pub stashes: u32,
 }
 
 /// One `git.v1` branch entry.
@@ -190,6 +194,15 @@ pub struct GitStatusCounts {
     /// Untracked files.
     #[serde(default)]
     pub untracked: u32,
+    /// Unmerged paths — a merge, or anything else on the merge machinery
+    /// (rebase, cherry-pick, stash pop), stopped on a conflict. Additive
+    /// since #70 item 5: an emitter that predates it never sent the
+    /// field and reads as 0 — it folded each unmerged path into staged
+    /// and unstaged instead, so it loses nothing it ever had. The only
+    /// status count the renderer reads: while nonzero the checked-out
+    /// branch renders as an alert.
+    #[serde(default)]
+    pub conflicted: u32,
 }
 
 /// `net.v1`: a network-interface counter snapshot. Interfaces, not
