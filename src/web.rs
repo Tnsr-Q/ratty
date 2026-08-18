@@ -61,10 +61,25 @@ struct PendingQuery {
 thread_local! {
     // Wasm is single-threaded: RattySession methods and the Bevy schedule
     // interleave on the JS main thread, so a thread-local map is the whole
-    // synchronization story. The map stays page-global and token-keyed —
-    // `try_resolve_pending` is a flat token lookup, and whether that
-    // intercept must itself become per-seat is #86's open decision 7 —
-    // but each entry carries its owner, so disposal rejects only the
+    // synchronization story. The map stays page-global and token-keyed, and
+    // `try_resolve_pending` stays a flat token lookup — RATIFIED as #86's
+    // decision 7: no pane or owner scope, under either fork shape.
+    //
+    // Know what actually protects a pending promise before "fixing" this.
+    // The key space is NOT closed — a raw 778 `id=`, a malformed 778's
+    // recovered token, and any 777 `tok=` all reach this lookup, and the
+    // minted 32-hex space is a strict subset of all three alphabets. The
+    // protection is that `query()` is this map's SOLE inserter and mints a
+    // 128-bit token that never crosses the wasm/JS ABI: the wire can only
+    // ever REMOVE a key it already knows, never insert or enumerate one.
+    // Population closure first, secrecy and entropy second — never
+    // key-space separation, never transport scoping. The overlap is pinned
+    // by `query::tests::wire_token_space_contains_the_wasm_mint_space`;
+    // the invariant fails the moment a token becomes predictable, reused,
+    // or readable by any party that can feed bytes, and then transport
+    // scoping becomes required, not optional.
+    //
+    // Each entry still carries its owner, so disposal rejects only the
     // disposing handle's promises (#86's chartered pre-work).
     static PENDING_QUERIES: RefCell<HashMap<String, PendingQuery>> = RefCell::new(HashMap::new());
     /// Mints one owner id per JS handle that can issue queries — today
