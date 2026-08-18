@@ -195,8 +195,9 @@ The telemetry kinds (`ps`/`fs`/`git`/`net`) render as a near-square
 grid of magnitude bars inside the anchored footprint. Bar heights are
 the snapshot's normalized magnitudes (cpu for `ps`, log-scaled size for
 `fs`, log-scaled rx+tx for `net`; `git` weights the checked-out branch
-over the rest), normalized *within* the snapshot: the tallest bar is
-the snapshot's largest item, not an absolute unit.
+over the rest and alerts it while the tree is conflicted), normalized
+*within* the snapshot: the tallest bar is the snapshot's largest item,
+not an absolute unit.
 
 The chart kinds split their rendering per the #20 design: **static
 geometry — axes, gridlines, labels, gauge arcs, timeline tracks — draws
@@ -266,14 +267,22 @@ log-scaled size; directories color as containers.
 ```json
 { "capture": { "source": "…", "ts": "…" }, "repo": "ratty",
   "branches": [ { "name": "main", "current": true }, { "name": "dev" } ],
-  "status": { "staged": 1, "unstaged": 2, "untracked": 0 },
-  "ahead": 0, "behind": 3 }
+  "status": { "staged": 1, "unstaged": 2, "untracked": 0, "conflicted": 0 },
+  "ahead": 0, "behind": 3, "stashes": 0 }
 ```
 
 Domain key: the branch name. `repo` and each branch `name` are
-required; `current`, the `status` counts, `ahead`, and `behind`
-default. The item count is the branch count; the checked-out branch
-renders tallest and active.
+required; `current`, the `status` counts, `ahead`, `behind`, and
+`stashes` default. The item count is the branch count; the checked-out
+branch renders tallest and active — or as an **alert** while
+`status.conflicted` is nonzero, the one status count the renderer
+reads. `conflicted` counts unmerged paths — a merge, or anything else
+on the merge machinery (rebase, cherry-pick, stash pop), stopped on a
+conflict — which is a state of the checkout rather than of any one
+branch, so it colors the bar the user is standing on; it clears once
+every path is resolved and added, before the operation is committed.
+`conflicted` and `stashes` arrived additively (#70 item 5): an emitter
+that predates them reads as 0.
 
 ### `net.v1` — interface counters
 
@@ -415,7 +424,12 @@ ratty-ai kill    <pid> [--sigkill] [--timeout-ms 5000] [--id N]
   children are depth 1), capped at 4096 entries, never follows
   symlinks, skips-but-counts unreadable directories, and records
   directory sizes honestly as 0 (unmeasured). `git` shells out to the
-  `git` binary; a missing repo or binary exits 2.
+  `git` binary; a missing repo or binary exits 2. Its porcelain parse
+  counts an unmerged path as `conflicted` and *not* as staged or
+  unstaged, even though porcelain shows a letter in both columns —
+  before that class existed a conflicted tree was indistinguishable
+  from ordinary dirt; `stashes` is the line count of
+  `git stash list --format=%gd`.
 
 ### `history` — shell history as a timeline
 
